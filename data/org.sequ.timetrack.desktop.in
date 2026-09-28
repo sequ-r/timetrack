@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Timetrack
+Exec=timetrack
+Icon=org.sequ.timetrack
+Terminal=false
+Type=Application
+Categories=Utility;
+Keywords=GTK;
+StartupNotify=true
+DBusActivatable=true

@@ -1,0 +1,6 @@
+# List of source files containing translatable strings.
+# Please keep this file sorted alphabetically.
+data/org.sequ.timetrack.desktop.in
+data/org.sequ.timetrack.metainfo.xml.in
+data/org.sequ.timetrack.gschema.xml
+src/window.ui
