@@ -10,4 +10,8 @@ gtk = { version = "0.9", package = "gtk4", features = ["gnome_47"] }
 [dependencies.adw]
 package = "libadwaita"
 version = "0.7"
-features = ["v1_6"]
+# v1_7 is required, not v1_6: src/shortcuts-dialog.ui uses
+# AdwShortcutsDialog, which was introduced in libadwaita 1.7. At the 1.6
+# floor the class is unregistered and loading the file aborts the process
+# with "Invalid object type 'AdwShortcutsDialog'".
+features = ["v1_7"]

@@ -42,6 +42,17 @@ fn main() -> glib::ExitCode {
         .expect("Could not load resources");
     gio::resources_register(&resources);
 
+    // Initialize libadwaita. This must happen before any AdwTemplate-derived
+    // widget is instantiated, and it registers the template-only widget
+    // classes (AdwShortcutsDialog, AdwAboutDialog, ...) with the GType
+    // system. Without it, loading a .ui file that references one of them
+    // fails at runtime with "Invalid object type", which no compiler check
+    // catches.
+    if let Err(e) = adw::init() {
+        eprintln!("Failed to initialize libadwaita: {e}");
+        return glib::ExitCode::FAILURE;
+    }
+
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
     // desktop features such as file opening and single-instance applications.

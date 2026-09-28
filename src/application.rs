@@ -127,11 +127,32 @@ impl TimetrackApplication {
             // than part of the window template, so build it on demand.
             // AdwShortcutsDialog is a template-only class with no typed
             // binding; it derives from AdwDialog, which is what we present.
+            let present_fallback = |window: &gtk::Window| {
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Keyboard Shortcuts")
+                    .body(
+                        "The shortcuts window requires libadwaita 1.7 or newer, \
+                         which is not available in this installation.",
+                    )
+                    .build();
+                dialog.present(Some(window));
+            };
+
+            // GtkBuilder treats an unknown widget class as fatal and aborts
+            // the process, so the .ui must not be parsed at all when
+            // AdwShortcutsDialog is missing. The class is registered by
+            // libadwaita only from 1.7 onward, so check for its GType first
+            // rather than trying to catch a parse failure.
+            if glib::Type::from_name("AdwShortcutsDialog").is_none() {
+                present_fallback(&window);
+                return;
+            }
+
             let builder = gtk::Builder::from_resource("/org/sequ/timetrack/shortcuts-dialog.ui");
-            let dialog = builder
-                .object::<adw::Dialog>("shortcuts_dialog")
-                .expect("shortcuts_dialog should be defined in shortcuts-dialog.ui");
-            dialog.present(Some(&window));
+            match builder.object::<adw::Dialog>("shortcuts_dialog") {
+                Some(dialog) => dialog.present(Some(&window)),
+                None => present_fallback(&window),
+            }
         }
     }
 
