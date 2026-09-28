@@ -92,7 +92,47 @@ impl TimetrackApplication {
         let about_action = gio::ActionEntry::builder("about")
             .activate(move |app: &Self, _, _| app.show_about())
             .build();
-        self.add_action_entries([quit_action, about_action]);
+        let shortcuts_action = gio::ActionEntry::builder("shortcuts")
+            .activate(move |app: &Self, _, _| app.show_shortcuts())
+            .build();
+        let preferences_action = gio::ActionEntry::builder("preferences")
+            .activate(move |app: &Self, _, _| app.show_preferences())
+            .build();
+        self.add_action_entries([
+            quit_action,
+            about_action,
+            shortcuts_action,
+            preferences_action,
+        ]);
+        self.set_accels_for_action("app.shortcuts", &["<control>question"]);
+        self.set_accels_for_action("app.preferences", &["<control>comma"]);
+    }
+
+    fn show_preferences(&self) {
+        // There is no preferences UI yet. Register the action anyway so the
+        // menu item is not dead: activating it reports the missing feature
+        // instead of silently doing nothing.
+        if let Some(window) = self.active_window() {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Preferences")
+                .body("Preferences are not implemented yet.")
+                .build();
+            dialog.present(Some(&window));
+        }
+    }
+
+    fn show_shortcuts(&self) {
+        if let Some(window) = self.active_window() {
+            // shortcuts-dialog.ui is bundled as a standalone resource rather
+            // than part of the window template, so build it on demand.
+            // AdwShortcutsDialog is a template-only class with no typed
+            // binding; it derives from AdwDialog, which is what we present.
+            let builder = gtk::Builder::from_resource("/org/sequ/timetrack/shortcuts-dialog.ui");
+            let dialog = builder
+                .object::<adw::Dialog>("shortcuts_dialog")
+                .expect("shortcuts_dialog should be defined in shortcuts-dialog.ui");
+            dialog.present(Some(&window));
+        }
     }
 
     fn show_about(&self) {
@@ -104,7 +144,7 @@ impl TimetrackApplication {
             .version(VERSION)
             .developers(vec!["sequ"])
             // Translators: Replace "translator-credits" with your name/username, and optionally an email or URL.
-            .translator_credits(&gettext("translator-credits"))
+            .translator_credits(gettext("translator-credits"))
             .copyright("© 2026 sequ")
             .build();
 
