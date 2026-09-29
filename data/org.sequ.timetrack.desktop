@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=TimeTrack
+GenericName=Time Tracker
+Comment=Track time on tasks
+Exec=timetrack
+Icon=org.sequ.timetrack
+Terminal=false
+Type=Application
+Categories=Utility;GTK;
+Keywords=time;track;todo;productivity;
+StartupNotify=true

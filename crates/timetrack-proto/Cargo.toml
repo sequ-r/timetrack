@@ -1,0 +1,16 @@
+[package]
+name = "timetrack-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared D-Bus contract and client for TimeTrack"
+
+[dependencies]
+timetrack-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

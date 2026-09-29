@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.sequ.timetrack</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>TimeTrack</name>
+  <summary>Track time on tasks</summary>
+  <description>
+    <p>
+      TimeTrack records where your time goes. Start a timer, stop it, and
+      keep a history you can review.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Start and stop timers with a description</li>
+      <li>Review tracked entries and totals</li>
+      <li>A graphical interface and a terminal client, both talking to one service</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.sequ.timetrack.desktop</launchable>
+  <url type="homepage">https://github.com/sequ-r/timetrack</url>
+  <url type="bugtracker">https://github.com/sequ-r/timetrack/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-29"/>
+  </releases>
+</component>

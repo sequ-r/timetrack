@@ -1,0 +1,15 @@
+[Unit]
+Description=TimeTrack timer service
+Documentation=https://github.com/sequ-r/timetrack
+PartOf=graphical-session.target
+After=dbus.socket
+
+[Service]
+Type=dbus
+BusName=org.sequ.timetrack
+ExecStart=%h/.local/bin/timetrack-service
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

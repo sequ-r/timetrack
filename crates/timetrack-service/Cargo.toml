@@ -1,0 +1,21 @@
+[package]
+name = "timetrack-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TimeTrack system service: owns the running timer and serves it over D-Bus"
+
+[[bin]]
+name = "timetrack-service"
+path = "src/main.rs"
+
+[dependencies]
+timetrack-core = { workspace = true }
+timetrack-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

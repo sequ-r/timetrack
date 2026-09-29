@@ -1,17 +1,47 @@
-[package]
-name = "timetrack"
+[workspace]
+resolver = "3"
+members = [
+    "crates/timetrack-core",
+    "crates/timetrack-proto",
+    "crates/timetrack-service",
+    "crates/timetrack-cli",
+    "crates/timetrack-gui",
+]
+
+[workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sequ-r/timetrack"
 
-[dependencies]
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-gtk = { version = "0.9", package = "gtk4", features = ["gnome_47"] }
+[workspace.dependencies]
+timetrack-core = { path = "crates/timetrack-core" }
+timetrack-proto = { path = "crates/timetrack-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
 
-[dependencies.adw]
-package = "libadwaita"
-version = "0.7"
-# v1_7 is required, not v1_6: src/shortcuts-dialog.ui uses
-# AdwShortcutsDialog, which was introduced in libadwaita 1.7. At the 1.6
-# floor the class is unregistered and loading the file aborts the process
-# with "Invalid object type 'AdwShortcutsDialog'".
-features = ["v1_7"]
+# gpui-ce publishes no crates.io build that includes the platform backend, so
+# both crates are pinned to a single git rev. The platform crate is version
+# 0.1.0 and is deliberately NOT kept in lockstep with gpui-ce's 0.2.x line.
+[workspace.dependencies.gpui]
+git = "https://github.com/gpui-ce/gpui-ce.git"
+rev = "17d9c8e8fdb30a329d817ca06bff424e8e848f1a"
+package = "gpui-ce"
+
+[workspace.dependencies.gpui_platform]
+git = "https://github.com/gpui-ce/gpui-ce.git"
+rev = "17d9c8e8fdb30a329d817ca06bff424e8e848f1a"
+package = "gpui_ce_platform"
+features = ["font-kit", "wayland", "x11"]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
