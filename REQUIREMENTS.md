@@ -1,16 +1,16 @@
 # TimeTrack requirements
 
-Status: draft for discussion. Sections marked **[DECIDED]** were settled with
-the author; **[OPEN]** needs an answer before the work is scoped.
+Status: **agreed.** Every question is answered; there are no open decisions.
+Sections marked **[DECIDED]** were settled with the author.
 
-All structural questions are now closed. Totals are **sum of durations** (§4)
-and the **running timer is cut** (§7), which together simplify the model
-substantially: every entry is closed, and the service stops being a state
-machine owner. Quick-add durations, week boundaries, export format, storage
-migration and the GUI layout are all settled too (§6, §9, §10, §2, §11).
+The two decisions that shaped everything else: totals are **sum of durations**
+(§4) and the **running timer is cut** (§7). Together they simplify the model
+substantially — every entry is closed, and the service stops being a state
+machine owner.
 
-What remains open is sizing and naming, listed in §14. The app is ready to
-scope.
+The centre of the app is the **Home tab** (§11): this week's total, large, at
+the top with nothing above it; four quick-add buttons; undo; then the week's
+time per project. Three tabs: Home, Projects, Export.
 
 ## 1. What this app is
 
@@ -155,22 +155,20 @@ meant "subtract 30 minutes" must never lose an hour of data.
 - Quick-add must not require opening a dialog.
 - Every destructive or hard-to-undo action is undoable in one step.
 
-### v1 scope — **[OPEN]**
+### v1 scope **[DECIDED]**
 
-Do all five ship in v1, or does v1 ship a subset? The honest trade-off:
+**Methods 2, 3, 4 and 1 ship in v1**, deferring only the drag-to-trim gesture
+— which is a refinement of method 1's dialog, not a separate feature.
 
-- **Ship 2, 3 and 4 first.** They cover the common cases with the least UI:
-  typing a duration covers most manual entry, and quick-add covers the rest in
-  one click. Methods 1 and 2 are nearly the same dialog with a default filled
-  in.
-- **Ship all five** if editing times after the fact (§8) is expected to be
-  routine rather than occasional — which "full editing" implies.
+**Methods 1 and 2 are one dialog.** Method 2 is method 1 with "end = now"
+pre-filled, so they are the same form with a different default rather than two
+forms. That avoids duplicating validation, and "end = now" is the common case
+anyway.
 
-Recommend **2, 3, 4 and 1 in v1**, deferring nothing but the dedicated
-drag-to-trim gesture, which is a refinement of method 1's dialog rather than a
-separate feature. Method 2 is method 1 with "now" pre-filled.
+The daily/monthly views are *read* views, not entry methods, so they are in v1
+by way of §9 without depending on this decision.
 
-## 6. Quick-add **[DECIDED as a requirement, details OPEN — now load-bearing]**
+## 6. Quick-add **[DECIDED]**
 
 "Quick add / remove in 5-minute slots." With the timer cut (§7), this is no
 longer a convenience — it is what replaced it, and it is the fastest path to
@@ -387,7 +385,9 @@ without a clock.
 
 ## 14. Open questions, collected
 
-Answered, in the order asked:
+**All questions are answered.** There is nothing open.
+
+Settled, in the order asked:
 
 - **Totals** → sum of durations (§4), with a >24h/day warning.
 - **Running timer** → cut (§7); quick-add and merge replace it.
@@ -395,16 +395,19 @@ Answered, in the order asked:
 - **Week boundaries** → ISO weeks; aggregation in the service (§9).
 - **Export format** → CSV (§10).
 - **Store migration** → start clean (§2).
-- **Large clock on Home** → dropped. The week's total is the large element at
-  the top, with nothing above it — not even a greeting (§11).
-- **Tabs** → Home, Projects, Export. Entry editing is not a tab yet (§11).
-- **Archived projects** → remain in historical totals; entries are never
-  deleted, only archived, so a report never changes retroactively.
+- **Large clock on Home** → dropped; the week total is the large element at the
+  top with nothing above it (§11).
+- **Tabs** → Home, Projects, Export (§11).
+- **Archived projects** → remain in historical totals (§14 note).
+- **v1 entry scope** → methods 1, 2, 3, 4, with 1 and 2 sharing one dialog
+  (§5).
 
-Still open — all sizing:
+Two things are deliberate gaps rather than open questions, and should be
+treated as follow-ups rather than blockers:
 
-1. **§5 v1 scope** — the recommendation is 2, 3, 4 and 1 in v1, deferring only
-   the drag-to-trim gesture. Confirm or overrule; method 2 is largely method 1
-   with "now" pre-filled, so the real question is whether they ship as one dialog.
+- **Drag-to-trim** for adjusting times (§5, deferred).
+- **A dedicated entry list tab** (§11); editing currently lives behind the
+  per-project rows and the undo path. If §5/§8 in practice need more room than
+  that, a fourth tab is the likely fix.
 
-Everything structural is decided. The app is ready to scope.
+The app is ready to build.
