@@ -1,0 +1,22 @@
+# Release builds of the terminal client are statically linked musl binaries.
+#
+# 1. crt-static: without it, rustc links against musl's *dynamic* loader
+#    (interpreter /lib/ld-musl-x86_64.so.1), so the binary needs musl
+#    installed on the target machine. The published artifact promises to run
+#    anywhere, so link fully static. (musl is crt-static by default; this
+#    states the intent explicitly.)
+#
+# 2. Do NOT set CARGO_TARGET_*_MUSL_LINKER=musl-gcc. On Arch/CachyOS the
+#    `musl` package currently ships GCC 16.2.1 as musl-gcc, and code produced
+#    by it segfaults at runtime under the musl target: std's HashMap
+#    (RandomState::new) crashes, so anything that hashes dies -- which included
+#    zbus' D-Bus address parser, and so the whole CLI. Rust's default linker for
+#    musl targets (rust-lld) produces a correct binary, as do clang and gcc, so
+#    the fix is simply to not override the linker. On a Debian-based CI runner
+#    the `musl-tools` package's gcc is unaffected, but the default is still the
+#    safer choice.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

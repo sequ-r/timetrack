@@ -1,0 +1,91 @@
+name: release
+
+# Publishes statically linked `timetrack` binaries for the terminal client.
+#
+# The flatpak is NOT built here: Flathub builds and signs it against the same
+# tree. Keeping the two pipelines separate stops each from being
+# half-maintained.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `musl-tools` is the Debian/Ubuntu package name for the musl cross
+      # toolchain. Deliberately NO CARGO_TARGET_*_LINKER override: rust's
+      # default linker (rust-lld) for musl targets is what works. Some
+      # distros' musl-gcc (GCC 16.x on Arch as of 2026-09) produces binaries
+      # that segfault on anything that hashes -- std's HashMap, and therefore
+      # zbus' D-Bus address parser. See .cargo/config.toml.
+      - name: Install the musl cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --locked \
+            --package timetrack-cli \
+            --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/timetrack dist/timetrack-${{ matrix.arch }}
+          tar -czf dist/timetrack-${{ matrix.arch }}.tar.gz -C dist timetrack-${{ matrix.arch }}
+          rm dist/timetrack-${{ matrix.arch }}
+
+      - name: Checksum
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Verify the binary is static and actually runs
+        run: |
+          BIN=dist/timetrack-${{ matrix.arch }}
+          file "$BIN"
+          # Zero NEEDED entries is what "static" means in practice.
+          test "$(readelf -d "$BIN" | grep -c NEEDED)" = "0" \
+            || { echo "::error::binary is dynamically linked"; exit 1; }
+          # And it must not just link -- it must run. A broken linker can
+          # produce a binary that segfaults immediately; `--version` touches
+          # argument parsing and the hash map that zbus needs.
+          "$BIN" --version
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true

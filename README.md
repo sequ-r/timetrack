@@ -72,17 +72,25 @@ systemctl --user enable --now timetrack.service
 
 ## The terminal client
 
-`timetrack` is not a flatpak — it is an ordinary binary you can install
-directly:
+`timetrack` is not a flatpak — it is an ordinary binary:
 
 ```sh
 cargo install --git https://github.com/sequ-r/timetrack.git timetrack-cli
 ```
 
-Prebuilt release binaries are **not** published yet. A statically linked musl
-build was attempted and segfaults on startup (12/12 runs), so it was removed
-rather than shipped; a static build of the ratatui + zbus stack is not yet
-working. Install with cargo, or build from source, until that is fixed.
+Release tags also publish statically linked musl builds for x86_64 and
+aarch64, so a single artifact runs on any Linux regardless of glibc version:
+
+```sh
+curl -LO https://github.com/sequ-r/timetrack/releases/latest/download/timetrack-x86_64.tar.gz
+tar xzf timetrack-x86_64.tar.gz && install -m755 timetrack-x86_64 ~/.local/bin/timetrack
+```
+
+Note for packagers: **do not set `CARGO_TARGET_*_MUSL_LINKER=musl-gcc`**. Some
+distributions' `musl-gcc` (GCC 16.x on Arch as of 2026-09) produces binaries
+that segfault at startup on anything that hashes — `std`'s `HashMap`, which
+zbus' D-Bus address parser needs. Rust's default linker for musl targets is
+correct; the override is the bug. See `.cargo/config.toml`.
 
 ## Flatpak
 
@@ -103,11 +111,6 @@ toolchain download per build; the version is pinned so builds stay
 reproducible.
 
 ## Known issues
-
-**No prebuilt binaries are published.** A statically linked musl build of the
-CLI compiles and links with no `NEEDED` entries, but segfaults on startup
-(12/12 runs). Install with `cargo install` instead. Fixing that is the main
-thing left before a release pipeline is worth adding.
 
 **The GUI has never displayed a window.** It builds, links, and starts without
 panicking, and under `Xvfb` it maps `libX11`, `libGLX` and `libvulkan` and runs
