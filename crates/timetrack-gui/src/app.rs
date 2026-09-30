@@ -16,8 +16,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, InteractiveElement, IntoElement, Render, StatefulInteractiveElement, Styled,
-    Window, div, px, rgb, rgba,
+    AppContext, AsyncApp, Context, Entity, InteractiveElement, IntoElement, Render,
+    StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
 };
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
@@ -40,6 +40,10 @@ enum Action {
     Stop,
     Cancel,
     Remove(String),
+    /// Launch the service binary. The GUI is a flatpak and cannot run host
+    /// binaries itself, so this asks the session bus to activate it, which
+    /// works when a D-Bus activation file is installed on the host.
+    StartService,
 }
 
 /// Spawn the service thread. Returns `(messages_rx, actions_tx)`.
@@ -59,8 +63,11 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                 if let Ok(c) = timetrack_proto::Client::connect().await {
                     break c;
                 }
+                // Say what to do about it. "Daemon not running" is a dead
+                // end for a user; this names the command that fixes it.
                 let _ = tx.send(Msg::Error(
-                    "waiting for the timetrack service...".to_string(),
+                    "the timetrack service is not running. Start it with:\n                         timetrack-service &\n                     (or install it to a systemd user unit -- see the README)."
+                        .to_string(),
                 ));
                 async_io::Timer::after(Duration::from_secs(2)).await;
             };
@@ -81,6 +88,13 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         }
                         Ok(Action::Remove(id)) => {
                             report(&tx, client.remove(&id).await.map_err(|e| e.to_string()))
+                        }
+                        Ok(Action::StartService) => {
+                            // Calling the name is what triggers D-Bus
+                            // activation; `Client::connect` just asks for a
+                            // proxy, so make a real call to force the bus to
+                            // start the service if it can.
+                            report(&tx, client.snapshot().await.map(|_| ()).map_err(|e| e.to_string()))
                         }
                         Err(TryRecvError::Empty) => break,
                         // The window is gone; nothing left to do.
@@ -123,6 +137,9 @@ pub struct TimetrackView {
     snapshot: Snapshot,
     status: Option<String>,
     selected: usize,
+    /// Entity handle, used to attach the start-service button's click handler
+    /// from inside `render` (which only has `&self`).
+    footer_entity: Option<Entity<Self>>,
 }
 
 impl TimetrackView {
@@ -134,6 +151,7 @@ impl TimetrackView {
             snapshot: Snapshot::default(),
             status: None,
             selected: 0,
+            footer_entity: None,
         };
         view.schedule_poll(cx);
         view
@@ -226,6 +244,19 @@ impl TimetrackView {
         true
     }
 
+    /// Whether the service has not been seen yet, in which case the window
+    /// offers to start it instead of just complaining.
+    fn service_missing(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_some_and(|s| s.contains("not running"))
+    }
+
+    /// Ask the service thread to try starting the service for us.
+    fn try_start_service(&self) {
+        self.send(Action::StartService);
+    }
+
     fn footer(&self) -> String {
         self.status.clone().unwrap_or_else(|| {
             "space start/stop · c cancel · d delete · j/k move · q quit".to_string()
@@ -241,6 +272,7 @@ impl Render for TimetrackView {
         let now = timetrack_core::now_ms();
         let running = self.snapshot.running().cloned();
         let this = cx.entity();
+        self.footer_entity = Some(this.clone());
 
         div()
             .flex()
@@ -379,11 +411,44 @@ impl TimetrackView {
     }
 
     fn render_footer(&self) -> impl IntoElement {
+        if self.service_missing() {
+            let Some(this) = self.footer_entity.clone() else {
+                return div().into_any_element();
+            };
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_6()
+                .py_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xc8c8d8))
+                        .child(self.status.clone().unwrap_or_default()),
+                )
+                .child(
+                    div()
+                        .id("start-service")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(0x2ea043))
+                        .text_color(rgb(0xffffff))
+                        .on_click(move |_ev, _window, cx| {
+                            this.update(cx, |view, _cx| view.try_start_service());
+                        })
+                        .child("Start the service"),
+                )
+                .into_any_element();
+        }
         div()
             .px_6()
             .py_2()
             .text_sm()
             .text_color(rgb(0x6a6a80))
             .child(self.footer())
+            .into_any_element()
     }
 }

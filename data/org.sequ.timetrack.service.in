@@ -1,0 +1,9 @@
+[D-BUS Service]
+Name=org.sequ.timetrack
+# D-Bus launches Exec directly -- it is NOT run through a shell, so this must
+# be a real executable path, not `sh -c ...`.
+#
+# The service lives on the host, not in the flatpak: a sandboxed GUI cannot
+# run host binaries, so activation must resolve to an installed binary.
+# /usr/bin first (package install), then the user's own bin.
+Exec=/usr/bin/timetrack-service

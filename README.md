@@ -51,10 +51,16 @@ apt install libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-
 
 ## Running
 
-Start the service, then whichever client you want:
+The service owns the running timer; the clients are clients. Start it once and
+leave it:
 
 ```sh
-timetrack-service &          # or via the systemd user unit, see below
+timetrack-service &
+```
+
+Then either client:
+
+```sh
 timetrack                    # TUI
 timetrack start "writing"    # or one-shot
 timetrack status
@@ -62,13 +68,34 @@ timetrack status
 
 The TUI: `space` start/stop, `c` cancel, `d` delete, `j`/`k` move, `q` quit.
 
-To run the service at login:
+### The service has to be installed once
+
+The GUI is a flatpak and cannot run host binaries, so it cannot start the
+service itself. Install the service and a D-Bus activation file on the host;
+after that the session bus starts it on demand and the GUI never has to:
+
+```sh
+install -Dm755 timetrack-service ~/.local/bin/timetrack-service
+mkdir -p ~/.local/share/dbus-1/services
+sed 's|/usr/bin/timetrack-service|$HOME/.local/bin/timetrack-service|' \
+  data/org.sequ.timetrack.service.in \
+  > ~/.local/share/dbus-1/services/org.sequ.timetrack.service
+```
+
+Without that, the window opens but reports that the service is not running. The
+GUI also offers a **Start the service** button, which works once the activation
+file is in place.
+
+To have it running at login instead:
 
 ```sh
 mkdir -p ~/.config/systemd/user
 cp data/org.sequ.timetrack.service ~/.config/systemd/user/
 systemctl --user enable --now timetrack.service
 ```
+
+Note that `Exec=` in a D-Bus service file is **not** run through a shell, so it
+must be an absolute path to a real executable -- `sh -c ...` does not work.
 
 ## The terminal client
 
@@ -112,19 +139,9 @@ reproducible.
 
 ## Known issues
 
-**The GUI has never displayed a window.** It builds, links, and starts without
-panicking, and under `Xvfb` it maps `libX11`, `libGLX` and `libvulkan` and runs
-30 threads including its zbus connection thread — so the process is healthy. But
-no window ever appears, and Xvfb cannot prove that it would.
-
-`gpui_linux::current_platform` picks a backend from `gpui::guess_compositor()`,
-which only looks at `WAYLAND_DISPLAY` and `DISPLAY`. With `DISPLAY=:99` it does
-select X11 — yet the process ends up holding 5 DRM fds and *zero* X11 socket
-fds, and rendering falls back to Vulkan, which Xvfb has no presentation path
-for. So Xvfb exercises process startup and the gpui event loop, not rendering.
-
-Testing rendering needs a real display: run it inside a nested Wayland
-compositor (sway, cage or weston), or on a normal session of this machine.
+**The GNOME 51 beta manifest is unbuilt.** `org.sequ.timetrack.beta.json`
+is identical to the GNOME 50 one apart from `runtime-version`, and the GNOME
+50 build succeeds, but the 51 build has not been run.
 
 ## Licence
 
