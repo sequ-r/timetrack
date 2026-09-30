@@ -8,39 +8,52 @@
 //! The main window: status, entry list, and the bridge to the service.
 //!
 //! GPUI is single-threaded and owns the UI, but zbus is async, so the two meet
-//! through `cx.spawn`: a gpui async task drives the bus connection and pushes
-//! snapshots back with `cx.update`. The view holds no authoritative state —
-//! everything it draws comes from a `Snapshot` the service produced, which is
-//! what keeps the GUI and the CLI consistent when both are open.
+//! across a thread boundary: a background thread owns a tokio runtime and the
+//! bus connection and forwards snapshots over a channel, while the UI drains
+//! that channel during `render`. The view holds no authoritative state — every
+//! pixel it draws comes from a `Snapshot` the service produced, which is what
+//! keeps the GUI and the CLI consistent when both are open.
 
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, Render, Window, WindowHandle, div, prelude::*, px, rgb, rgb_u8,
+    AsyncApp, Context, InteractiveElement, IntoElement, Render, StatefulInteractiveElement, Styled,
+    Window, div, px, rgb, rgba,
 };
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::Duration;
 use timetrack_proto::Snapshot;
 
-/// How often the view redraws while a timer is running.
-const TICK: Duration = Duration::from_millis(250);
-
-/// How often the service is polled.
+/// How often the service is polled for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(1000);
 
-/// Messages from the background service thread.
+/// A snapshot handed from the service thread to the UI thread.
 enum Msg {
     Snapshot(Box<Snapshot>),
     Error(String),
 }
 
-/// Owns a tokio runtime and the bus connection on its own thread, and forwards
-/// snapshots to the UI thread over a channel.
-fn spawn_service_thread(
-    actions: std::sync::mpsc::Receiver<Action>,
-) -> Receiver<Msg> {
+/// A command the UI wants performed. The service thread owns the bus
+/// connection, so the UI cannot issue D-Bus calls itself.
+#[derive(Debug, Clone)]
+enum Action {
+    Start(String),
+    Stop,
+    Cancel,
+    Remove(String),
+}
+
+/// Spawn the service thread. Returns `(messages_rx, actions_tx)`.
+fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        // Both zbus backends end up enabled here: gpui pulls in async-io, this
+        // workspace asks for tokio, and Cargo unions them. zbus' executor
+        // prefers its `tokio` branch, so it calls `tokio::task::spawn_blocking`
+        // and panics with "there is no reactor running" unless a tokio runtime
+        // is entered on this thread.
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
         {
@@ -52,9 +65,13 @@ fn spawn_service_thread(
                 return;
             }
         };
-        rt.block_on(async {
+        // Enter the runtime for this thread so that any tokio API called from
+        // a worker thread — including zbus' `spawn_blocking`, which panics with
+        // "there is no reactor running" otherwise — finds a runtime context.
+        let _guard = rt.enter();
+        rt.block_on(async move {
             // Wait for the service, but keep retrying: the user may start it
-            // after the GUI, and the window should recover without a restart.
+            // after the window opens, and the GUI should recover on its own.
             let client = loop {
                 if let Ok(c) = timetrack_proto::Client::connect().await {
                     break c;
@@ -64,27 +81,33 @@ fn spawn_service_thread(
                 ));
                 tokio::time::sleep(Duration::from_secs(2)).await;
             };
+
             loop {
-                // Drain any commands the UI queued, then refresh once. Batching
-                // them here means one bus round trip per tick, not per keypress.
-                let mut dirty = false;
+                // Drain queued commands first, then refresh once. Batching
+                // them means one bus round trip per tick, not per keypress.
                 loop {
-                    match actions.try_recv() {
-                        Ok(Action::Start(d)) => report(&tx, client.start(&d).await.map(|_| ())),
-                        Ok(Action::Stop) => report(&tx, client.stop().await.map(|_| ())),
-                        Ok(Action::Cancel) => report(&tx, client.cancel().await.map(|_| ())),
-                        Ok(Action::Remove(id)) => report(&tx, client.remove(&id).await),
+                    match action_rx.try_recv() {
+                        Ok(Action::Start(d)) => {
+                            report(&tx, client.start(&d).await.map(|_| ()).map_err(|e| e.to_string()))
+                        }
+                        Ok(Action::Stop) => {
+                            report(&tx, client.stop().await.map(|_| ()).map_err(|e| e.to_string()))
+                        }
+                        Ok(Action::Cancel) => {
+                            report(&tx, client.cancel().await.map(|_| ()).map_err(|e| e.to_string()))
+                        }
+                        Ok(Action::Remove(id)) => {
+                            report(&tx, client.remove(&id).await.map_err(|e| e.to_string()))
+                        }
                         Err(TryRecvError::Empty) => break,
-                        // The UI dropped the channel: nothing left to do.
+                        // The window is gone; nothing left to do.
                         Err(TryRecvError::Disconnected) => return,
                     }
-                    dirty = true;
                 }
-                let _ = dirty;
                 match client.snapshot().await {
                     Ok(s) => {
                         if tx.send(Msg::Snapshot(Box::new(s))).is_err() {
-                            return; // the UI is gone; stop the thread
+                            return;
                         }
                     }
                     Err(e) => {
@@ -97,75 +120,79 @@ fn spawn_service_thread(
             }
         });
     });
-    rx
+    (rx, action_tx)
 }
 
-/// Forward a command result to the UI, preserving the service's own wording.
-fn report<T>(tx: &std::sync::mpsc::Sender<Msg>, r: Result<T>) {
-    if let Err(e) = r {
-        let _ = tx.send(Msg::Error(e.to_string()));
+/// Forward a command failure to the UI, keeping the service's own wording.
+///
+/// Takes an already-rendered message rather than a `Result`, because `Result`
+/// is ambiguous in this crate: `anyhow` exports a one-parameter alias and gpui
+/// re-exports its own, so naming either one here is a coin flip.
+fn report(tx: &Sender<Msg>, outcome: std::result::Result<(), String>) {
+    if let Err(e) = outcome {
+        let _ = tx.send(Msg::Error(e));
     }
 }
 
 pub struct TimetrackView {
     rx: Receiver<Msg>,
+    actions: Sender<Action>,
     snapshot: Snapshot,
     status: Option<String>,
     selected: usize,
-    /// When the current snapshot arrived, so the clock can be interpolated
-    /// between polls instead of visibly stuttering once a second.
-    last_poll: Instant,
-    /// Actions requested by the UI, executed by the service thread.
-    actions: std::sync::mpsc::Sender<Action>,
-}
-
-/// A command the UI wants performed. The service thread owns the bus
-/// connection, so the UI cannot issue D-Bus calls itself.
-#[derive(Debug, Clone)]
-pub enum Action {
-    Start(String),
-    Stop,
-    Cancel,
-    Remove(String),
 }
 
 impl TimetrackView {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let (actions_tx, actions_rx) = std::sync::mpsc::channel();
+        let (rx, actions) = spawn_service_thread();
         let view = TimetrackView {
-            rx: spawn_service_thread(actions_rx),
+            rx,
+            actions,
             snapshot: Snapshot::default(),
             status: None,
             selected: 0,
-            last_poll: Instant::now(),
-            actions: actions_tx,
         };
-        view.schedule_tick(cx);
+        view.schedule_poll(cx);
         view
     }
 
-    /// Keep a redraw coming so the running clock advances smoothly.
-    fn schedule_tick(self: &Entity<Self>, cx: &mut Context<Self>) {
-        let this = self.clone();
-        cx.spawn(async move |_, cx| {
+    /// Re-render roughly twice a second so the running clock advances smoothly
+    /// and a queued service snapshot shows up promptly.
+    ///
+    /// `cx.spawn` hands the future a `WeakEntity`, so the entity is not kept
+    /// alive by its own timer task; if the window closes the upgrade fails and
+    /// the loop ends.
+    fn schedule_poll(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor()
-                    .timer(TICK)
+                    .timer(Duration::from_millis(500))
                     .await;
-                this.update(cx, |view, _cx| {
-                    view.last_poll = Instant::now();
-                });
+                if this.update(cx, |view, _cx| view.drain()).is_err() {
+                    return;
+                }
             }
         })
         .detach();
     }
 
+    // NOTE: the service connection deliberately does NOT happen inside a
+    // `cx.spawn` future. gpui drives those on its own executor, whose threads
+    // have no tokio context, and zbus' `spawn_blocking` panics there with
+    // "there is no reactor running". Everything bus-related is therefore
+    // confined to the dedicated std::thread in `spawn_service_thread`, which
+    // owns a tokio runtime of its own.
+
+    /// Fold every queued message into one refresh. Several may be pending and
+    /// only the newest snapshot matters.
     fn drain(&mut self) {
         loop {
             match self.rx.try_recv() {
                 Ok(Msg::Snapshot(s)) => {
                     self.snapshot = *s;
                     self.status = None;
+                    // The list can shrink under the cursor when an entry is
+                    // removed, which would otherwise index out of bounds.
                     if self.selected >= self.snapshot.entries.len() {
                         self.selected = self.snapshot.entries.len().saturating_sub(1);
                     }
@@ -180,42 +207,39 @@ impl TimetrackView {
         }
     }
 
-    /// Send a command to the service thread.
     fn send(&self, a: Action) {
         let _ = self.actions.send(a);
     }
 
-    /// Handle a key. Returns false when the key means "quit".
-    fn on_key(&mut self, key: &gpui::KeyEvent, _cx: &mut Context<Self>) -> bool {
-        use gpui::KeyCode;
-        match key.keystroke.key_char {
-            Some('q') => return false,
-            Some(' ') => {
+    /// Handle a key press. Returns false when the app should quit.
+    fn on_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        let Some(ch) = ev.keystroke.key_char.as_deref() else {
+            return true;
+        };
+        match ch {
+            "q" => return false,
+            " " => {
                 if self.snapshot.running().is_some() {
                     self.send(Action::Stop);
                 } else {
                     self.send(Action::Start(String::new()));
                 }
             }
-            Some('s') => self.send(Action::Stop),
-            Some('c') => self.send(Action::Cancel),
-            Some('d') => {
+            "s" => self.send(Action::Stop),
+            "c" => self.send(Action::Cancel),
+            "d" => {
                 if let Some(e) = self.snapshot.entries.get(self.selected) {
                     let id = e.id.clone();
                     self.send(Action::Remove(id));
                 }
             }
-            Some('j') | Some('k') => {
-                let len = self.snapshot.entries.len();
-                match key.keystroke.key_char {
-                    Some('j') if self.selected + 1 < len => self.selected += 1,
-                    Some('k') => self.selected = self.snapshot.entries.saturating_sub(1),
-                    _ => {}
+            "j" => {
+                if self.selected + 1 < self.snapshot.entries.len() {
+                    self.selected += 1;
                 }
             }
-            _ => {
-                let _ = key.code;
-            }
+            "k" => self.selected = self.selected.saturating_sub(1),
+            _ => {}
         }
         true
     }
@@ -230,27 +254,24 @@ impl TimetrackView {
 impl Render for TimetrackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain();
-        self.schedule_tick(cx);
+        self.schedule_poll(cx);
 
         let now = timetrack_core::now_ms();
         let running = self.snapshot.running().cloned();
-
         let this = cx.entity();
+
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0x11111b))
             .text_color(rgb(0xe6e6f0))
-            .track_focus(&this)
-            .on_key_down(move |_ev, _w, cx| {
-                // The view cannot mutate itself from inside a closure, so the
-                // key is handled by its own entity.
+            .on_key_down(move |ev, _window, cx| {
                 this.update(cx, |view, cx| {
-                    if !view.on_key(&_ev, cx) {
+                    if !view.on_key(ev) {
                         cx.quit();
                     }
-                })
+                });
             })
             .child(self.render_status(running.as_ref(), now))
             .child(self.render_entries(now))
@@ -281,17 +302,13 @@ impl TimetrackView {
                             .px_3()
                             .py_1()
                             .rounded_md()
-                            .bg(if running.is_some() {
-                                rgb_u8(0x2ea043, 0xff)
+                            .bg(rgba(if running.is_some() {
+                                0x2ea043ff
                             } else {
-                                rgb_u8(0x3a3a4a, 0xff)
-                            })
+                                0x3a3a4aff
+                            }))
                             .text_color(rgb(0xffffff))
-                            .child(if running.is_some() {
-                                " RUNNING"
-                            } else {
-                                " IDLE"
-                            }),
+                            .child(if running.is_some() { " RUNNING" } else { " IDLE" }),
                     )
                     .child(
                         div()
@@ -301,14 +318,11 @@ impl TimetrackView {
                     ),
             )
             .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x9a9ab0))
-                    .child(format!(
-                        "total {}   ·   {} entries",
-                        timetrack_core::format_duration(self.snapshot.total_ms),
-                        self.snapshot.entries.len()
-                    )),
+                div().text_sm().text_color(rgb(0x9a9ab0)).child(format!(
+                    "total {}   ·   {} entries",
+                    timetrack_core::format_duration(self.snapshot.total_ms),
+                    self.snapshot.entries.len()
+                )),
             )
             .child(
                 div()
@@ -323,14 +337,6 @@ impl TimetrackView {
     }
 
     fn render_entries(&self, now: i64) -> impl IntoElement {
-        let header = div()
-            .px_6()
-            .pt_2()
-            .pb_1()
-            .text_sm()
-            .text_color(rgb(0x7a7a90))
-            .child("ENTRIES (NEWEST FIRST)");
-
         if self.snapshot.entries.is_empty() {
             return div()
                 .flex_1()
@@ -346,7 +352,6 @@ impl TimetrackView {
 
         let rows = self.snapshot.entries.iter().enumerate().map(|(i, e)| {
             let selected = i == self.selected;
-            let marker = if e.is_running() { "*" } else { " " };
             div()
                 .flex()
                 .items_center()
@@ -354,11 +359,11 @@ impl TimetrackView {
                 .px_6()
                 .py_1()
                 .bg(if selected {
-                    rgb_u8(0x2a2a3a, 0xff)
+                    rgba(0x2a2a3aff)
                 } else {
-                    rgb_u8(0x000000, 0x00)
+                    rgba(0x00000000)
                 })
-                .child(div().w_4().text_color(rgb(0x2ea043)).child(marker))
+                .child(div().w_4().text_color(rgb(0x2ea043)).child(if e.is_running() { "*" } else { " " }))
                 .child(
                     div()
                         .w(px(110.))
@@ -375,9 +380,18 @@ impl TimetrackView {
         });
 
         div()
+            .id("entries")
             .flex_1()
             .overflow_y_scroll()
-            .child(header)
+            .child(
+                div()
+                    .px_6()
+                    .pt_2()
+                    .pb_1()
+                    .text_sm()
+                    .text_color(rgb(0x7a7a90))
+                    .child("ENTRIES (NEWEST FIRST)"),
+            )
             .child(div().flex().flex_col().children(rows))
             .into_any_element()
     }

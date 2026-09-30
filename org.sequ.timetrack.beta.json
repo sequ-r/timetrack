@@ -34,31 +34,20 @@
     ],
     "modules": [
         {
-            "name": "rust-toolchain",
-            "buildsystem": "simple",
-            "build-commands": [
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh",
-                "sh rustup-init.sh -y --default-toolchain 1.98.0 --profile minimal --no-modify-path"
-            ]
-        },
-        {
             "name": "timetrack",
             "buildsystem": "simple",
             "sources": [
                 {
-                    "type": "dir",
-                    "path": "..",
-                    "skip": [
-                        "target",
-                        ".flatpak-builder",
-                        ".git"
-                    ]
+                    "type": "git",
+                    "url": "https://github.com/sequ-r/timetrack.git",
+                    "branch": "main"
                 }
             ],
             "build-commands": [
-                "export PATH=\"$RUSTUP_HOME/toolchains/1.98.0-x86_64-unknown-linux-gnu/bin:$PATH\"",
-                "cargo build --release --locked --package timetrack-gui",
-                "install -Dm0755 target/release/timetrack /app/bin/timetrack",
+                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o rustup-init.sh",
+                "sh rustup-init.sh -y --default-toolchain 1.98.0 --profile minimal --no-modify-path",
+                "export PATH=\"$RUSTUP_HOME/toolchains/1.98.0-x86_64-unknown-linux-gnu/bin:$PATH\" && cargo build --release --locked --package timetrack-gui",
+                "install -Dm0755 target/release/timetrack-gui /app/bin/timetrack",
                 "install -Dm0644 data/org.sequ.timetrack.desktop /app/share/applications/org.sequ.timetrack.desktop",
                 "install -Dm0644 data/org.sequ.timetrack.metainfo.xml /app/share/metainfo/org.sequ.timetrack.metainfo.xml",
                 "install -Dm0644 data/icons/hicolor/scalable/apps/org.sequ.timetrack.svg /app/share/icons/hicolor/scalable/apps/org.sequ.timetrack.svg",
