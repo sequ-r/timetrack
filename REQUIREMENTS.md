@@ -1,7 +1,11 @@
 # TimeTrack requirements
 
-Status: **agreed.** Every question is answered; there are no open decisions.
-Sections marked **[DECIDED]** were settled with the author.
+Status: **agreed and largely built.** Every question is answered; there are no
+open decisions. Sections marked **[DECIDED]** were settled with the author.
+
+> **What exists right now** is tracked in [§15 Build status](#15-build-status).
+> This document is the specification; §15 is the gap between it and the code.
+> Where the two disagree, the code is what ships and §15 says so.
 
 The two decisions that shaped everything else: totals are **sum of durations**
 (§4) and the **running timer is cut** (§7). Together they simplify the model
@@ -42,7 +46,8 @@ fact, entries can be deleted, and entries can be split and merged.
 monthly per-project totals are the product. Export is for showing someone else.
 
 **[DECIDED] Manual entry is a first-class input method**, alongside quick-add
-increments and (retained?) a running timer.
+increments. A running timer was considered here and cut in §7; the "retained?"
+is resolved as **no**.
 
 **[DECIDED]** The service owns all state; the GUI and CLI are clients. This
 already works and is not up for renegotiation.
@@ -410,4 +415,68 @@ treated as follow-ups rather than blockers:
   per-project rows and the undo path. If §5/§8 in practice need more room than
   that, a fourth tab is the likely fix.
 
-The app is ready to build.
+The app is ready to build. It has since been built — see §15.
+
+## 15. Build status
+
+Where the code stands against the sections above. Recorded here so the
+specification and the implementation do not quietly diverge.
+
+### Built and verified
+
+| Requirement | Where | Verified by |
+|---|---|---|
+| §3 Model, `ended_at: i64` | `core/src/model.rs` | 72 core tests |
+| §4 Sum of durations, overlap counted twice | `core/src/aggregate.rs` | unit tests + e2e totals |
+| §4 >24h/day warning, never a rejection | `core/src/rules.rs::days_exceeding_24h` | e2e |
+| §5 Methods 1–4 | core, service, CLI | e2e exercises all four |
+| §5 Shorten never deletes | `rules.rs::set_times` | service test |
+| §5 Undo refuses a non-quick-add | `rules.rs` + service | e2e and unit tests |
+| §6 Quick-add 5/15/30/60, own entry each | `rules.rs::quick_add` | e2e |
+| §7 Timer cut; no `running` anywhere | whole tree | a test asserts no `running` field exists |
+| §8 Split and merge | core + service D-Bus | unit tests; **not in the GUI** |
+| §8 Merge takes the union, may shrink the total | `rules.rs::merge_entries` | tests assert both cases |
+| §9 ISO weeks, months, per-project | `core/src/aggregate.rs` | boundary tests |
+| §9 Aggregation applied by the service | `service/src/interface.rs` | e2e |
+| §11 Three tabs | `gui/src/app.rs` | screenshot |
+| §11 Week total large, at the top, nothing above it | `gui/src/app.rs`, 72px | screenshot |
+| §14 Archived projects stay in totals | `rules.rs::set_archived` | service test |
+| §2 Version field, no migration | `model.rs::STORE_VERSION` | storage test |
+| §2 Corrupt store refused, not reset | `storage.rs` | storage test |
+| §13 Core free of GUI/IPC/async/clock | `core/` | by construction |
+
+### Specified but not built
+
+- **§10 CSV export.** Agreed in full: CSV format, ISO 8601 timestamps, duration
+  in both `HH:MM:SS` and minutes, a `source` column, exportable from the GUI,
+  scoped to a period. **No implementation exists.** The Export tab currently
+  shows the column list and a preview of the rows, and writes no file. This is
+  the largest remaining gap and the only one that blocks the stakeholder
+  workflow §1 exists to serve.
+- **§5 drag-to-trim.** Deferred by decision, not by omission.
+- **§5 Methods 1 and 2 as one dialog.** The *rule* is settled and the CLI
+  honours it; the GUI has no entry dialog at all yet, so there is nothing to
+  merge.
+- **§11 proportional bars** on the per-project rows. Rows show the time; the bar
+  is not drawn.
+- **§11 project rename and recolour.** Create and archive exist; rename and
+  recolour do not, and the GUI's "New project" invents a numbered default name
+  because there is no text field.
+- **§8 split/merge in the GUI.** On the service and core, unreachable from the
+  UI.
+- **§11 tabs switched by keyboard.** Tabs respond to clicks; the shortcuts are
+  not wired.
+
+### Known defects and gaps
+
+- **The timezone offset is resolved once at startup, fixed-offset only.** A
+  named `TZ` such as `Europe/Rome` falls back to UTC, and a zone observing DST
+  can bucket an entry into the wrong local day near a week boundary. §9 assumes
+  correct local-time bucketing, so this is a real shortfall against the spec,
+  not a nicety. A tz-database lookup per instant is the fix.
+- **GUI keyboard shortcuts are unverified.** The wiring follows gpui's dispatch
+  rules — the root needs an id, a `FocusHandle` and focus — and is in place, but
+  the headless X server used for testing has no keymap and cannot deliver a
+  keystroke. Untested, not known-broken.
+- **The GUI's "New project" name is a placeholder** (`Project 1`, `Project 2`).
+  Functional but not what §11 asks for.

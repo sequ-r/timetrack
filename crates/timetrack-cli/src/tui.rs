@@ -126,7 +126,9 @@ impl App {
             // --- method 2: a duration ending now ---
             KeyCode::Char('a') => {
                 let Some(project) = self.current_project().map(|p| p.id.clone()) else {
-                    self.status = Some("create a project first (p)".into());
+                    self.status = Some(
+                        "no project yet -- create one with: timetrack project \"Work\"".into(),
+                    );
                     return;
                 };
                 // Thirty minutes is the middle default and the least
@@ -201,7 +203,8 @@ impl App {
     /// Add one of the quick-add buckets to the selected project.
     async fn quick_add(&mut self, duration_ms: i64) {
         let Some(project) = self.current_project().map(|p| p.id.clone()) else {
-            self.status = Some("create a project first (p)".into());
+            self.status =
+                Some("no project yet -- create one with: timetrack project \"Work\"".into());
             return;
         };
         let name = self
