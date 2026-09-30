@@ -3,10 +3,14 @@
 Status: draft for discussion. Sections marked **[DECIDED]** were settled with
 the author; **[OPEN]** needs an answer before the work is scoped.
 
-The two structural questions are now closed: **totals are sum of durations**
-(§4) and **the running timer is cut** (§7). Both simplify the model
-substantially — every entry is closed, and the service stops being a state
-machine owner. Six questions remain, listed in §13.
+All structural questions are now closed. Totals are **sum of durations** (§4)
+and the **running timer is cut** (§7), which together simplify the model
+substantially: every entry is closed, and the service stops being a state
+machine owner. Quick-add durations, week boundaries, export format, storage
+migration and the GUI layout are all settled too (§6, §9, §10, §2, §11).
+
+What remains open is sizing and naming, listed in §14. The app is ready to
+scope.
 
 ## 1. What this app is
 
@@ -42,6 +46,12 @@ increments and (retained?) a running timer.
 
 **[DECIDED]** The service owns all state; the GUI and CLI are clients. This
 already works and is not up for renegotiation.
+
+**[DECIDED] Start clean on storage.** The existing `store.json` files are
+throwaway — they were created while developing the timer model, and they hold
+entries whose shape is now wrong. No migration is written; an unreadable store
+produces a clear "unsupported or corrupt store" message rather than a crash.
+A version field is added now so a future migration has something to branch on.
 
 **[DECIDED]** Edition 2024, gpui-ce for the GUI, ratatui for the CLI.
 
@@ -107,7 +117,7 @@ Consequences accepted:
 - The data model already stores raw intervals, so switching to union later would
   need no migration. Only the aggregation code would change.
 
-## 5. Manual entry **[OPEN — scope]**
+## 5. Manual entry **[OPEN — scope for v1]**
 
 The ways time should be enterable:
 
@@ -148,13 +158,18 @@ Still ambiguous, and the two readings are genuinely different features:
 the same project into a single "1h 15m · 15 taps" style row. (a) silently
 rewrites history, which is exactly what §8's editing exists to avoid.
 
-Other details:
+**[DECIDED]** Durations are **5, 15, 30 and 60 minutes**, one button each.
 
-- Fixed 5 minutes, or selectable (5 / 15 / 30 / 60)? Recommend **5 and 30**, one
-  key each.
+- Four buttons is the whole set. More invites deliberation; fewer forces
+  arithmetic, and the point of quick-add is to avoid that.
 - Applies to the **selected** project, always.
-- **Undo must be immediate** for quick-add, and it must be the last thing
-  pressed — with one-click actions, mistakes are certain.
+- **Undo must be the last thing pressed**, always visible, and undo the whole
+  step. With four one-click buttons, mistakes are certain.
+
+Where they live is §14: on the Home tab, under the clock.
+
+Not in scope: custom durations from the quick-add row. Use the manual entry
+dialog (§5) for anything unusual.
 
 ## 7. Running timer: cut **[DECIDED]**
 
@@ -222,7 +237,7 @@ total would be worse.
 Documented in the UI (the confirmation says the duration will shrink by the
 overlap), and covered by tests.
 
-## 9. Weekly and monthly totals **[OPEN — scope]**
+## 9. Weekly and monthly totals **[DECIDED]**
 
 The stated goal: "how much time I spend on a particular project any given week
 and month."
@@ -232,27 +247,86 @@ Needed:
 - Per-project totals for a week, and for a month.
 - A single total for the same periods.
 - Navigation between weeks/months; "this week", "last week".
-- **Week boundaries need defining**: ISO weeks (Monday start) is the obvious
-  default, but it must be a stated decision, because it determines what a
-  "weekly total" means at a month boundary.
+**[DECIDED] ISO weeks** (Monday 00:00 to Sunday 23:59:59, local time). Stated
+explicitly because it determines what "this week's total" means when a week
+straddles a month boundary.
 
-Do these aggregate live in the service or in the clients? Recommend the
-**service**: one implementation, both UIs agree, and it can be tested once.
+Months are calendar months, local time.
 
-## 10. Export **[DECIDED as a requirement, format OPEN]**
+**[DECIDED] Aggregation lives in the service.** One implementation, both UIs
+agree, and it is testable once. A week boundary rule implemented twice is a bug
+waiting to happen — and the CLI and GUI would be free to disagree, which is
+exactly the class of problem the shared core exists to prevent.
+
+Consequences: the service gains weekly/monthly aggregate methods, and the
+snapshot grows the current week's figures so a client can render the Home tab
+without a second round trip.
+
+## 10. Export **[DECIDED]**
 
 Export to something a stakeholder can open.
 
-- **CSV vs XLSX.** CSV opens in Excel, is trivially diffable, needs no library,
-  and any spreadsheet tool reads it. XLSX allows multiple sheets and formatting.
-  Recommend **CSV first**; add XLSX only if someone actually asks for a
-  formatted multi-sheet workbook.
+**[DECIDED] CSV.** Opens in Excel, is diffable and greppable, needs no library,
+and any spreadsheet tool reads it. XLSX is deferred: it earns its place only if
+someone wants a formatted multi-sheet workbook, which nobody has asked for.
+
+- One row per entry, with a header row.
+- Times as ISO 8601 local timestamps (`2026-09-29T14:00:00`), not epoch millis —
+  a stakeholder opens this in Excel, not in a hex editor.
+- Duration in both `HH:MM:SS` and raw minutes, so the file is readable without
+  arithmetic.
+- Include the `source` column, so hand-entered time is visible to the reader.
 - Must be exportable **from the GUI**, not only the CLI — the stakeholder
   workflow should not require opening a terminal.
 - Scope of an export: current week, a chosen week, a chosen month, or all time.
 - Should include the `source` column, so hand-entered time is visible.
 
-## 11. Non-goals
+## 11. GUI structure **[DECIDED]**
+
+The window is tabbed. The **Home** tab is the only one that is a dashboard;
+everything else is reached by switching tabs.
+
+### Home tab, top to bottom
+
+1. **A large clock.** Replaces the live timer (§7) as the window's focal
+   point. The question is what it shows, and it cannot be a ticking stopwatch —
+   there is no timer. Recommended: the **current wall-clock time**, large. It
+   anchors the layout, it is genuinely useful at a glance, and it needs no
+   ticking.
+
+   Alternative if it feels decorative: the week total instead, with the clock
+   demoted to the title bar.
+
+2. **This week's total.** Large, unambiguous, the sum of every entry this ISO
+   week (§9). Sitting directly under the clock, it answers the question the app
+   exists for in one glance.
+
+3. **Quick-add buttons.** The four durations from §6 (5 / 15 / 30 / 60), each
+   applying to whichever project is selected.
+
+4. **Per-project totals for this week**, one row per project: name, time, and
+   ideally a bar proportional to the total so the distribution is readable
+   without reading every number.
+
+5. **Undo**, immediately after the quick-add buttons — the last thing pressed.
+
+### Other tabs
+
+Named tentatively; content follows from §5/§8/§10:
+
+- **Entries** — the list, filterable by project and date, fully editable
+  (rename, retime, split, merge, delete).
+- **Projects** — create, rename, recolour, archive.
+- **Export** — CSV, for the chosen period.
+
+### Notes
+
+- Project selection is global window state, not per-tab, so quick-add always
+  has an unambiguous target.
+- Tabs are switched with keyboard shortcuts as well as clicks, since every
+  other action in this app is a keystroke.
+
+## 12. Non-goals
 
 Stating these now, to keep them from arriving later as "small features":
 
@@ -263,7 +337,7 @@ Stating these now, to keep them from arriving later as "small features":
 - Recurring or scheduled entries.
 - Timezone-aware "work hours" or overtime logic.
 
-## 12. Architecture consequences
+## 13. Architecture consequences
 
 The service/CLI/GPUI split is unaffected and stays. What changes:
 
@@ -271,31 +345,39 @@ The service/CLI/GPUI split is unaffected and stays. What changes:
 |---|---|
 | `timetrack-core` | `Entry` gains `project_id`, `source`, `note`. New `Project` type. New split/merge and time-edit operations in the state machine. Overlap is no longer an error. |
 | Store format | Schema change. Needs a migration for existing `store.json` files, or a version bump with a clear "unsupported format" message. |
-| D-Bus protocol | New methods: create/update entry, create/list projects, split, merge, weekly/monthly aggregates. Existing `Snapshot` needs the new fields. |
+| D-Bus protocol | New methods: create/update entry, create/list projects, split, merge, weekly/monthly aggregates (§9). `Snapshot` gains the new fields and loses `running`. |
+| Store | Version field added; no migration (start clean, §2). |
 | Service | Becomes the aggregation point (§9). |
-| GUI | Manual-entry dialog, project selector, weekly/monthly view. |
+| GUI | Rebuild the window as the tabbed Home/Entries/Projects/Export layout (§11), plus a manual-entry dialog and a project selector. |
 | CLI | New subcommands for the same. |
 
 Both crates keep their existing properties: core stays free of GUI/IPC/async,
 and the state machine keeps taking an explicit timestamp so it stays testable
 without a clock.
 
-## 13. Open questions, collected
+## 14. Open questions, collected
 
-Answered since the first draft:
+Answered, in the order asked:
 
-- ~~**§4** sum or wall-clock union?~~ → **sum of durations**, with a >24h/day warning.
-- ~~**§7** keep or cut the running timer?~~ → **cut**; quick-add and merge
-  replace it.
+- **Totals** → sum of durations (§4), with a >24h/day warning.
+- **Running timer** → cut (§7); quick-add and merge replace it.
+- **Quick-add durations** → 5 / 15 / 30 / 60 (§6).
+- **Week boundaries** → ISO weeks; aggregation in the service (§9).
+- **Export format** → CSV (§10).
+- **Store migration** → start clean (§2).
+- **GUI layout** → tabbed, with Home as the dashboard (§11).
 
-Still open:
+Still open — all sizing or naming, none architectural:
 
-1. **§5** — which manual entry methods are in scope for v1?
-2. **§6** — is quick-add an increment on an existing entry, or a new
-   short entry of its own? (still ambiguous)
-3. **§9** — ISO weeks? Does aggregation live in the service? (recommend yes/yes)
-4. **§10** — CSV or XLSX? (recommend CSV)
-5. Store format: migrate existing files, or start clean?
-6. **New, from cutting the timer** — the GUI loses its live clock and with it
-   its main visual element. What replaces it? (recommend the current week's
-   total, large, with the project breakdown beneath)
+1. **§5** — do all five manual entry methods ship in v1, or does v1 ship a
+   subset and defer the rest?
+2. **§11** — what the large clock *shows*. Wall-clock time is recommended; the
+   week total is the alternative. Cosmetic, but it is the most prominent element
+   in the window, so worth a deliberate answer rather than a default.
+3. **§11** — tab names and shortcut keys are placeholders.
+4. Do archived projects keep their entries in past totals, or drop out of them?
+   Recommended: entries are never deleted, only archived, and archived projects
+   remain in historical totals — a report should not change because a project
+   was tidied away later.
+
+Everything structural is decided. The app is ready to scope.
