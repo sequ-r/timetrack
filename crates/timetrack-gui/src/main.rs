@@ -24,7 +24,10 @@ use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(720.), px(560.)), cx);
+        // Tall enough for the 72px week total plus the quick-add row, the
+        // per-project list and a few recent entries, without scrolling to
+        // reach the buttons.
+        let bounds = Bounds::centered(None, size(px(760.), px(720.)), cx);
         let _ = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

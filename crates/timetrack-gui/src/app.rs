@@ -28,7 +28,7 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, ElementId, Entity, InteractiveElement, IntoElement, Render,
+    AsyncApp, Context, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement, Render,
     StatefulInteractiveElement, Styled, Window, div, px, rgb, rgba,
 };
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -78,19 +78,38 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
         async_io::block_on(async move {
             // Wait for the service, but keep retrying: the user may start it
             // after the window opens, and the GUI should recover on its own.
+            //
+            // The reported message distinguishes "not there" from "there but
+            // speaking a different interface". Those need different fixes, and
+            // a version mismatch between the GUI and the service is otherwise
+            // indistinguishable from the service being absent.
+            let mut last_error: Option<String> = None;
             let client = loop {
-                if let Ok(c) = timetrack_proto::Client::connect().await {
-                    break c;
+                match timetrack_proto::Client::connect().await {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        let text = e.to_string();
+                        let hint = if text.contains("UnknownInterface")
+                            || text.contains("Unknown interface")
+                        {
+                            "The GUI and the service are different versions.\n\
+                             Reinstall whichever one is older so both speak\n\
+                             org.sequ.timetrack.Entries."
+                        } else {
+                            "the timetrack service is not running. Start it with:\n\
+                             timetrack-service &\n\
+                             (or install it to a systemd user unit -- see the README)"
+                        };
+                        if last_error.as_deref() != Some(hint) {
+                            last_error = Some(hint.to_string());
+                            let _ = tx.send(Msg::Error(format!("{hint}\n\n({text})")));
+                        }
+                    }
                 }
-                // Say what to do about it. "Daemon not running" is a dead
-                // end for a user; this names the command that fixes it.
-                let _ = tx.send(Msg::Error(
-                    "the timetrack service is not running. Start it with:\n\
-                     timetrack-service &\n\
-                     (or install it to a systemd user unit -- see the README)."
-                        .to_string(),
-                ));
-                async_io::Timer::after(Duration::from_secs(2)).await;
+                // Poll briskly: this is a bus round trip to a local process,
+                // and a short backoff means a service started after the window
+                // is picked up almost immediately rather than seconds later.
+                async_io::Timer::after(Duration::from_millis(500)).await;
             };
 
             loop {
@@ -236,6 +255,18 @@ pub struct TimetrackView {
     /// Entity handle, used to attach click handlers from inside `render`
     /// (which only has `&self`).
     entity: Option<Entity<Self>>,
+    /// Focus for the root element.
+    ///
+    /// This is not optional polish. gpui dispatches a key event along the
+    /// ancestor path of the *focused* node only, so without a focused element
+    /// the root's `on_key_down` never runs and the whole keyboard is dead --
+    /// the window looks alive, tabs respond to clicks, and nothing else
+    /// responds to anything. The handle is focused on the first frame.
+    focus: FocusHandle,
+    /// Whether the one-time focus-on-render has happened. Re-focusing every
+    /// frame would steal focus back from anything focusable the user reaches
+    /// later, which would break Tab navigation.
+    focused_once: bool,
 }
 
 impl TimetrackView {
@@ -250,6 +281,8 @@ impl TimetrackView {
             tab: Tab::Home,
             project_cursor: 0,
             entity: None,
+            focus: cx.focus_handle(),
+            focused_once: false,
         };
         view.schedule_poll(cx);
         view
@@ -410,9 +443,19 @@ impl TimetrackView {
 }
 
 impl Render for TimetrackView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain();
         self.schedule_poll(cx);
+
+        // Focus the root on the first frame. `FocusHandle::focus` needs a
+        // `&mut Window`, which `new` does not have, and doing it here is
+        // equivalent: gpui cannot dispatch a key event until a frame exists to
+        // dispatch it against, and the first render is that frame. Without
+        // this the keyboard is dead until the user clicks something focusable.
+        if !self.focused_once {
+            self.focused_once = true;
+            self.focus.focus(window, cx);
+        }
 
         let this = cx.entity();
         self.entity = Some(this.clone());
@@ -420,7 +463,13 @@ impl Render for TimetrackView {
         // The tab strip is the only chrome above the content, and it is chrome
         // rather than data -- the week total is still the first *number* on
         // screen and nothing of substance sits above it.
+        //
+        // The `.id()` and `.track_focus()` are load-bearing, not decoration:
+        // gpui dispatches key events along the ancestor path of the focused
+        // node, and an element with no id is not in the dispatch tree at all.
         div()
+            .id("root")
+            .track_focus(&self.focus)
             .flex()
             .flex_col()
             .size_full()
@@ -492,11 +541,14 @@ impl TimetrackView {
             .items_center()
             .gap_1()
             .px_6()
-            .pt_4()
-            .pb_2()
+            .pt_6()
+            .pb_4()
             .child(
+                // An explicit size rather than a step from the scale: the
+                // largest step (text_3xl) was still smaller than this number
+                // is supposed to be. It has to be the first thing you see.
                 div()
-                    .text_3xl()
+                    .text_size(px(72.))
                     .text_color(rgb(0xffffff))
                     .child(timetrack_core::format_duration(week.total_ms)),
             )

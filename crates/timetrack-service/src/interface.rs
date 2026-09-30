@@ -55,19 +55,41 @@ pub struct EntryService {
 
 impl EntryService {
     pub fn new(store: JsonStore) -> anyhow::Result<Self> {
-        let data = store.load()?;
-        // Continue the id sequence past anything already on disk, so a restart
-        // cannot mint an id that collides with a stored entry.
+        let mut data = store.load()?;
+        // A brand-new store has no projects, and with no project there is
+        // nothing to attribute time to -- which made the Home tab's quick-add
+        // buttons do nothing at all on a fresh install. Seed one so the app
+        // is usable the moment it opens. Only on a genuinely empty store: an
+        // existing one is left exactly as it is, archived projects and all.
+        if data.projects.is_empty() {
+            data.projects.push(timetrack_core::Project {
+                id: "p1".into(),
+                name: "General".into(),
+                colour: None,
+                archived: false,
+            });
+        }
         let ids = Counter::continuing(&data);
         let local_offset_ms = resolve_offset();
-        Ok(EntryService {
+        let service = EntryService {
             inner: Mutex::new(Inner {
                 store,
                 data,
                 ids,
                 local_offset_ms,
             }),
-        })
+        };
+        // Persist the seed immediately, so a read-only store surfaces at
+        // startup rather than on the user's first tap.
+        service.persist()?;
+        Ok(service)
+    }
+
+    /// Write the current state out. Used by the mutation funnel and by
+    /// startup, so both go through the same path.
+    fn persist(&self) -> anyhow::Result<()> {
+        let g = self.inner.lock().expect("service state mutex poisoned");
+        g.store.save(&g.data).map_err(anyhow::Error::from)
     }
 
     /// A consistent view of everything a client needs for one frame.
@@ -510,12 +532,49 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_empty_but_valid_on_a_fresh_store() {
+    fn a_fresh_store_has_no_entries_but_one_project() {
+        // The seeded project is deliberate: with none, the Home tab had
+        // nothing to attribute time to and its quick-add buttons were inert on
+        // a fresh install.
         let (svc, _) = service("fresh");
         let snap = svc.snapshot();
         assert!(snap.entries.is_empty());
-        assert!(snap.projects.is_empty());
         assert_eq!(snap.total_ms, 0);
+        assert_eq!(snap.projects.len(), 1);
+        assert_eq!(snap.projects[0].name, "General");
+        assert!(!snap.projects[0].archived, "the seed must be selectable");
+    }
+
+    #[test]
+    fn the_seeded_project_is_persisted() {
+        // Otherwise a restart would re-seed it and a rename would be lost.
+        let (_svc, path) = service("seed-persist");
+        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let snap = reopened.snapshot();
+        assert_eq!(snap.projects.len(), 1, "no duplicate seed after restart");
+    }
+
+    #[test]
+    fn an_existing_store_is_never_seeded_over() {
+        // Archiving the only project and restarting must not resurrect it as a
+        // fresh "General", which would rewrite the user's history.
+        let (svc, path) = service("no-reseed");
+        let p = svc.snapshot().projects[0].id.clone();
+        svc.set_archived(&p, true).unwrap();
+        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let snap = reopened.snapshot();
+        assert_eq!(snap.projects.len(), 1);
+        assert!(snap.projects[0].archived, "must stay archived");
+    }
+
+    #[test]
+    fn time_can_be_added_to_a_fresh_store_without_creating_a_project_first() {
+        // The regression this whole seed exists for.
+        let (svc, _) = service("fresh-usable");
+        let p = svc.snapshot().projects[0].id.clone();
+        let e = svc.add_duration(&p, "", 15 * 60_000).unwrap();
+        assert_eq!(e.duration_ms(), 15 * 60_000);
+        assert_eq!(svc.snapshot().week.total_ms, 15 * 60_000);
     }
 
     // --- projects ---
@@ -529,10 +588,13 @@ mod tests {
 
     #[test]
     fn the_last_project_cannot_be_deleted() {
+        // A fresh store is seeded with "General", so archiving it leaves
+        // exactly one project and that one is undeletable.
         let (svc, _) = service("last-project");
-        let p = svc.add_project("Only").unwrap();
-        assert!(svc.delete_project(&p.id).is_err());
+        let seed = svc.snapshot().projects[0].id.clone();
+        svc.set_archived(&seed, true).unwrap();
         assert_eq!(svc.snapshot().projects.len(), 1);
+        assert!(svc.delete_project(&seed).is_err(), "last project");
     }
 
     // --- timezone parsing ---

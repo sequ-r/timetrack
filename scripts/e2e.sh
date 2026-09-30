@@ -60,10 +60,30 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== starting a private bus and the service =="
+# A hermetic bus. `--session` reads standard_session_servicedirs, which
+# includes ~/.local/share/dbus-1/services -- so a plain private bus
+# auto-activates whatever host service is installed there, and that binary can
+# win the name before ours does. A config with no service directories keeps
+# this test talking only to the binary under test.
+BUS_CONF=$WORK/bus.conf
+cat >"$BUS_CONF" <<'XML'
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+XML
+
 # `--fork` prints the address on stdout and then daemonises, so this returns
 # immediately. (Asking for --print-pid as well makes it print two lines, and
 # the address is no longer the only thing captured.)
-DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --session --print-address --fork) || {
+DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --config-file="$BUS_CONF" --print-address --fork) || {
   echo "could not start a private bus"; exit 1; }
 export DBUS_SESSION_BUS_ADDRESS
 [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && { echo "empty bus address"; exit 1; }
@@ -85,23 +105,37 @@ wait_for_service() {
 wait_for_service || { echo "service never became ready:"; cat "$WORK/svc.log"; exit 1; }
 echo "  service up: $(head -1 "$WORK/svc.log")"
 
-# With the store empty there is nothing to attribute time to, so every add must
-# be refused. This has to run BEFORE the first project is created -- the earlier
-# version of this script asserted it afterwards, by which time a project
-# existed and the check passed for the wrong reason.
+# A fresh install must be usable immediately: the service seeds a project, so
+# the very first command works with no setup. This replaced the old
+# "with no projects, nothing can be added" check, which is no longer the
+# behaviour -- and which never tested anything anyway, since it ran after a
+# project already existed.
 echo
-echo "== with no projects, no time can be added =="
-out=$("$CLI" add -S -60 -E 0 -d x 2>&1)
-contains "add refused" "no projects yet" "$out"
-out=$("$CLI" quick -m 15 2>&1)
-contains "quick add refused" "no projects yet" "$out"
-check "nothing was stored" "0" "$(listed)"
+echo "== a fresh store is usable with no setup =="
+# The service seeds a "General" project, so the first command works with no
+# prior setup. This replaced the old "with no projects, nothing can be added"
+# check, which is no longer the behaviour and never tested anything anyway --
+# it ran after a project already existed.
+out=$("$CLI" quick -m 5)
+contains "quick add works with no setup" "added 00:05:00" "$out"
+FIRST=$(id_of "$out")
+created=$((created+1))
+# Prove the seed is really there by naming it, then undo the probe entry so the
+# exact total assertions further down start from zero.
+out=$("$CLI" add -p General -S -30 -E 0 -d "probe")
+contains "the seeded project is selectable by name" "added 00:30:00" "$out"
+created=$((created+1))
+PROBE=$(id_of "$out")
+"$CLI" delete "$FIRST" >/dev/null; removed=$((removed+1))
+"$CLI" delete "$PROBE" >/dev/null; removed=$((removed+1))
+check "both probe entries removed" "0" "$(listed)"
 
 echo
 echo "== projects =="
 out=$("$CLI" project "Work"); contains "create Work" "created project" "$out"
-out=$("$CLI" project "Work" 2>&1); contains "duplicate name refused" "already exists" "$out"
+out=$("$CLI" project "General" 2>&1); contains "duplicate name refused" "already exists" "$out"
 out=$("$CLI" project "Home"); contains "create Home" "created project" "$out"
+# p1 is the seeded General, p2 Work, p3 Home. The archive check below uses p2.
 
 echo
 echo "== method 1: explicit start and end =="
@@ -234,7 +268,7 @@ fi
 echo
 echo "== archiving keeps history in the totals =="
 before_all=$(total)
-out=$("$CLI" archive p2)
+out=$("$CLI" archive "p1")
 contains "archived" "archived" "$out"
 contains "history is preserved in the message" "stay in historical totals" "$out"
 check "all-time unchanged by archiving" "$before_all" "$(total)"
