@@ -109,10 +109,19 @@ CLI compiles and links with no `NEEDED` entries, but segfaults on startup
 (12/12 runs). Install with `cargo install` instead. Fixing that is the main
 thing left before a release pipeline is worth adding.
 
-**The GUI has not been run on a real display.** It builds, links, and starts
-without panicking, but this environment has no X11 or Wayland session, so the
-window itself has never been seen. The layout, the key bindings and the service
-integration are therefore unexercised.
+**The GUI has never displayed a window.** It builds, links, and starts without
+panicking, and under `Xvfb` it maps `libX11`, `libGLX` and `libvulkan` and runs
+30 threads including its zbus connection thread — so the process is healthy. But
+no window ever appears, and Xvfb cannot prove that it would.
+
+`gpui_linux::current_platform` picks a backend from `gpui::guess_compositor()`,
+which only looks at `WAYLAND_DISPLAY` and `DISPLAY`. With `DISPLAY=:99` it does
+select X11 — yet the process ends up holding 5 DRM fds and *zero* X11 socket
+fds, and rendering falls back to Vulkan, which Xvfb has no presentation path
+for. So Xvfb exercises process startup and the gpui event loop, not rendering.
+
+Testing rendering needs a real display: run it inside a nested Wayland
+compositor (sway, cage or weston), or on a normal session of this machine.
 
 ## Licence
 
