@@ -125,8 +125,22 @@ correct; the override is the bug. See `.cargo/config.toml`.
 targets **GNOME 51**. Both build the same tree.
 
 ```sh
+./build-flatpak.sh            # GNOME 50 (stable)
+./build-flatpak.sh beta       # GNOME 51
+```
+
+Or by hand:
+
+```sh
+rm -rf .flatpak-builder build   # this step matters, see below
 flatpak-builder --user --install --force-clean build org.sequ.timetrack.json
 ```
+
+**Clear `.flatpak-builder` after pulling.** It mirrors the git source into
+`.flatpak-builder/git/` and reuses that clone, so it can lag behind
+`origin/main` — the build then fails on a file that exists in your checkout,
+which looks like the manifest is wrong when it is the cache. The helper script
+does this for you.
 
 A note on the toolchain: the manifest does **not** use
 `org.freedesktop.Sdk.Extension.rust-stable`, because Flathub publishes that
