@@ -117,27 +117,58 @@ Consequences accepted:
 - The data model already stores raw intervals, so switching to union later would
   need no migration. Only the aggregation code would change.
 
-## 5. Manual entry **[OPEN — scope for v1]**
+## 5. Manual entry **[five methods, all need add *and* remove]**
 
-The ways time should be enterable:
+Every method below must work in both directions. "Remove" means shortening an
+entry that turns out to have been overstated — which happens constantly when
+the time is estimated rather than measured.
 
-1. **Explicit start/end.** User picks both. Most precise, most typing.
-2. **Duration, ending now.** "3 hours, just now." Fewest keystrokes.
-3. **Duration, into the past.** "3 hours, ending at 14:00."
-4. **Quick-add increments.** "Add 5 minutes" as a one-click action, per
-   requirement in §6.
-5. ~~**Running timer → stop.**~~ Removed — see §7.
+| # | Method | Add | Remove |
+|---|---|---|---|
+| 1 | **Explicit start/end** — pick both timestamps | create an entry over any interval | drag either endpoint to an earlier time |
+| 2 | **Duration, ending now** — "3 hours, just now" | create `[now−3h, now]` | shorten a recent entry to "it was really 1 hour" |
+| 3 | **Duration, into the past** — "3 hours, ending at 14:00" | create `[14:00−3h, 14:00]` | shorten an entry you just wrote for this morning |
+| 4 | **Quick-add** — the four buttons (§6) | tap to add 5/15/30/60 min | tap again to undo, or reduce a grouped entry |
+| 5 | ~~**Running timer → stop**~~ | removed — see §7 | — |
 
-The distinction that matters: (1) creates an arbitrary interval; (2)–(4) create
-an interval ending at *now*. Both must handle **overlap** (§4).
+### What "remove" actually means
 
-Required behaviour:
+This is the part worth being precise about, because there are three different
+operations and only one of them is destructive:
 
-- An entry must not end before it starts.
-- Entries may overlap freely (§4). They must not be *rejected* for it.
-- Adding a 5-minute slot should not require opening a dialog.
-- Undo should be available for quick-add, at minimum — it is a one-click action
-  and mistakes will happen.
+- **Shorten** an entry (1, 2, 3): its `ended_at` moves earlier. Reversible by
+  moving it back; nothing is lost.
+- **Undo** a quick-add (4): removes the entry that tap created. Only meaningful
+  because quick-add creates a *separate* short entry rather than incrementing an
+  existing one (§6) — so undo is unambiguous.
+- **Delete** an entry entirely: only via the explicit delete action, never as
+  an accidental side effect.
+
+**No method may delete an entry as a side effect of reducing time.** A user who
+meant "subtract 30 minutes" must never lose an hour of data.
+
+### Rules that apply to all five
+
+- An entry must not end before it starts; the UI prevents it rather than
+  rejecting after the fact.
+- Entries may overlap freely and are never rejected for it (§4).
+- Quick-add must not require opening a dialog.
+- Every destructive or hard-to-undo action is undoable in one step.
+
+### v1 scope — **[OPEN]**
+
+Do all five ship in v1, or does v1 ship a subset? The honest trade-off:
+
+- **Ship 2, 3 and 4 first.** They cover the common cases with the least UI:
+  typing a duration covers most manual entry, and quick-add covers the rest in
+  one click. Methods 1 and 2 are nearly the same dialog with a default filled
+  in.
+- **Ship all five** if editing times after the fact (§8) is expected to be
+  routine rather than occasional — which "full editing" implies.
+
+Recommend **2, 3, 4 and 1 in v1**, deferring nothing but the dedicated
+drag-to-trim gesture, which is a refinement of method 1's dialog rather than a
+separate feature. Method 2 is method 1 with "now" pre-filled.
 
 ## 6. Quick-add **[DECIDED as a requirement, details OPEN — now load-bearing]**
 
@@ -288,36 +319,33 @@ everything else is reached by switching tabs.
 
 ### Home tab, top to bottom
 
-1. **A large clock.** Replaces the live timer (§7) as the window's focal
-   point. The question is what it shows, and it cannot be a ticking stopwatch —
-   there is no timer. Recommended: the **current wall-clock time**, large. It
-   anchors the layout, it is genuinely useful at a glance, and it needs no
-   ticking.
+1. **This week's total, large, at the very top.** The sum of every entry this
+   ISO week (§4, §9). It is the number the app exists to produce, so it gets
+   the position of honour and nothing sits above it.
 
-   Alternative if it feels decorative: the week total instead, with the clock
-   demoted to the title bar.
+   No clock. No greeting, no time-of-day flourish — not even a "good morning".
+   The first thing on screen is the answer.
 
-2. **This week's total.** Large, unambiguous, the sum of every entry this ISO
-   week (§9). Sitting directly under the clock, it answers the question the app
-   exists for in one glance.
-
-3. **Quick-add buttons.** The four durations from §6 (5 / 15 / 30 / 60), each
+2. **Quick-add buttons.** The four durations from §6 (5 / 15 / 30 / 60), each
    applying to whichever project is selected.
 
-4. **Per-project totals for this week**, one row per project: name, time, and
-   ideally a bar proportional to the total so the distribution is readable
-   without reading every number.
+3. **Undo**, immediately after the quick-add buttons — the last thing pressed.
 
-5. **Undo**, immediately after the quick-add buttons — the last thing pressed.
+4. **Per-project totals for this week**, one row per project: name, time, and a
+   bar proportional to the total, so the distribution is readable without
+   reading every number.
 
-### Other tabs
+### Tabs
 
-Named tentatively; content follows from §5/§8/§10:
+**Three, for now:**
 
-- **Entries** — the list, filterable by project and date, fully editable
-  (rename, retime, split, merge, delete).
+- **Home** — the layout above.
 - **Projects** — create, rename, recolour, archive.
-- **Export** — CSV, for the chosen period.
+- **Export** — CSV (§10) for the chosen period.
+
+Entry list and editing are **not a tab yet**. They live behind the per-project
+rows and the quick-add undo path until v1 says otherwise; §5 and §8 will settle
+where editing actually happens, and that may not need a fourth tab at all.
 
 ### Notes
 
@@ -325,6 +353,8 @@ Named tentatively; content follows from §5/§8/§10:
   has an unambiguous target.
 - Tabs are switched with keyboard shortcuts as well as clicks, since every
   other action in this app is a keystroke.
+- The week total is the only large element. Everything else is deliberately
+  quieter, so it is not competing with the one number that matters.
 
 ## 12. Non-goals
 
@@ -365,19 +395,16 @@ Answered, in the order asked:
 - **Week boundaries** → ISO weeks; aggregation in the service (§9).
 - **Export format** → CSV (§10).
 - **Store migration** → start clean (§2).
-- **GUI layout** → tabbed, with Home as the dashboard (§11).
+- **Large clock on Home** → dropped. The week's total is the large element at
+  the top, with nothing above it — not even a greeting (§11).
+- **Tabs** → Home, Projects, Export. Entry editing is not a tab yet (§11).
+- **Archived projects** → remain in historical totals; entries are never
+  deleted, only archived, so a report never changes retroactively.
 
-Still open — all sizing or naming, none architectural:
+Still open — all sizing:
 
-1. **§5** — do all five manual entry methods ship in v1, or does v1 ship a
-   subset and defer the rest?
-2. **§11** — what the large clock *shows*. Wall-clock time is recommended; the
-   week total is the alternative. Cosmetic, but it is the most prominent element
-   in the window, so worth a deliberate answer rather than a default.
-3. **§11** — tab names and shortcut keys are placeholders.
-4. Do archived projects keep their entries in past totals, or drop out of them?
-   Recommended: entries are never deleted, only archived, and archived projects
-   remain in historical totals — a report should not change because a project
-   was tidied away later.
+1. **§5 v1 scope** — the recommendation is 2, 3, 4 and 1 in v1, deferring only
+   the drag-to-trim gesture. Confirm or overrule; method 2 is largely method 1
+   with "now" pre-filled, so the real question is whether they ship as one dialog.
 
 Everything structural is decided. The app is ready to scope.
