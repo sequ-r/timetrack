@@ -26,6 +26,27 @@ pub enum RuleError {
     NegativeDuration,
     #[error("cannot delete the last project")]
     LastProject,
+    /// A project with entries cannot be deleted outright.
+    ///
+    /// Its own variant rather than reusing `UnknownProject`, because the
+    /// project does exist -- deleting it would silently orphan its history,
+    /// so the client has to be able to say what actually happened.
+    #[error("project '{0}' still has entries; move or delete them first")]
+    ProjectHasEntries(String),
+    /// A quick-add duration outside the fixed buckets.
+    ///
+    /// `quick_add` used to accept any duration in release builds (the bucket
+    /// check was a `debug_assert`), which let arbitrary entries in through
+    /// tagged as quick-adds and therefore undoable as a group that never was
+    /// one (REQUIREMENTS §6).
+    #[error("quick add takes one of 5, 15, 30 or 60 minutes, not {0}ms")]
+    InvalidQuickAdd(i64),
+    /// A merge that cannot be performed without losing or misattributing data.
+    ///
+    /// Kept distinct from `UnknownEntry`: the entries exist, but merging them
+    /// as asked would silently discard information -- see `merge_entries`.
+    #[error("cannot merge: {0}")]
+    InvalidMerge(String),
     /// Quick-add undo was asked to remove something it did not create.
     ///
     /// Its own variant rather than reusing `UnknownEntry`, because the entry
@@ -176,7 +197,7 @@ pub fn delete_project(store: &mut Store, id: &str) -> RuleResult<Project> {
         return Err(RuleError::LastProject);
     }
     if store.entries.iter().any(|e| e.project_id == id) {
-        return Err(RuleError::UnknownProject(id.to_string()));
+        return Err(RuleError::ProjectHasEntries(id.to_string()));
     }
     let idx = store
         .projects
@@ -278,7 +299,8 @@ pub fn create_duration(
 ///
 /// Each tap creates its own entry rather than extending an existing one, so
 /// that undo is unambiguous and nothing rewrites an earlier entry's
-/// `ended_at`.
+/// `ended_at`. Durations outside the buckets are refused: a non-bucket entry
+/// tagged `QuickAdd` would be undoable under false pretences.
 pub fn quick_add(
     store: &mut Store,
     ids: &mut dyn Ids,
@@ -286,10 +308,9 @@ pub fn quick_add(
     duration_ms: i64,
     now: i64,
 ) -> RuleResult<Entry> {
-    debug_assert!(
-        QUICK_ADD_MS.contains(&duration_ms),
-        "use a quick-add bucket"
-    );
+    if !QUICK_ADD_MS.contains(&duration_ms) {
+        return Err(RuleError::InvalidQuickAdd(duration_ms));
+    }
     create_entry_from(
         store,
         ids,
@@ -363,7 +384,16 @@ pub fn delete_entry(store: &mut Store, id: &str) -> RuleResult<Entry> {
 ///
 /// The split point must fall strictly inside the entry, otherwise it is not a
 /// split and the caller should edit times instead.
-pub fn split_entry(store: &mut Store, id: &str, at_ms: i64) -> RuleResult<(Entry, Entry)> {
+///
+/// The second half mints its id from `ids`, like every other new entry: the
+/// old `{id}-b` scheme collided when one entry was split twice, silently
+/// leaving two entries with the same id in the store.
+pub fn split_entry(
+    store: &mut Store,
+    ids: &mut dyn Ids,
+    id: &str,
+    at_ms: i64,
+) -> RuleResult<(Entry, Entry)> {
     let original = store
         .get(id)
         .cloned()
@@ -372,6 +402,15 @@ pub fn split_entry(store: &mut Store, id: &str, at_ms: i64) -> RuleResult<(Entry
         return Err(RuleError::NegativeDuration);
     }
 
+    // Mint until the id is actually fresh, so even a store whose ids predate
+    // the counter scheme cannot gain a duplicate.
+    let second_id = loop {
+        let candidate = ids.next();
+        if store.get(&candidate).is_none() {
+            break candidate;
+        }
+    };
+
     // The original entry becomes the first half, in place, so a client that
     // is already holding its id keeps pointing at something valid.
     let first = Entry {
@@ -379,7 +418,7 @@ pub fn split_entry(store: &mut Store, id: &str, at_ms: i64) -> RuleResult<(Entry
         ..original.clone()
     };
     let second = Entry {
-        id: format!("{id}-b"),
+        id: second_id,
         started_at: at_ms,
         ..original
     };
@@ -395,9 +434,22 @@ pub fn split_entry(store: &mut Store, id: &str, at_ms: i64) -> RuleResult<(Entry
 /// entries shrinks the total. That is deliberate: merging is the user stating
 /// the overlap was a mistake. Preserving the summed total instead would
 /// require an entry claiming time it did not occupy.
+///
+/// Two requests are refused rather than misapplied: merging an entry with
+/// itself (which used to remove the survivor and then panic looking it up),
+/// and merging entries from different projects (whose time would otherwise be
+/// silently reattributed to the first entry's project).
 pub fn merge_entries(store: &mut Store, ids: &[String]) -> RuleResult<Entry> {
     if ids.len() < 2 {
         return Err(RuleError::UnknownEntry("<need two entries>".into()));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(RuleError::InvalidMerge(format!(
+                "entry '{id}' is listed twice"
+            )));
+        }
     }
     let mut chosen = Vec::with_capacity(ids.len());
     for id in ids {
@@ -407,6 +459,11 @@ pub fn merge_entries(store: &mut Store, ids: &[String]) -> RuleResult<Entry> {
                 .cloned()
                 .ok_or_else(|| RuleError::UnknownEntry(id.clone()))?,
         );
+    }
+    if chosen.iter().any(|e| e.project_id != chosen[0].project_id) {
+        return Err(RuleError::InvalidMerge(
+            "entries belong to different projects; move them onto one project first".into(),
+        ));
     }
     let project_id = chosen[0].project_id.clone();
     let started_at = chosen.iter().map(|e| e.started_at).min().unwrap();
@@ -689,11 +746,29 @@ mod tests {
         let mut s = store_with_project();
         let mut c = ids();
         let e = create_entry(&mut s, &mut c, "p1", "long", 0, D).unwrap();
-        let (first, second) = split_entry(&mut s, &e.id, D / 2).unwrap();
+        let (first, second) = split_entry(&mut s, &mut c, &e.id, D / 2).unwrap();
         assert_eq!(first.duration_ms(), D / 2);
         assert_eq!(second.duration_ms(), D / 2);
+        assert_ne!(first.id, second.id, "halves must be distinct entries");
         assert_eq!(s.entries.len(), 2);
         assert_eq!(s.total_ms(), D, "a split must not change the total");
+    }
+
+    #[test]
+    fn splitting_twice_never_reuses_an_id() {
+        // The old `{id}-b` scheme minted the same second-half id on every
+        // split of one entry, leaving two entries sharing an id.
+        let mut s = store_with_project();
+        let mut c = ids();
+        let e = create_entry(&mut s, &mut c, "p1", "", 0, D).unwrap();
+        split_entry(&mut s, &mut c, &e.id, D / 2).unwrap();
+        split_entry(&mut s, &mut c, &e.id, D / 4).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for entry in &s.entries {
+            assert!(seen.insert(entry.id.clone()), "duplicate id {}", entry.id);
+        }
+        assert_eq!(s.entries.len(), 3);
+        assert_eq!(s.total_ms(), D, "splits must not change the total");
     }
 
     #[test]
@@ -701,8 +776,8 @@ mod tests {
         let mut s = store_with_project();
         let mut c = ids();
         let e = create_entry(&mut s, &mut c, "p1", "", 0, D).unwrap();
-        assert!(split_entry(&mut s, &e.id, 0).is_err());
-        assert!(split_entry(&mut s, &e.id, D).is_err());
+        assert!(split_entry(&mut s, &mut c, &e.id, 0).is_err());
+        assert!(split_entry(&mut s, &mut c, &e.id, D).is_err());
         assert_eq!(s.entries.len(), 1);
     }
 
@@ -770,6 +845,64 @@ mod tests {
         let mut c = ids();
         let a = create_entry(&mut s, &mut c, "p1", "", 0, 100).unwrap();
         assert!(merge_entries(&mut s, &[a.id]).is_err());
+    }
+
+    #[test]
+    fn merge_with_itself_is_refused_not_a_panic() {
+        // Merging [e1, e1] used to remove the survivor and then panic on the
+        // lookup that assumed it was still there.
+        let mut s = store_with_project();
+        let mut c = ids();
+        let a = create_entry(&mut s, &mut c, "p1", "", 0, 100).unwrap();
+        let ids = vec![a.id.clone(), a.id.clone()];
+        assert!(matches!(
+            merge_entries(&mut s, &ids).unwrap_err(),
+            RuleError::InvalidMerge(_)
+        ));
+        assert_eq!(s.entries.len(), 1, "a refused merge must not apply");
+    }
+
+    #[test]
+    fn merge_across_projects_is_refused() {
+        // The merged entry keeps one project id, so merging across projects
+        // would silently reattribute time. Refuse with a message that says so.
+        let mut s = store_with_project();
+        let mut c = Counter::continuing(&s);
+        create_project(&mut s, &mut c, "Personal").unwrap();
+        let a = create_entry(&mut s, &mut c, "p1", "", 0, 100).unwrap();
+        let b = create_entry(&mut s, &mut c, "p2", "", 200, 300).unwrap();
+        assert!(matches!(
+            merge_entries(&mut s, &[a.id.clone(), b.id.clone()]).unwrap_err(),
+            RuleError::InvalidMerge(_)
+        ));
+        assert_eq!(s.entries.len(), 2, "a refused merge must not apply");
+    }
+
+    #[test]
+    fn quick_add_outside_the_buckets_is_refused() {
+        // The bucket check was a debug_assert, so release builds accepted any
+        // duration as an undoable quick-add.
+        let mut s = store_with_project();
+        let mut c = ids();
+        assert_eq!(
+            quick_add(&mut s, &mut c, "p1", 7 * 60_000, D).unwrap_err(),
+            RuleError::InvalidQuickAdd(7 * 60_000)
+        );
+        assert!(s.entries.is_empty(), "a refused entry must not be stored");
+    }
+
+    #[test]
+    fn deleting_a_project_with_entries_names_the_problem() {
+        // It used to report UnknownProject for a project that plainly exists.
+        let mut s = store_with_project();
+        let mut c = Counter::continuing(&s);
+        create_project(&mut s, &mut c, "Personal").unwrap();
+        create_entry(&mut s, &mut c, "p1", "", 0, 100).unwrap();
+        assert_eq!(
+            delete_project(&mut s, "p1").unwrap_err(),
+            RuleError::ProjectHasEntries("p1".into())
+        );
+        assert!(s.project("p1").is_some(), "a refused delete must not apply");
     }
 
     // --- the 24h warning ---

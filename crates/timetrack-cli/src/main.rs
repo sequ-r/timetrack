@@ -192,8 +192,8 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         } => {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
-            let start_ms = parse_when(&start, "start")?;
-            let end_ms = parse_when(&end, "end")?;
+            let start_ms = parse_when(&start, "start", snap.local_offset_ms)?;
+            let end_ms = parse_when(&end, "end", snap.local_offset_ms)?;
             let e = client.add(&project, &description, start_ms, end_ms).await?;
             println!(
                 "added {} ({})",
@@ -227,7 +227,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
             let ms = parse_duration(&for_)?;
-            let end_ms = parse_when(&ended, "ended")?;
+            let end_ms = parse_when(&ended, "ended", snap.local_offset_ms)?;
             let e = client
                 .add_duration_ending(&project, &description, ms, end_ms)
                 .await?;
@@ -270,11 +270,11 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
             let start_ms = match &start {
-                Some(s) => parse_when(s, "start")?,
+                Some(s) => parse_when(s, "start", snap.local_offset_ms)?,
                 None => existing.started_at,
             };
             let end_ms = match &end {
-                Some(s) => parse_when(s, "end")?,
+                Some(s) => parse_when(s, "end", snap.local_offset_ms)?,
                 None => existing.ended_at,
             };
             let e = client.set_times(&id, start_ms, end_ms).await?;
@@ -360,16 +360,21 @@ fn print_list(s: &Snapshot, limit: usize) {
 }
 
 /// Resolve a project argument to an id, defaulting to the first active one.
+///
+/// Matches either the id or (case-insensitively) the name: `timetrack quick
+/// -p p1` should work the same as `-p Work`, since ids are what every other
+/// command prints back.
 fn pick_project(snap: &Snapshot, requested: Option<&str>) -> Result<String> {
     let active: Vec<&ProjectView> = snap.projects.iter().filter(|p| !p.archived).collect();
     match requested {
-        Some(name) => active
+        Some(want) => active
             .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .find(|p| p.id == want)
+            .or_else(|| active.iter().find(|p| p.name.eq_ignore_ascii_case(want)))
             .map(|p| p.id.clone())
             .ok_or_else(|| {
                 let names: Vec<&str> = active.iter().map(|p| p.name.as_str()).collect();
-                anyhow::anyhow!("no active project named '{name}'. Active: {names:?}")
+                anyhow::anyhow!("no active project named '{want}'. Active: {names:?}")
             }),
         None => active.first().map(|p| p.id.clone()).ok_or_else(|| {
             anyhow::anyhow!("no projects yet. Create one with:  timetrack project \"Work\"")
@@ -390,11 +395,15 @@ fn now_ms() -> i64 {
 /// Two forms, because they cover the two things a person actually means:
 ///
 /// - `-90` -- minutes relative to now, so `-90` is 90 minutes ago
-/// - `09:30` -- today at that wall-clock time
+/// - `09:30` -- today at that wall-clock time, in local time
+///
+/// `local_offset_ms` is the service's UTC offset from the snapshot: `HH:MM`
+/// has to anchor on local midnight, not UTC midnight, or entries land hours
+/// out for anyone east or west of Greenwich.
 ///
 /// A leading `-` is deliberately allowed through clap (`allow_hyphen_values`)
 /// because `-90` is a perfectly ordinary thing to type for "90 minutes ago".
-fn parse_when(text: &str, what: &str) -> Result<i64> {
+fn parse_when(text: &str, what: &str, local_offset_ms: i64) -> Result<i64> {
     let text = text.trim();
     anyhow::ensure!(!text.is_empty(), "{what} cannot be empty");
 
@@ -424,12 +433,13 @@ fn parse_when(text: &str, what: &str) -> Result<i64> {
         "{what}: '{text}' is not a real time of day"
     );
 
-    // `HH:MM` means today, so anchor on today's UTC midnight. The service owns
-    // the timezone; the CLI only needs a good-enough anchor, and being a few
-    // hours out is visible and correctable by editing the entry.
+    // `HH:MM` means today in local time, so anchor on local midnight. The
+    // service owns the timezone and reports its offset in the snapshot; using
+    // UTC midnight here instead put entries hours out for non-UTC zones, an
+    // error that was visible only as a wrong day bucket after the fact.
     let day_ms = 86_400_000;
-    let today = now_ms().div_euclid(day_ms) * day_ms;
-    Ok(today + (h * 3_600_000 + m * 60_000))
+    let local_midnight = (now_ms() + local_offset_ms).div_euclid(day_ms) * day_ms - local_offset_ms;
+    Ok(local_midnight + (h * 3_600_000 + m * 60_000))
 }
 
 /// Parse a duration like `90m`, `1h30m` or `45s`, in milliseconds.
@@ -519,7 +529,7 @@ mod tests {
     #[test]
     fn minutes_ago_parses_relative_to_now() {
         let before = now_ms();
-        let t = parse_when("-90", "start").unwrap();
+        let t = parse_when("-90", "start", 0).unwrap();
         let after = now_ms();
         // 90 minutes before, give or take the time the call itself took.
         assert!(
@@ -531,13 +541,13 @@ mod tests {
     #[test]
     fn minutes_from_now_parses_forward() {
         let before = now_ms();
-        let t = parse_when("30", "start").unwrap();
+        let t = parse_when("30", "start", 0).unwrap();
         assert!((before + 1_800_000..=now_ms() + 1_800_000).contains(&t));
     }
 
     #[test]
     fn a_wall_clock_time_lands_today() {
-        let t = parse_when("09:30", "start").unwrap();
+        let t = parse_when("09:30", "start", 0).unwrap();
         let day = 86_400_000;
         let today = now_ms().div_euclid(day) * day;
         assert!(
@@ -554,11 +564,26 @@ mod tests {
     }
 
     #[test]
+    fn a_wall_clock_time_is_local_not_utc() {
+        // UTC+2: anchoring on UTC midnight would put 00:30 two hours out and
+        // could bucket the entry on the wrong local day.
+        let off = 2 * 3_600_000;
+        let t = parse_when("00:30", "start", off).unwrap();
+        // Thirty minutes past local midnight...
+        assert_eq!((t + off).rem_euclid(86_400_000), 30 * 60_000);
+        // ...on the local today.
+        assert_eq!(
+            (t + off).div_euclid(86_400_000),
+            (now_ms() + off).div_euclid(86_400_000)
+        );
+    }
+
+    #[test]
     fn impossible_times_are_refused() {
-        assert!(parse_when("25:00", "start").is_err());
-        assert!(parse_when("09:70", "start").is_err());
-        assert!(parse_when("nonsense", "start").is_err());
-        assert!(parse_when("", "start").is_err());
+        assert!(parse_when("25:00", "start", 0).is_err());
+        assert!(parse_when("09:70", "start", 0).is_err());
+        assert!(parse_when("nonsense", "start", 0).is_err());
+        assert!(parse_when("", "start", 0).is_err());
     }
 
     #[test]
@@ -566,7 +591,7 @@ mod tests {
         // "start" vs "end" matters: a user who typed the wrong one should be
         // told which argument to look at.
         assert!(
-            parse_when("99:99", "end")
+            parse_when("99:99", "end", 0)
                 .unwrap_err()
                 .to_string()
                 .contains("end")

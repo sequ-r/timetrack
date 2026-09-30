@@ -46,7 +46,7 @@ struct App {
     client: Client,
     snapshot: Snapshot,
     selected: usize,
-    /// Index into `snapshot.projects` for the project quick-adds go to.
+    /// Index into the *active* projects for the project quick-adds go to.
     project_cursor: usize,
     /// The entry the last quick-add created, so `u` undoes exactly that one.
     ///
@@ -72,7 +72,18 @@ impl App {
                 if self.project_cursor >= project_count {
                     self.project_cursor = project_count.saturating_sub(1);
                 }
-                self.status = None;
+                // A routine poll must not wipe feedback from the last action
+                // ("added 30m", an undo error, ...): the tick fires every
+                // second, so clearing here made every message unreadable.
+                // Only the poll's own "service unavailable" notice clears on
+                // recovery; action feedback survives until the next action.
+                if self
+                    .status
+                    .as_deref()
+                    .is_some_and(|m| m.starts_with("service unavailable"))
+                {
+                    self.status = None;
+                }
             }
             Err(e) => self.status = Some(format!("service unavailable: {e}")),
         }
@@ -86,16 +97,22 @@ impl App {
     }
 
     /// The project quick-add and the new-entry dialogs attribute time to.
+    ///
+    /// Indexes the *active* projects, not the raw list: archiving hides a
+    /// project from the picker, so the cursor must not be able to land on one
+    /// (or every index past it would attribute time to the wrong project).
     fn current_project(&self) -> Option<&ProjectView> {
-        self.snapshot.projects.get(self.project_cursor)
+        current_project(&self.snapshot, self.project_cursor)
     }
 
     /// Run one action, recording any failure in the footer rather than
     /// exiting: a transient bus error should not kill the UI.
     ///
     /// Takes a closure rather than a future so the call is not evaluated (and
-    /// not sent to the bus) until it is actually awaited here.
-    async fn act<F, Fut>(&mut self, f: F)
+    /// not sent to the bus) until it is actually awaited here. Returns whether
+    /// the call succeeded, so the caller prints "undid ..." only when
+    /// something was actually undone.
+    async fn act<F, Fut>(&mut self, f: F) -> bool
     where
         F: FnOnce(Client) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
@@ -104,11 +121,15 @@ impl App {
         // rather than borrow `self` across the call: the call needs `&mut self`
         // again afterwards to refresh and to record any error.
         let client = self.client.clone();
-        match f(client).await {
-            Ok(()) => {}
-            Err(e) => self.status = Some(e.to_string()),
-        }
+        let ok = match f(client).await {
+            Ok(()) => true,
+            Err(e) => {
+                self.status = Some(e.to_string());
+                false
+            }
+        };
         self.refresh().await;
+        ok
     }
 
     async fn on_key(&mut self, key: event::KeyEvent) {
@@ -155,12 +176,15 @@ impl App {
                     .or_else(|| last_quick_add(&self.snapshot));
                 if let Some(id) = undo_id {
                     let for_call = id.clone();
-                    self.act(move |c| {
-                        let id = for_call.clone();
-                        async move { c.undo_quick_add(&id).await }
-                    })
-                    .await;
-                    self.status = Some(format!("undid quick add {id}"));
+                    let ok = self
+                        .act(move |c| {
+                            let id = for_call.clone();
+                            async move { c.undo_quick_add(&id).await }
+                        })
+                        .await;
+                    if ok {
+                        self.status = Some(format!("undid quick add {id}"));
+                    }
                 } else {
                     self.status = Some("nothing to undo".into());
                 }
@@ -170,12 +194,15 @@ impl App {
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected_id() {
                     let for_call = id.clone();
-                    self.act(move |c| {
-                        let id = for_call.clone();
-                        async move { c.delete_entry(&id).await }
-                    })
-                    .await;
-                    self.status = Some(format!("deleted {id}"));
+                    let ok = self
+                        .act(move |c| {
+                            let id = for_call.clone();
+                            async move { c.delete_entry(&id).await }
+                        })
+                        .await;
+                    if ok {
+                        self.status = Some(format!("deleted {id}"));
+                    }
                 }
             }
 
@@ -231,6 +258,14 @@ impl App {
 /// (REQUIREMENTS §14).
 fn active_projects(snap: &Snapshot) -> Vec<&ProjectView> {
     snap.projects.iter().filter(|p| !p.archived).collect()
+}
+
+/// The project at `cursor` in the picker's order.
+///
+/// A free function over the snapshot rather than a method on `App`, so the
+/// archived-filtering rule is testable without a live service connection.
+fn current_project(snap: &Snapshot, cursor: usize) -> Option<&ProjectView> {
+    active_projects(snap).get(cursor).copied()
 }
 
 /// The entry `u` would undo.
@@ -576,6 +611,24 @@ mod tests {
             .map(|p| p.name.as_str())
             .collect();
         assert_eq!(names, ["Work"]);
+    }
+
+    #[test]
+    fn the_picker_never_lands_on_an_archived_project() {
+        // `current_project` used to index the unfiltered list, so with an
+        // archived project anywhere but the end every cursor past it picked
+        // the wrong project -- or an archived one -- for quick-adds.
+        let snap = Snapshot {
+            projects: vec![
+                project("p1", "Work", false),
+                project("p2", "Old", true),
+                project("p3", "Personal", false),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(current_project(&snap, 0).map(|p| p.id.as_str()), Some("p1"));
+        assert_eq!(current_project(&snap, 1).map(|p| p.id.as_str()), Some("p3"));
+        assert_eq!(current_project(&snap, 2), None);
     }
 
     #[test]
