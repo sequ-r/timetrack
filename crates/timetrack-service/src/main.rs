@@ -7,70 +7,156 @@
 
 //! The TimeTrack service.
 //!
-//! Owns the running timer and serves it on the session bus. Both front ends
-//! are clients: the GPUI GUI and the ratatui CLI, which means the timer keeps
-//! running when either one exits.
+//! Owns the store and serves it on the session bus. Both front ends are
+//! clients: the GPUI GUI and the ratatui CLI, which means tracked data
+//! outlives either one.
+//!
+//! # Why the payloads are JSON strings
+//!
+//! Every method takes and returns a single `s` holding JSON. A hand-written
+//! D-Bus signature per call would mean two definitions of every type -- one in
+//! the interface, one in the client -- and they would drift. With JSON the
+//! serde structs in `timetrack-proto` are the single definition, so adding a
+//! field to `Snapshot` is not a signature change.
 
 mod interface;
 
-use interface::TimerService;
+use interface::EntryService;
 use timetrack_core::JsonStore;
 use timetrack_proto::{BUS_NAME, OBJECT_PATH};
 use zbus::interface;
 
-struct TimerIface(TimerService);
+struct EntryIface(EntryService);
 
 /// Convert service errors into a D-Bus error the clients can surface verbatim.
 fn to_dbus_err(e: anyhow::Error) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(e.to_string())
 }
 
-// The wire types are `serde` structs rather than native zvariant ones, so the
-// boundary is a JSON string. That keeps the protocol versioned by the same
-// definitions the clients already use, and means adding a field to Snapshot is
-// not a D-Bus signature change.
-
-// A snapshot serialised for transport.
 type Wire = String;
 
 fn encode<T: serde::Serialize>(value: &T) -> Wire {
     serde_json::to_string(value).expect("wire types are always serializable")
 }
 
-#[interface(name = "org.sequ.timetrack.Timer")]
-impl TimerIface {
+#[interface(name = "org.sequ.timetrack.Entries")]
+impl EntryIface {
     /// Everything a client needs to draw its first frame.
     #[zbus(name = "Snapshot")]
     fn snapshot(&self) -> Wire {
         encode(&self.0.snapshot())
     }
 
-    #[zbus(name = "Start")]
-    fn start(&self, description: &str) -> zbus::fdo::Result<Wire> {
-        self.0.start(description).map(|e| encode(&e)).map_err(to_dbus_err)
-    }
+    // --- the four v1 entry methods (REQUIREMENTS §5) ---
 
-    #[zbus(name = "Stop")]
-    fn stop(&self) -> zbus::fdo::Result<Wire> {
-        self.0.stop().map(|e| encode(&e)).map_err(to_dbus_err)
-    }
-
-    #[zbus(name = "Cancel")]
-    fn cancel(&self) -> zbus::fdo::Result<Wire> {
-        self.0.cancel().map(|e| encode(&e)).map_err(to_dbus_err)
-    }
-
-    #[zbus(name = "Remove")]
-    fn remove(&self, id: &str) -> zbus::fdo::Result<()> {
-        self.0.remove(id).map_err(to_dbus_err)
-    }
-
-    #[zbus(name = "Rename")]
-    fn rename(&self, id: &str, description: &str) -> zbus::fdo::Result<Wire> {
+    /// Method 1: an explicit start and end.
+    #[zbus(name = "Add")]
+    fn add(
+        &self,
+        project_id: &str,
+        description: &str,
+        started_at: i64,
+        ended_at: i64,
+    ) -> zbus::fdo::Result<Wire> {
         self.0
-            .rename(id, description)
+            .add(project_id, description, started_at, ended_at)
             .map(|e| encode(&e))
             .map_err(to_dbus_err)
+    }
+
+    /// Method 2: a duration ending now.
+    #[zbus(name = "AddDuration")]
+    fn add_duration(
+        &self,
+        project_id: &str,
+        description: &str,
+        duration_ms: i64,
+    ) -> zbus::fdo::Result<Wire> {
+        self.0
+            .add_duration(project_id, description, duration_ms)
+            .map(|e| encode(&e))
+            .map_err(to_dbus_err)
+    }
+
+    /// Method 3: a duration ending at a given instant.
+    #[zbus(name = "AddDurationEnding")]
+    fn add_duration_ending(
+        &self,
+        project_id: &str,
+        description: &str,
+        duration_ms: i64,
+        ended_at: i64,
+    ) -> zbus::fdo::Result<Wire> {
+        self.0
+            .add_duration_ending(project_id, description, duration_ms, ended_at)
+            .map(|e| encode(&e))
+            .map_err(to_dbus_err)
+    }
+
+    /// Method 4: one of the quick-add buckets, ending now.
+    #[zbus(name = "QuickAdd")]
+    fn quick_add(&self, project_id: &str, duration_ms: i64) -> zbus::fdo::Result<Wire> {
+        self.0
+            .quick_add(project_id, duration_ms)
+            .map(|e| encode(&e))
+            .map_err(to_dbus_err)
+    }
+
+    // --- editing ---
+
+    /// Shorten by moving an endpoint. Never deletes (REQUIREMENTS §5).
+    #[zbus(name = "SetTimes")]
+    fn set_times(&self, id: &str, started_at: i64, ended_at: i64) -> zbus::fdo::Result<Wire> {
+        self.0
+            .set_times(id, started_at, ended_at)
+            .map(|e| encode(&e))
+            .map_err(to_dbus_err)
+    }
+
+    /// Undo exactly the entry a quick-add created.
+    #[zbus(name = "UndoQuickAdd")]
+    fn undo_quick_add(&self, id: &str) -> zbus::fdo::Result<()> {
+        self.0.undo_quick_add(id).map_err(to_dbus_err)
+    }
+
+    /// Explicit deletion.
+    #[zbus(name = "DeleteEntry")]
+    fn delete_entry(&self, id: &str) -> zbus::fdo::Result<()> {
+        self.0.delete_entry(id).map_err(to_dbus_err)
+    }
+
+    #[zbus(name = "Split")]
+    fn split(&self, id: &str, at_ms: i64) -> zbus::fdo::Result<Wire> {
+        let (a, b) = self.0.split(id, at_ms).map_err(to_dbus_err)?;
+        Ok(encode(&(a, b)))
+    }
+
+    #[zbus(name = "Merge")]
+    fn merge(&self, ids: Vec<String>) -> zbus::fdo::Result<Wire> {
+        self.0.merge(&ids).map(|e| encode(&e)).map_err(to_dbus_err)
+    }
+
+    // --- projects ---
+
+    #[zbus(name = "AddProject")]
+    fn add_project(&self, name: &str) -> zbus::fdo::Result<Wire> {
+        self.0
+            .add_project(name)
+            .map(|p| encode(&p))
+            .map_err(to_dbus_err)
+    }
+
+    #[zbus(name = "SetArchived")]
+    fn set_archived(&self, id: &str, archived: bool) -> zbus::fdo::Result<Wire> {
+        self.0
+            .set_archived(id, archived)
+            .map(|p| encode(&p))
+            .map_err(to_dbus_err)
+    }
+
+    #[zbus(name = "DeleteProject")]
+    fn delete_project(&self, id: &str) -> zbus::fdo::Result<()> {
+        self.0.delete_project(id).map_err(to_dbus_err)
     }
 }
 
@@ -88,32 +174,21 @@ async fn run() -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(JsonStore::default_path),
     );
-    let service = TimerService::new(store)?;
-    let running = service
-        .snapshot()
-        .running
-        .map(|e| e.description)
-        .unwrap_or_default();
+    let service = EntryService::new(store)?;
 
     let _dbus = zbus::connection::Builder::session()?
         .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, TimerIface(service))?
+        .serve_at(OBJECT_PATH, EntryIface(service))?
         .build()
         .await?;
 
     // A plain, greppable line. Both clients wait for the name to appear on the
     // bus, so make activation observable for humans and scripts alike.
-    if running.is_empty() {
-        println!("timetrack-service: listening on {BUS_NAME} (idle)");
-    } else {
-        println!("timetrack-service: listening on {BUS_NAME} (running: {running})");
-    }
+    println!("timetrack-service: listening on {BUS_NAME}");
 
     // Park forever. Ctrl-C kills the process outright, which is fine: every
     // mutation is persisted before it is acknowledged, so there is no state to
-    // flush on the way out. (An earlier version used a tokio ctrl_c handler;
-    // zbus no longer uses tokio, and pulling in async-signal only for this
-    // would add a dependency for no benefit.)
+    // flush on the way out.
     std::future::pending::<()>().await;
     unreachable!()
 }
@@ -126,6 +201,10 @@ mod tests {
     fn constants_are_consistent() {
         assert_eq!(BUS_NAME, "org.sequ.timetrack");
         assert_eq!(OBJECT_PATH, "/org/sequ/timetrack");
-        assert_eq!(INTERFACE, "org.sequ.timetrack.Timer");
+        // The interface was renamed off ".Timer" when the stopwatch went; a
+        // client still asking for the old name must fail loudly rather than
+        // reach a half-removed API.
+        assert_eq!(INTERFACE, "org.sequ.timetrack.Entries");
+        assert_ne!(INTERFACE, "org.sequ.timetrack.Timer");
     }
 }

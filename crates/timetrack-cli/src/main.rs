@@ -8,15 +8,32 @@
 //! The TimeTrack terminal client.
 //!
 //! Two modes in one binary: a one-shot command surface for scripts and shell
-//! aliases (`timetrack start "writing"`), and a full ratatui TUI
-//! (`timetrack`, or `timetrack tui`). Both are pure clients — the running
-//! timer lives in the service, so closing the terminal never stops it.
+//! aliases (`timetrack quick -f 30`), and a full ratatui TUI (`timetrack`, or
+//! `timetrack tui`). Both are pure clients -- the store lives in the service,
+//! so closing the terminal never loses anything.
+//!
+//! # The four entry methods
+//!
+//! Each of REQUIREMENTS §5's methods is a subcommand, named for what it does
+//! rather than which UI gesture it came from:
+//!
+//! - `add`      explicit start and end (method 1)
+//! - `duration` a duration ending now (method 2)
+//! - `past`     a duration ending earlier (method 3)
+//! - `quick`    one of the fixed buckets (method 4)
+//!
+//! And the three ways time comes back off, which are deliberately separate
+//! commands because they are separate operations (REQUIREMENTS §5):
+//!
+//! - `shorten` moves an endpoint, keeping the entry
+//! - `undo`    removes the entry a quick add created
+//! - `delete`  removes any entry, on purpose
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 use timetrack_cli::tui;
-use timetrack_proto::Client;
+use timetrack_proto::{Client, ProjectView, Snapshot};
 
 /// How long to wait for the service to appear before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,8 +44,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     version,
     about = "TimeTrack terminal client",
     long_about = "Control the TimeTrack service from the terminal.\n\n\
-                  The service owns the running timer; this is a client, so \
-                  quitting the TUI does not stop what you are timing."
+                  The service owns the store and does all the aggregation; this \
+                  is a client, so quitting the TUI never loses tracked time."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,19 +57,88 @@ enum Command {
     /// Open the full terminal UI (the default when no subcommand is given).
     Tui,
 
-    /// Start timing with an optional description.
-    Start {
+    // --- the four add methods ---
+    /// Method 1: record an explicit start and end.
+    Add {
+        /// Project to attribute the time to. Defaults to the first project.
+        #[arg(short, long)]
+        project: Option<String>,
         /// What you are working on.
-        description: Option<String>,
+        #[arg(short, long, default_value = "")]
+        description: String,
+        /// Start of the interval: `-90` for 90 minutes ago, or `09:30` today.
+        #[arg(short = 'S', long, allow_hyphen_values = true)]
+        start: String,
+        /// End of the interval, in the same format as --start.
+        #[arg(short = 'E', long, allow_hyphen_values = true)]
+        end: String,
     },
 
-    /// Stop the running timer and record the entry.
-    Stop,
+    /// Method 2: record a duration ending now.
+    Duration {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long, default_value = "")]
+        description: String,
+        /// The duration, e.g. 90m, 1h30m or 45s.
+        #[arg(short, long, value_name = "DURATION")]
+        for_: String,
+    },
 
-    /// Stop the running timer and discard it.
-    Cancel,
+    /// Method 3: record a duration ending at a given moment.
+    Past {
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(short, long, default_value = "")]
+        description: String,
+        /// The duration, e.g. 90m or 1h30m.
+        #[arg(short, long, value_name = "DURATION")]
+        for_: String,
+        /// When it ended: `-120` for two hours ago, or `14:00` today.
+        #[arg(short = 'E', long, allow_hyphen_values = true, default_value = "0")]
+        ended: String,
+    },
 
-    /// Print the current state and exit.
+    /// Method 4: add one of the fixed buckets, ending now.
+    Quick {
+        #[arg(short, long)]
+        project: Option<String>,
+        /// One of 5, 15, 30 or 60.
+        #[arg(short, long)]
+        minutes: i64,
+    },
+
+    // --- the three ways time comes back off ---
+    /// Move an entry's endpoints. Shortens without deleting.
+    Shorten {
+        /// The entry to change.
+        id: String,
+        /// New start, in the same format as add --start.
+        #[arg(short = 'S', long, allow_hyphen_values = true)]
+        start: Option<String>,
+        /// New end.
+        #[arg(short = 'E', long, allow_hyphen_values = true)]
+        end: Option<String>,
+    },
+
+    /// Remove the entry a quick add created. Refuses anything else.
+    Undo { id: String },
+
+    /// Delete an entry outright.
+    Delete { id: String },
+
+    // --- projects ---
+    /// Create a project.
+    Project {
+        /// The project name.
+        name: String,
+    },
+
+    /// Archive a project, keeping its history in totals.
+    Archive { id: String },
+
+    // --- reading ---
+    /// Print this week, this month and the all-time total.
     Status,
 
     /// List tracked entries, most recent first.
@@ -61,9 +147,6 @@ enum Command {
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
-
-    /// Delete a finished entry by id.
-    Remove { id: String },
 }
 
 /// zbus uses the async-io backend (see the workspace Cargo.toml), so the
@@ -80,82 +163,421 @@ async fn run() -> Result<()> {
         return tui::run().await;
     }
 
-    let client = Client::wait_for_service(CONNECT_TIMEOUT).await.map_err(|e| {
-        // A bare "ServiceUnknown" is accurate but unhelpful; say what to do.
-        if e.to_string().contains("ServiceUnknown") {
-            e.context(
-                "the TimeTrack service is not running.\n\
+    let client = Client::wait_for_service(CONNECT_TIMEOUT)
+        .await
+        .map_err(|e| {
+            // A bare "ServiceUnknown" is accurate but unhelpful; say what to do.
+            if e.to_string().contains("ServiceUnknown") {
+                e.context(
+                    "the TimeTrack service is not running.\n\
                  Start it with:  timetrack-service\n\
                  or enable the systemd user unit for your session.",
-            )
-        } else {
-            e
-        }
-    })?;
-    match cli.command.expect("non-TUI command above") {
+                )
+            } else {
+                e
+            }
+        })?;
+    dispatch(client, cli.command.expect("non-TUI command above")).await
+}
+
+async fn dispatch(client: Client, command: Command) -> Result<()> {
+    match command {
         Command::Tui => unreachable!("handled above"),
-        Command::Start { description } => {
-            let desc = description.unwrap_or_default();
-            let e = client.start(&desc).await?;
+
+        Command::Add {
+            project,
+            description,
+            start,
+            end,
+        } => {
+            let snap = client.snapshot().await?;
+            let project = pick_project(&snap, project.as_deref())?;
+            let start_ms = parse_when(&start, "start")?;
+            let end_ms = parse_when(&end, "end")?;
+            let e = client.add(&project, &description, start_ms, end_ms).await?;
             println!(
-                "started: {}",
-                if e.description.is_empty() {
-                    "(no description)"
-                } else {
-                    &e.description
-                }
+                "added {} ({})",
+                timetrack_core::format_duration(e.duration_ms()),
+                e.id
             );
         }
-        Command::Stop => {
-            let e = client.stop().await?;
+
+        Command::Duration {
+            project,
+            description,
+            for_,
+        } => {
+            let snap = client.snapshot().await?;
+            let project = pick_project(&snap, project.as_deref())?;
+            let ms = parse_duration(&for_)?;
+            let e = client.add_duration(&project, &description, ms).await?;
             println!(
-                "stopped: {} ({})",
-                if e.description.is_empty() {
-                    "(no description)"
-                } else {
-                    &e.description
-                },
-                timetrack_core::format_duration(e.duration_ms(timetrack_core::now_ms()))
+                "added {} ending now ({})",
+                timetrack_core::format_duration(e.duration_ms()),
+                e.id
             );
         }
-        Command::Cancel => {
-            let e = client.cancel().await?;
-            println!("discarded: {}", e.label());
+
+        Command::Past {
+            project,
+            description,
+            for_,
+            ended,
+        } => {
+            let snap = client.snapshot().await?;
+            let project = pick_project(&snap, project.as_deref())?;
+            let ms = parse_duration(&for_)?;
+            let end_ms = parse_when(&ended, "ended")?;
+            let e = client
+                .add_duration_ending(&project, &description, ms, end_ms)
+                .await?;
+            println!(
+                "added {} ending {}ms before now ({})",
+                timetrack_core::format_duration(e.duration_ms()),
+                now_ms() - end_ms,
+                e.id
+            );
         }
-        Command::Status => {
-            let s = client.snapshot().await?;
-            let now = timetrack_core::now_ms();
-            match s.running() {
-                Some(r) => println!(
-                    "running: {} ({})",
-                    r.label(),
-                    timetrack_core::format_duration(r.duration_ms(now))
-                ),
-                None => println!("running: (nothing)"),
-            }
-            println!("total:   {}", timetrack_core::format_duration(s.total_ms));
-            println!("entries: {}", s.entries.len());
+
+        Command::Quick { project, minutes } => {
+            let snap = client.snapshot().await?;
+            let project = pick_project(&snap, project.as_deref())?;
+            let ms = minutes * 60_000;
+            anyhow::ensure!(
+                timetrack_core::QUICK_ADD_MS.contains(&ms),
+                "quick add takes one of {:?} minutes",
+                timetrack_core::QUICK_ADD_MS
+                    .iter()
+                    .map(|m| m / 60_000)
+                    .collect::<Vec<_>>()
+            );
+            let e = client.quick_add(&project, ms).await?;
+            println!(
+                "added {} ({}) -- undo with: timetrack undo {}",
+                timetrack_core::format_duration(e.duration_ms()),
+                e.id,
+                e.id
+            );
         }
-        Command::List { limit } => {
-            let s = client.snapshot().await?;
-            let now = timetrack_core::now_ms();
-            if s.entries.is_empty() {
-                println!("no entries yet");
-            }
-            for e in s.entries.iter().take(limit) {
-                let state = if e.is_running() { "running" } else { "done" };
-                println!(
-                    "{state}  {:>10}  {}  {}",
-                    timetrack_core::format_duration(e.duration_ms(now)),
-                    e.id,
-                    e.label()
-                );
-            }
+
+        Command::Shorten { id, start, end } => {
+            // Unspecified endpoints are left alone, so `shorten e2 -E 30m`
+            // moves only the end and the entry is kept.
+            let snap = client.snapshot().await?;
+            let existing = snap
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let start_ms = match &start {
+                Some(s) => parse_when(s, "start")?,
+                None => existing.started_at,
+            };
+            let end_ms = match &end {
+                Some(s) => parse_when(s, "end")?,
+                None => existing.ended_at,
+            };
+            let e = client.set_times(&id, start_ms, end_ms).await?;
+            println!(
+                "shortened to {} (the entry is still there: {})",
+                timetrack_core::format_duration(e.duration_ms()),
+                e.id
+            );
         }
-        Command::Remove { id } => {
-            client.remove(&id).await?;
-            println!("removed: {id}");
+
+        Command::Undo { id } => {
+            client.undo_quick_add(&id).await?;
+            println!("undid quick add: {id}");
         }
+
+        Command::Delete { id } => {
+            client.delete_entry(&id).await?;
+            println!("deleted: {id}");
+        }
+
+        Command::Project { name } => {
+            let p = client.add_project(&name).await?;
+            println!("created project {} ({})", p.name, p.id);
+        }
+
+        Command::Archive { id } => {
+            let p = client.set_archived(&id, true).await?;
+            println!(
+                "archived {} ({}) -- its entries stay in historical totals",
+                p.name, p.id
+            );
+        }
+
+        Command::Status => print_status(&client.snapshot().await?),
+
+        Command::List { limit } => print_list(&client.snapshot().await?, limit),
     }
     Ok(())
+}
+
+fn print_status(s: &Snapshot) {
+    println!(
+        "this week:  {}  ({} entries)",
+        timetrack_core::format_duration(s.week.total_ms),
+        s.week.entry_count
+    );
+    println!(
+        "this month: {}",
+        timetrack_core::format_duration(s.month.total_ms)
+    );
+    println!(
+        "all time:   {}",
+        timetrack_core::format_duration(s.total_ms)
+    );
+    if !s.over_24h_days.is_empty() {
+        // Legal, but worth surfacing: it usually means a mistyped interval
+        // rather than a genuinely enormous day (REQUIREMENTS §4).
+        println!(
+            "warning:    {} day(s) total more than 24h",
+            s.over_24h_days.len()
+        );
+    }
+}
+
+fn print_list(s: &Snapshot, limit: usize) {
+    if s.entries.is_empty() {
+        println!("no entries yet");
+        return;
+    }
+    for e in s.entries.iter().take(limit) {
+        let marker = if e.source == timetrack_proto::EntrySource::QuickAdd {
+            "+"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {:>10}  {:<6}  {}",
+            timetrack_core::format_duration(e.duration_ms()),
+            e.id,
+            e.label()
+        );
+    }
+}
+
+/// Resolve a project argument to an id, defaulting to the first active one.
+fn pick_project(snap: &Snapshot, requested: Option<&str>) -> Result<String> {
+    let active: Vec<&ProjectView> = snap.projects.iter().filter(|p| !p.archived).collect();
+    match requested {
+        Some(name) => active
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .map(|p| p.id.clone())
+            .ok_or_else(|| {
+                let names: Vec<&str> = active.iter().map(|p| p.name.as_str()).collect();
+                anyhow::anyhow!("no active project named '{name}'. Active: {names:?}")
+            }),
+        None => active.first().map(|p| p.id.clone()).ok_or_else(|| {
+            anyhow::anyhow!("no projects yet. Create one with:  timetrack project \"Work\"")
+        }),
+    }
+}
+
+/// The current time, in milliseconds since the epoch.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse a moment given on the command line, in milliseconds since the epoch.
+///
+/// Two forms, because they cover the two things a person actually means:
+///
+/// - `-90` -- minutes relative to now, so `-90` is 90 minutes ago
+/// - `09:30` -- today at that wall-clock time
+///
+/// A leading `-` is deliberately allowed through clap (`allow_hyphen_values`)
+/// because `-90` is a perfectly ordinary thing to type for "90 minutes ago".
+fn parse_when(text: &str, what: &str) -> Result<i64> {
+    let text = text.trim();
+    anyhow::ensure!(!text.is_empty(), "{what} cannot be empty");
+
+    if let Some(rest) = text.strip_prefix('-') {
+        let mins: i64 = rest
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{what}: '{text}' is not a number of minutes ago"))?;
+        return Ok(now_ms() - mins * 60_000);
+    }
+    if let Ok(mins) = text.parse::<i64>() {
+        // A bare positive number reads as "minutes from now", which is the
+        // only sensible reading of `timetrack add -S 30`.
+        return Ok(now_ms() + mins * 60_000);
+    }
+
+    let (h, m) = text
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("{what}: '{text}' is neither -90, 90 nor HH:MM"))?;
+    let h: i64 = h
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{what}: '{text}' has a bad hour"))?;
+    let m: i64 = m
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{what}: '{text}' has a bad minute"))?;
+    anyhow::ensure!(
+        (0..24).contains(&h) && (0..60).contains(&m),
+        "{what}: '{text}' is not a real time of day"
+    );
+
+    // `HH:MM` means today, so anchor on today's UTC midnight. The service owns
+    // the timezone; the CLI only needs a good-enough anchor, and being a few
+    // hours out is visible and correctable by editing the entry.
+    let day_ms = 86_400_000;
+    let today = now_ms().div_euclid(day_ms) * day_ms;
+    Ok(today + (h * 3_600_000 + m * 60_000))
+}
+
+/// Parse a duration like `90m`, `1h30m` or `45s`, in milliseconds.
+fn parse_duration(text: &str) -> Result<i64> {
+    let text = text.trim().to_ascii_lowercase();
+    anyhow::ensure!(!text.is_empty(), "duration cannot be empty");
+
+    let mut total: i64 = 0;
+    let mut number = String::new();
+    let mut saw_unit = false;
+
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        let n: i64 = number
+            .parse()
+            .map_err(|_| anyhow::anyhow!("'{text}': expected a number before '{ch}'"))?;
+        number.clear();
+        total += match ch {
+            'h' => n * 3_600_000,
+            'm' => n * 60_000,
+            's' => n * 1_000,
+            _ => anyhow::bail!("'{text}': unknown unit '{ch}' (use h, m or s)"),
+        };
+        saw_unit = true;
+    }
+
+    // A trailing number with no unit: read it as minutes, which is what a bare
+    // `timetrack duration -f 30` almost certainly means.
+    if !number.is_empty() {
+        let n: i64 = number
+            .parse()
+            .map_err(|_| anyhow::anyhow!("'{text}': trailing number is not a number"))?;
+        total += n * 60_000;
+        saw_unit = true;
+    }
+
+    anyhow::ensure!(saw_unit, "'{text}' has no unit (try 30m, 1h30m or 45s)");
+    anyhow::ensure!(total > 0, "'{text}' must be a positive duration");
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_parse_with_units() {
+        assert_eq!(parse_duration("30m").unwrap(), 1_800_000);
+        assert_eq!(parse_duration("1h").unwrap(), 3_600_000);
+        assert_eq!(parse_duration("45s").unwrap(), 45_000);
+        assert_eq!(parse_duration("1h30m").unwrap(), 5_400_000);
+    }
+
+    #[test]
+    fn durations_are_case_insensitive() {
+        assert_eq!(parse_duration("30M").unwrap(), 1_800_000);
+        assert_eq!(parse_duration("1H").unwrap(), 3_600_000);
+    }
+
+    #[test]
+    fn a_bare_number_reads_as_minutes() {
+        // `timetrack duration -f 30` almost certainly means 30 minutes.
+        assert_eq!(parse_duration("30").unwrap(), 1_800_000);
+    }
+
+    #[test]
+    fn zero_and_negative_durations_are_refused() {
+        assert!(parse_duration("0m").is_err());
+        assert!(parse_duration("0").is_err());
+    }
+
+    #[test]
+    fn a_unitless_string_is_refused() {
+        assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn an_unknown_unit_is_named_in_the_error() {
+        let e = parse_duration("30d").unwrap_err().to_string();
+        assert!(e.contains('d'), "should name the bad unit: {e}");
+    }
+
+    #[test]
+    fn minutes_ago_parses_relative_to_now() {
+        let before = now_ms();
+        let t = parse_when("-90", "start").unwrap();
+        let after = now_ms();
+        // 90 minutes before, give or take the time the call itself took.
+        assert!(
+            (before - 5_400_001..=after - 5_399_999).contains(&t),
+            "got {t}"
+        );
+    }
+
+    #[test]
+    fn minutes_from_now_parses_forward() {
+        let before = now_ms();
+        let t = parse_when("30", "start").unwrap();
+        assert!((before + 1_800_000..=now_ms() + 1_800_000).contains(&t));
+    }
+
+    #[test]
+    fn a_wall_clock_time_lands_today() {
+        let t = parse_when("09:30", "start").unwrap();
+        let day = 86_400_000;
+        let today = now_ms().div_euclid(day) * day;
+        assert!(
+            t >= today && t < today + day,
+            "09:30 should fall inside today"
+        );
+        // And specifically at 9h30m past the anchor day.
+        let offset_in_day = t - today;
+        assert!(
+            (6 * 3_600_000..=11 * 3_600_000).contains(&offset_in_day),
+            "09:30 should be mid-morning, got {}ms into the day",
+            offset_in_day
+        );
+    }
+
+    #[test]
+    fn impossible_times_are_refused() {
+        assert!(parse_when("25:00", "start").is_err());
+        assert!(parse_when("09:70", "start").is_err());
+        assert!(parse_when("nonsense", "start").is_err());
+        assert!(parse_when("", "start").is_err());
+    }
+
+    #[test]
+    fn the_error_names_the_field() {
+        // "start" vs "end" matters: a user who typed the wrong one should be
+        // told which argument to look at.
+        assert!(
+            parse_when("99:99", "end")
+                .unwrap_err()
+                .to_string()
+                .contains("end")
+        );
+    }
+
+    #[test]
+    fn the_command_line_parses() {
+        // The subcommand surface is the CLI's real API; a rename that breaks
+        // someone's alias should fail here, not at runtime.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 }
