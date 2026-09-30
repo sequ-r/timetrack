@@ -17,5 +17,5 @@ timetrack-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zbus = { workspace = true }
-tokio = { workspace = true }
+async-io = "2"
 anyhow = { workspace = true }

@@ -66,8 +66,13 @@ enum Command {
     Remove { id: String },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// zbus uses the async-io backend (see the workspace Cargo.toml), so the
+/// runtime is `async_io`, not tokio.
+fn main() -> Result<()> {
+    async_io::block_on(run())
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // The TUI is interactive and wants the terminal to itself.

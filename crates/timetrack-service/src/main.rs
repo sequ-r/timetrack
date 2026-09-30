@@ -74,8 +74,14 @@ impl TimerIface {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// zbus uses the async-io backend (see the workspace Cargo.toml), so the
+/// runtime is `async_io`, not tokio. `tokio::main` would leave no reactor for
+/// zbus' internal executor.
+fn main() -> anyhow::Result<()> {
+    async_io::block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let store = JsonStore::new(
         std::env::args_os()
             .nth(1)
@@ -103,9 +109,13 @@ async fn main() -> anyhow::Result<()> {
         println!("timetrack-service: listening on {BUS_NAME} (running: {running})");
     }
 
-    tokio::signal::ctrl_c().await?;
-    println!("timetrack-service: shutting down");
-    Ok(())
+    // Park forever. Ctrl-C kills the process outright, which is fine: every
+    // mutation is persisted before it is acknowledged, so there is no state to
+    // flush on the way out. (An earlier version used a tokio ctrl_c handler;
+    // zbus no longer uses tokio, and pulling in async-signal only for this
+    // would add a dependency for no benefit.)
+    std::future::pending::<()>().await;
+    unreachable!()
 }
 
 #[cfg(test)]

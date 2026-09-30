@@ -8,7 +8,7 @@
 //! The main window: status, entry list, and the bridge to the service.
 //!
 //! GPUI is single-threaded and owns the UI, but zbus is async, so the two meet
-//! across a thread boundary: a background thread owns a tokio runtime and the
+//! across a thread boundary: a background thread owns an async-io runtime and the
 //! bus connection and forwards snapshots over a channel, while the UI drains
 //! that channel during `render`. The view holds no authoritative state — every
 //! pixel it draws comes from a `Snapshot` the service produced, which is what
@@ -47,29 +47,12 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        // Both zbus backends end up enabled here: gpui pulls in async-io, this
-        // workspace asks for tokio, and Cargo unions them. zbus' executor
-        // prefers its `tokio` branch, so it calls `tokio::task::spawn_blocking`
-        // and panics with "there is no reactor running" unless a tokio runtime
-        // is entered on this thread.
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = tx.send(Msg::Error(format!(
-                    "could not start the async runtime: {e}"
-                )));
-                return;
-            }
-        };
-        // Enter the runtime for this thread so that any tokio API called from
-        // a worker thread — including zbus' `spawn_blocking`, which panics with
-        // "there is no reactor running" otherwise — finds a runtime context.
-        let _guard = rt.enter();
-        rt.block_on(async move {
+        // zbus uses the async-io backend (see the workspace Cargo.toml for why
+        // that is not optional), so the bus is driven with `async_io::block_on`
+        // on this dedicated thread rather than from a gpui future. gpui's
+        // executor threads have no zbus-compatible reactor, and zbus'
+        // `spawn_blocking` would panic there.
+        async_io::block_on(async move {
             // Wait for the service, but keep retrying: the user may start it
             // after the window opens, and the GUI should recover on its own.
             let client = loop {
@@ -79,7 +62,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                 let _ = tx.send(Msg::Error(
                     "waiting for the timetrack service...".to_string(),
                 ));
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                async_io::Timer::after(Duration::from_secs(2)).await;
             };
 
             loop {
@@ -116,7 +99,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         }
                     }
                 }
-                tokio::time::sleep(REFRESH).await;
+                async_io::Timer::after(REFRESH).await;
             }
         });
     });
@@ -177,11 +160,10 @@ impl TimetrackView {
     }
 
     // NOTE: the service connection deliberately does NOT happen inside a
-    // `cx.spawn` future. gpui drives those on its own executor, whose threads
-    // have no tokio context, and zbus' `spawn_blocking` panics there with
-    // "there is no reactor running". Everything bus-related is therefore
-    // confined to the dedicated std::thread in `spawn_service_thread`, which
-    // owns a tokio runtime of its own.
+    // `cx.spawn` future. gpui drives those on its own executor threads, and
+    // zbus' blocking/async-io backend is fine there but its tokio backend is
+    // not. Everything bus-related is confined to the dedicated std::thread in
+    // `spawn_service_thread`, which owns an async-io runtime of its own.
 
     /// Fold every queued message into one refresh. Several may be pending and
     /// only the newest snapshot matters.

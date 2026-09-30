@@ -26,4 +26,4 @@ anyhow = { workspace = true }
 # fails to compile. Cargo unifies one version across the whole graph, so
 # depending on it here pins it for gpui too. Re-check when bumping gpui-ce.
 image = "=0.25.10"
-tokio = { workspace = true }
+async-io = "2"

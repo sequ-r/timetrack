@@ -104,21 +104,15 @@ reproducible.
 
 ## Known issues
 
-**The GUI compiles and links, but panics on startup.** zbus' `tokio` backend
-performs the bus connect inside zbus' *own* executor thread, which has no tokio
-context, and calls `tokio::task::spawn_blocking` there — panicking with "there
-is no reactor running, must be called from the context of a Tokio 1.x runtime".
-gpui drives its executor on threads we do not control, and Cargo unifies zbus'
-features across the workspace, so the GUI cannot simply drop the `tokio`
-backend that the service and CLI rely on. Everything bus-related is already
-confined to a dedicated thread with its own runtime in `crates/timetrack-gui/src/app.rs`;
-what remains is getting that runtime's context visible to zbus' internal
-thread. Until that is resolved the GUI is buildable but not runnable, and the
-flatpak is not yet publishable.
-
 **No prebuilt binaries are published.** A statically linked musl build of the
 CLI compiles and links with no `NEEDED` entries, but segfaults on startup
-(12/12 runs). Install with `cargo install` instead.
+(12/12 runs). Install with `cargo install` instead. Fixing that is the main
+thing left before a release pipeline is worth adding.
+
+**The GUI has not been run on a real display.** It builds, links, and starts
+without panicking, but this environment has no X11 or Wayland session, so the
+window itself has never been seen. The layout, the key bindings and the service
+integration are therefore unexercised.
 
 ## Licence
 
