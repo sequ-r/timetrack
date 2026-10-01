@@ -27,12 +27,11 @@ thiserror = "2"
 # `tokio::task::spawn_blocking`, which panics with "there is no reactor running"
 # unless the calling thread is inside a tokio runtime.
 #
-# gpui itself calls zbus -- `gpui_ce_linux` does `ashpd::zbus::Connection::system()`
-# for portals, from gpui's own executor threads, which have no tokio context and
-# which we do not control. So enabling "tokio" here breaks gpui's startup, not
-# just our own code. ashpd already selects the "async-io" backend, so this
-# matches what gpui expects; the blocking/async-io backend connects from any
-# thread.
+# gpui itself calls zbus -- its Linux backend goes through ashpd for portals,
+# from gpui's own executor threads, which have no tokio context and which we do
+# not control. So enabling "tokio" here breaks gpui's startup, not just our own
+# code. ashpd already selects the "async-io" backend, so this matches what gpui
+# expects; the blocking/async-io backend connects from any thread.
 #
 # Consequence: the service and CLI must also stop relying on
 # `#[tokio::main]`, since zbus no longer needs a tokio runtime. They use
@@ -43,19 +42,12 @@ ratatui = "0.29"
 crossterm = "0.28"
 anyhow = "1"
 
-# gpui-ce publishes no crates.io build that includes the platform backend, so
-# both crates are pinned to a single git rev. The platform crate is version
-# 0.1.0 and is deliberately NOT kept in lockstep with gpui-ce's 0.2.x line.
-[workspace.dependencies.gpui]
-git = "https://github.com/gpui-ce/gpui-ce.git"
-rev = "17d9c8e8fdb30a329d817ca06bff424e8e848f1a"
-package = "gpui-ce"
-
-[workspace.dependencies.gpui_platform]
-git = "https://github.com/gpui-ce/gpui-ce.git"
-rev = "17d9c8e8fdb30a329d817ca06bff424e8e848f1a"
-package = "gpui_ce_platform"
-features = ["font-kit", "wayland", "x11"]
+# Upstream gpui, as published from Zed. The community fork (gpui-ce) was only
+# ever needed because the published crate carried no platform backend and had
+# to be paired with a separate gpui_platform crate pinned to the same git rev.
+# 0.2.2 ships the backends behind its default features -- font-kit, wayland and
+# x11 -- so a single crates.io dependency replaces both of those.
+gpui = "0.2.2"
 
 [profile.release]
 opt-level = 2

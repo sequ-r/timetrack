@@ -23,6 +23,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `--workspace` builds timetrack-gui too, and gpui links the system
+      # libraries below. Without them the test job fails at build time, which
+      # reads as a broken test rather than a missing -dev package.
+      - name: Install the GUI's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --locked
 

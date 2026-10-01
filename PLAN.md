@@ -118,10 +118,53 @@ element with `on_key_down` but no `FocusHandle` has a dead keyboard while
 looking perfectly alive. Tabs still respond, because those are click handlers.
 The root is given an id, a `FocusHandle`, and focus on the first frame.
 
-Verification: rendering and mouse clicks were verified against a real service
-under Xvfb, driving the actual quick-add buttons and confirming the totals. The
-**keyboard could not be verified** — that X server has no keymap, so every
-keysym lookup returns 0. It needs a check on a real display.
+Verification: `scripts/gui-smoke.sh`, 10 checks. It starts a private bus, a real
+service and the real GUI on Xvfb, screenshots the window, clicks the 15-minute
+quick-add button through the X11 XTest extension, and asserts that the service
+then holds a 15-minute quick add, that the week total on screen re-rendered, and
+that `1` and `q` reach the app as a quick add and a quit. Pixels are the
+evidence: a rendered frame is the only thing that proves the renderer ran rather
+than the window merely existing.
+
+The headless keyboard check needed two things that were missing the first time
+round: an Xvfb server has no keymap until `setxkbmap` gives it one (without one
+every keysym lookup returns 0), and with no window manager the input focus is
+PointerRoot, so the pointer has to be over the window for a keystroke to arrive
+at all. Both are properties of the test rig, not of the app — on a real display
+a window manager handles the focus. **The keyboard is verified now**, which it
+was not before.
+
+One more trap, for whoever runs this next: Xvfb implements no DRI3, and Mesa's
+GPU drivers need it to present, so the app needs a software Vulkan driver
+(Arch: `vulkan-swrast`; Debian/Ubuntu: `mesa-vulkan-drivers`). Without one the
+window opens, is the right size, and stays black forever — and gpui does not
+paint its first frame until an event arrives, so the script nudges the pointer
+into the window before it starts looking.
+
+### The toolkit moved to upstream gpui
+
+The GUI was built on **gpui-ce**, the community fork, for one reason: the
+published `gpui` crate carried no platform backend, so a crates.io-only
+dependency produced a test platform that could not open a window, and gpui-ce
+shipped the real one in a separate `gpui_platform` crate. Upstream 0.2.2 carries
+the Linux backends behind its default features, so the fork bought nothing any
+more. What the migration changed:
+
+- `gpui = "0.2.2"` from crates.io replaces both git dependencies, and the
+  flatpak no longer needs a checkout of the toolkit.
+- The entry point is `Application::new()`, which picks the backend from the
+  session's environment, instead of `gpui_platform::application()`.
+- Exactly one call site in this repository changed:
+  `FocusHandle::focus(window, cx)` lost its `cx` argument. The `image` pin in
+  the GUI's manifest went away with it — that pin existed because gpui-ce's
+  Wayland backend called `ImageBuffer::into_raw_bgra`, which upstream 0.2.2
+  does not.
+
+The lockfile moves more than the toolkit. gpui-ce was *ahead* of upstream on
+several UI dependencies — wgpu 29 and cosmic-text 0.19 against upstream's
+blade-graphics and cosmic-text 0.14 — so those come back down to what upstream
+pins. Nothing here depends on either; the GUI uses boxes, text, colour and
+click handlers only.
 
 ## Increment 4 — CLI — **done**
 

@@ -16,7 +16,7 @@ the terminal never loses anything, and both can be open at once.
 
 ```
   timetrack (GUI, flatpak)        timetrack (CLI, static binary)
-  gpui-ce, 3 tabs                ratatui TUI + one-shot commands
+  gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands
         |                                  |
         +--------- D-Bus: org.sequ.timetrack.Entries ----+
                            |
@@ -32,7 +32,7 @@ the terminal never loses anything, and both can be open at once.
 | `timetrack-proto` | The D-Bus contract and a client. Both front ends depend on this. |
 | `timetrack-service` | D-Bus server. Owns the store, resolves the clock and timezone, persists on every change. |
 | `timetrack-cli` | Terminal client: a ratatui TUI plus one-shot subcommands. |
-| `timetrack-gui` | Desktop client, built on gpui-ce. Ships as the flatpak. |
+| `timetrack-gui` | Desktop client, built on gpui (upstream, from crates.io). Ships as the flatpak. |
 
 The core takes an explicit timestamp and never reads the clock, so the rules are
 identical everywhere and testable without any I/O. Aggregation is implemented in
@@ -67,6 +67,7 @@ Requires Rust 1.85 or newer (the crates are edition 2024).
 cargo build --release
 cargo test --workspace        # 136 unit tests
 bash scripts/e2e.sh           # 60 end-to-end checks against a real service
+bash scripts/gui-smoke.sh     # 10 checks that the GUI paints, clicks, and reads the keyboard
 ```
 
 On Linux the GUI additionally needs the system libraries gpui links against:
@@ -75,6 +76,21 @@ On Linux the GUI additionally needs the system libraries gpui links against:
 # Debian/Ubuntu
 apt install libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
 ```
+
+`gui-smoke.sh` runs the GUI on Xvfb, screenshots it and drives it through the
+X11 XTest extension, so it needs no display of its own — but Xvfb implements
+no DRI3 and Mesa's GPU drivers need it to present, so the GUI needs a software
+Vulkan driver there (Arch: `vulkan-swrast`, Debian/Ubuntu:
+`mesa-vulkan-drivers`; the script also accepts an extracted one via
+`TT_LAVAPIPE_DIR`). Without it the window opens and stays black, which the
+script reports as a driver problem rather than as a failure of the app.
+
+The GUI's keyboard was the one thing headless checks could not reach: an Xvfb
+server has no keymap, so every keysym lookup returns 0 and no keystroke can be
+delivered. `setxkbmap` gives it one, so `gui-smoke.sh` now presses `1` and `q`
+and asserts both. The window's root element still needs its id and `FocusHandle`
+for `on_key_down` to fire at all — that requirement did not go away with the
+toolkit.
 
 ## Running
 
@@ -215,13 +231,6 @@ is identical to the GNOME 50 one apart from `runtime-version`, and the GNOME
 entry into the wrong local day within a few hours of a transition, which
 matters most at a week boundary. This is the likeliest remaining source of
 wrong numbers, and a real tz-database lookup per instant is the fix.
-
-**GUI keyboard shortcuts are unverified.** The window's root element is given an
-id and a `FocusHandle`, and is focused on the first render, which is what gpui
-requires before `on_key_down` fires at all. It could not be confirmed on a
-headless X server, where every keymap lookup returns 0 and no keystroke can be
-delivered. Rendering and mouse clicks were verified against a real service, so
-try `1` on a real display.
 
 ## Licence
 

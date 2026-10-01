@@ -58,7 +58,9 @@ entries whose shape is now wrong. No migration is written; an unreadable store
 produces a clear "unsupported or corrupt store" message rather than a crash.
 A version field is added now so a future migration has something to branch on.
 
-**[DECIDED]** Edition 2024, gpui-ce for the GUI, ratatui for the CLI.
+**[DECIDED]** Edition 2024, gpui for the GUI, ratatui for the CLI. (Originally
+gpui-ce, the community fork, because the published gpui crate carried no
+platform backend; upstream 0.2.2 ships one, so the GUI is on upstream gpui.)
 
 ## 3. Data model (proposed)
 
@@ -438,8 +440,9 @@ specification and the implementation do not quietly diverge.
 | §8 Merge takes the union, may shrink the total | `rules.rs::merge_entries` | tests assert both cases |
 | §9 ISO weeks, months, per-project | `core/src/aggregate.rs` | boundary tests |
 | §9 Aggregation applied by the service | `service/src/interface.rs` | e2e |
-| §11 Three tabs | `gui/src/app.rs` | screenshot |
-| §11 Week total large, at the top, nothing above it | `gui/src/app.rs`, 72px | screenshot |
+| §6 Quick-add from the GUI — by click and by keystroke | `gui/src/app.rs` | `gui-smoke.sh`, XTest click and key |
+| §11 Three tabs | `gui/src/app.rs` | `gui-smoke.sh` (screenshot) |
+| §11 Week total large, at the top, nothing above it | `gui/src/app.rs`, 72px | `gui-smoke.sh` (text drawn; the value itself is not read back) |
 | §14 Archived projects stay in totals | `rules.rs::set_archived` | service test |
 | §2 Version field, no migration | `model.rs::STORE_VERSION` | storage test |
 | §2 Corrupt store refused, not reset | `storage.rs` | storage test |
@@ -474,9 +477,5 @@ specification and the implementation do not quietly diverge.
   can bucket an entry into the wrong local day near a week boundary. §9 assumes
   correct local-time bucketing, so this is a real shortfall against the spec,
   not a nicety. A tz-database lookup per instant is the fix.
-- **GUI keyboard shortcuts are unverified.** The wiring follows gpui's dispatch
-  rules — the root needs an id, a `FocusHandle` and focus — and is in place, but
-  the headless X server used for testing has no keymap and cannot deliver a
-  keystroke. Untested, not known-broken.
 - **The GUI's "New project" name is a placeholder** (`Project 1`, `Project 2`).
   Functional but not what §11 asks for.

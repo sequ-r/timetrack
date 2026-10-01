@@ -454,7 +454,7 @@ impl Render for TimetrackView {
         // this the keyboard is dead until the user clicks something focusable.
         if !self.focused_once {
             self.focused_once = true;
-            self.focus.focus(window, cx);
+            self.focus.focus(window);
         }
 
         let this = cx.entity();

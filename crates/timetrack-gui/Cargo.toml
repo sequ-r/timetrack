@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TimeTrack desktop client (gpui-ce)"
+description = "TimeTrack desktop client (gpui)"
 
 # Named distinctly from the CLI's `timetrack` so the two workspace
 # binaries do not collide in the shared target directory. The
@@ -18,12 +18,5 @@ path = "src/main.rs"
 timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
 gpui = { workspace = true }
-gpui_platform = { workspace = true }
 anyhow = { workspace = true }
-# gpui-ce 0.2.2 calls `ImageBuffer::into_raw_bgra`, which the `image` crate
-# removed in 0.25.9 and restored in 0.25.10. gpui declares a loose
-# `image = "0.25.1"`, so a fresh resolve picks 0.25.9 and gpui_ce_linux then
-# fails to compile. Cargo unifies one version across the whole graph, so
-# depending on it here pins it for gpui too. Re-check when bumping gpui-ce.
-image = "=0.25.10"
 async-io = "2"
