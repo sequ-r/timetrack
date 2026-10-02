@@ -43,6 +43,10 @@ const REFRESH: Duration = Duration::from_millis(1000);
 enum Msg {
     Snapshot(Box<Snapshot>),
     Error(String),
+    /// An action succeeded. Snapshots never clear feedback (they arrive
+    /// every second and would make errors unreadable), so success arrives as
+    /// its own message that dismisses the previous error.
+    ActionOk,
 }
 
 /// A command the UI wants performed. The service thread owns the bus
@@ -197,14 +201,20 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
     (rx, action_tx)
 }
 
-/// Forward a command failure to the UI, keeping the service's own wording.
+/// Forward a command outcome to the UI, keeping the service's own wording
+/// on failure.
 ///
 /// Takes an already-rendered message rather than a `Result`, because `Result`
 /// is ambiguous in this crate: `anyhow` exports a one-parameter alias and gpui
 /// re-exports its own, so naming either one here is a coin flip.
 fn report(tx: &Sender<Msg>, outcome: std::result::Result<(), String>) {
-    if let Err(e) = outcome {
-        let _ = tx.send(Msg::Error(e));
+    match outcome {
+        Ok(()) => {
+            let _ = tx.send(Msg::ActionOk);
+        }
+        Err(e) => {
+            let _ = tx.send(Msg::Error(e));
+        }
     }
 }
 
@@ -321,7 +331,14 @@ impl TimetrackView {
             match self.rx.try_recv() {
                 Ok(Msg::Snapshot(s)) => {
                     self.snapshot = *s;
-                    self.status = None;
+                    // A routine snapshot must not wipe feedback from the last
+                    // action: snapshots arrive every second, so clearing here
+                    // made error reports from the service thread unreadable.
+                    // Only the "service is not running" notice clears on
+                    // recovery; action errors survive until the next one.
+                    if self.service_missing() {
+                        self.status = None;
+                    }
                     // The lists can shrink under the cursor when something is
                     // removed, which would otherwise index out of bounds.
                     let entries = self.snapshot.entries.len();
@@ -334,6 +351,14 @@ impl TimetrackView {
                     }
                 }
                 Ok(Msg::Error(e)) => self.status = Some(e),
+                Ok(Msg::ActionOk) => {
+                    // A success dismisses the previous error -- but only one
+                    // the actions own. The "service is not running" notice
+                    // belongs to the connection, not to any action.
+                    if !self.service_missing() {
+                        self.status = None;
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.status = Some("the service thread stopped".into());

@@ -68,6 +68,12 @@ pub fn iso_week_of(day: i64) -> IsoWeek {
     while days_to_year(year + 1) <= thursday && year < 10_000 {
         year += 1;
     }
+    // ... and a matching downward walk: without it every pre-1970 Thursday
+    // stayed in "1970", and the week number below could go negative and
+    // wrap around the `as u64` cast.
+    while days_to_year(year) > thursday && year > -10_000 {
+        year -= 1;
+    }
     // ISO week 1 is the week containing the first Thursday, so the Thursday
     // of week 1 falls between Jan 1 and Jan 7.
     let jan1 = days_to_year(year);
@@ -80,11 +86,19 @@ pub fn iso_week_of(day: i64) -> IsoWeek {
 }
 
 /// Days from the epoch to 1 January `year`. Walks year by year so leap days
-/// are counted exactly.
+/// are counted exactly, in both directions: the `year..1970` range for
+/// pre-epoch years would otherwise be empty and every date before 1970 would
+/// land in January 1970.
 fn days_to_year(year: i64) -> i64 {
     let mut days = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
+    if year >= 1970 {
+        for y in 1970..year {
+            days += if is_leap(y) { 366 } else { 365 };
+        }
+    } else {
+        for y in year..1970 {
+            days -= if is_leap(y) { 366 } else { 365 };
+        }
     }
     days
 }
@@ -94,6 +108,9 @@ pub fn month_of(day: i64) -> (i64, u32) {
     let mut year = 1970;
     while days_to_year(year + 1) <= day && year < 10_000 {
         year += 1;
+    }
+    while days_to_year(year) > day && year > -10_000 {
+        year -= 1;
     }
     let mut doy = day - days_to_year(year);
     let mut month = 1;
@@ -265,6 +282,34 @@ mod tests {
     #[test]
     fn month_of_finds_january_1970() {
         assert_eq!(month_of(0), (1970, 1));
+    }
+
+    #[test]
+    fn month_of_handles_pre_epoch_days() {
+        // Day -1 is 31 Dec 1969, not January 1970: the year walk has to run
+        // backwards too, and `days_to_year` has to count leap days there.
+        assert_eq!(month_of(-1), (1969, 12));
+        assert_eq!(month_of(day_of_month(1969, 12, 31)), (1969, 12));
+        assert_eq!(month_of(day_of_month(1969, 1, 1)), (1969, 1));
+        assert_eq!(month_of(day_of_month(1968, 2, 29)), (1968, 2));
+        assert_eq!(month_of(day_of_month(1970, 1, 1) - 1), (1969, 12));
+    }
+
+    #[test]
+    fn iso_weeks_are_sane_before_the_epoch() {
+        // Same downward-walk bug as `month_of`: without it the year stayed
+        // 1970 and far-enough-back Thursdays wrapped the week number.
+        for day in -800..0 {
+            let w = iso_week_of(day);
+            assert!((1..=53).contains(&w.week), "day {day} gave week {}", w.week);
+            assert!(
+                w.start_day <= day && day < w.start_day + 7,
+                "day {day} is outside its own week"
+            );
+        }
+        // 1969-12-29 was a Monday opening ISO week 1 of 1970.
+        let w = iso_week_of(day_of_month(1969, 12, 29));
+        assert_eq!((w.year, w.week), (1970, 1));
     }
 
     #[test]

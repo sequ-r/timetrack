@@ -61,7 +61,8 @@ impl EntryService {
         // buttons do nothing at all on a fresh install. Seed one so the app
         // is usable the moment it opens. Only on a genuinely empty store: an
         // existing one is left exactly as it is, archived projects and all.
-        if data.projects.is_empty() {
+        let seeded = data.projects.is_empty();
+        if seeded {
             data.projects.push(timetrack_core::Project {
                 id: "p1".into(),
                 name: "General".into(),
@@ -80,8 +81,12 @@ impl EntryService {
             }),
         };
         // Persist the seed immediately, so a read-only store surfaces at
-        // startup rather than on the user's first tap.
-        service.persist()?;
+        // startup rather than on the user's first tap -- but only when there
+        // was something to seed. Rewriting the file on every launch needlessly
+        // dirties backups and turns a read-only store into a startup failure.
+        if seeded {
+            service.persist()?;
+        }
         Ok(service)
     }
 
@@ -230,7 +235,7 @@ impl EntryService {
     }
 
     pub fn split(&self, id: &str, at_ms: i64) -> anyhow::Result<(EntryView, EntryView)> {
-        let (a, b) = self.mutate(|s, _ids, _| core::split_entry(s, id, at_ms))?;
+        let (a, b) = self.mutate(|s, ids, _| core::split_entry(s, ids, id, at_ms))?;
         Ok((protocol::entry_to_view(&a), protocol::entry_to_view(&b)))
     }
 
@@ -376,6 +381,21 @@ mod tests {
     }
 
     #[test]
+    fn reopening_an_existing_store_leaves_the_file_alone() {
+        // Startup used to rewrite the file unconditionally, dirtying backups
+        // and failing on read-only stores that could otherwise be served.
+        let (svc, path) = service("untouched");
+        let p = project(&svc);
+        let now = now_ms();
+        svc.add(&p.id, "kept", now, now + 1).unwrap();
+
+        let before = std::fs::read(&path).unwrap();
+        let _ = EntryService::new(JsonStore::new(path.clone())).unwrap();
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "starting up must not rewrite the store");
+    }
+
+    #[test]
     fn a_failed_write_does_not_leave_the_service_reporting_success() {
         // The mutate funnel reloads from disk on a save error, so a client
         // never sees an entry the service could not persist.
@@ -484,6 +504,41 @@ mod tests {
     fn deleting_an_unknown_id_is_an_error() {
         let (svc, _) = service("delete-unknown");
         assert!(svc.delete_entry("nope").is_err());
+    }
+
+    #[test]
+    fn split_halves_get_distinct_ids() {
+        // Pins the service wiring: `split` must mint the second half from the
+        // id counter, so splitting twice cannot collide.
+        let (svc, _) = service("splitids");
+        let p = project(&svc);
+        let now = now_ms();
+        let e = svc.add(&p.id, "long", now - 3_600_000, now).unwrap();
+        let (a, b) = svc.split(&e.id, now - 1_800_000).unwrap();
+        assert_ne!(a.id, b.id);
+        let (c, d) = svc.split(&a.id, now - 2_700_000).unwrap();
+        assert_ne!(c.id, d.id);
+        // The store itself must hold no id twice: the first half keeps its id
+        // by design, so uniqueness is a property of the store, not of the
+        // returned pairs.
+        let snap = svc.snapshot();
+        let ids: Vec<&str> = snap.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            assert!(seen.insert(id), "duplicate id {id}");
+        }
+    }
+
+    #[test]
+    fn merge_with_itself_is_an_error_not_a_panic() {
+        let (svc, _) = service("mergeself");
+        let p = project(&svc);
+        let now = now_ms();
+        let e = svc.add(&p.id, "one", now - 1_000, now).unwrap();
+        let err = svc.merge(&[e.id.clone(), e.id.clone()]);
+        assert!(err.is_err(), "must refuse, not panic");
+        assert_eq!(svc.snapshot().entries.len(), 1);
     }
 
     // --- aggregation lands in the service ---
