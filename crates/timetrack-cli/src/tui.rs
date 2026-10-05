@@ -34,7 +34,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant};
 use timetrack_core::QUICK_ADD_MS;
-use timetrack_proto::{Client, ProjectView, Snapshot};
+use timetrack_proto::{Client, ClientError, ProjectView, Snapshot};
 
 /// How often to refresh from the service.
 const TICK: Duration = Duration::from_millis(1000);
@@ -115,7 +115,7 @@ impl App {
     async fn act<F, Fut>(&mut self, f: F) -> bool
     where
         F: FnOnce(Client) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
+        Fut: std::future::Future<Output = std::result::Result<(), ClientError>>,
     {
         // Client is a cheap handle over the same connection, so clone it out
         // rather than borrow `self` across the call: the call needs `&mut self`

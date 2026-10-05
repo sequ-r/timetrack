@@ -34,7 +34,7 @@ use gpui::{
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
-use timetrack_proto::{ProjectView, Snapshot};
+use timetrack_proto::{ClientError, ProjectView, Snapshot};
 
 /// How often the service is polled for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(1000);
@@ -42,7 +42,7 @@ const REFRESH: Duration = Duration::from_millis(1000);
 /// A snapshot handed from the service thread to the UI thread.
 enum Msg {
     Snapshot(Box<Snapshot>),
-    Error(String),
+    Error(StatusMsg),
     /// A success worth showing (e.g. where an export was written). Snapshots
     /// never clear feedback, so this survives until the next action.
     Status(String),
@@ -66,6 +66,9 @@ enum Action {
     ArchiveProject(String),
     /// Create a project.
     AddProject(String),
+    /// Rename a project. Colour is untouched: the GUI names projects, the
+    /// CLI recolours them (§11).
+    UpdateProject { id: String, name: String },
     /// Method 1: an explicit start and end (the manual-entry dialog).
     AddEntry {
         project: String,
@@ -81,6 +84,13 @@ enum Action {
     },
     /// Edit an entry's description (the dialog's edit mode).
     SetText { id: String, description: String },
+    /// Split one entry in two at a moment (REQUIREMENTS §8). Lossless: the
+    /// halves cover exactly the original interval.
+    SplitEntry { id: String, at_ms: i64 },
+    /// Merge entries into their union (REQUIREMENTS §8). Overlapping entries
+    /// collapse, so the total can shrink -- the view confirms with the amount
+    /// before sending this.
+    MergeEntries { ids: Vec<String> },
     /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
     /// the CSV over D-Bus and writes it to `path`.
     ExportCsv { scope: String, path: String },
@@ -107,27 +117,24 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
             // The reported message distinguishes "not there" from "there but
             // speaking a different interface". Those need different fixes, and
             // a version mismatch between the GUI and the service is otherwise
-            // indistinguishable from the service being absent.
-            let mut last_error: Option<String> = None;
+            // indistinguishable from the service being absent. The two cases
+            // sort by error variant in `ClientError`, never by message text.
+            let mut last_error: Option<StatusMsg> = None;
             let client = loop {
                 match timetrack_proto::Client::connect().await {
                     Ok(c) => break c,
                     Err(e) => {
-                        let text = e.to_string();
-                        let hint = if text.contains("UnknownInterface")
-                            || text.contains("Unknown interface")
-                        {
-                            "The GUI and the service are different versions.\n\
-                             Reinstall whichever one is older so both speak\n\
-                             org.sequ.timetrack.Entries."
-                        } else {
-                            "the timetrack service is not running. Start it with:\n\
-                             timetrack-service &\n\
-                             (or install it to a systemd user unit -- see the README)"
+                        // At startup any bus failure presents as the service
+                        // being unreachable; once connected, failures triage
+                        // precisely by variant. The detail rides along in
+                        // parens, as it always has.
+                        let note = StatusMsg {
+                            text: format!("{}\n\n({e})", no_service_hint()),
+                            kind: StatusKind::NoService,
                         };
-                        if last_error.as_deref() != Some(hint) {
-                            last_error = Some(hint.to_string());
-                            let _ = tx.send(Msg::Error(format!("{hint}\n\n({text})")));
+                        if last_error.as_ref() != Some(&note) {
+                            last_error = Some(note.clone());
+                            let _ = tx.send(Msg::Error(note));
                         }
                     }
                 }
@@ -143,46 +150,24 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                 loop {
                     match action_rx.try_recv() {
                         Ok(Action::QuickAdd { project, ms }) => {
-                            report(
-                                &tx,
-                                client
-                                    .quick_add(&project, ms)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.quick_add(&project, ms).await.map(|_| ()));
                         }
                         Ok(Action::UndoQuickAdd(id)) => {
-                            report(
-                                &tx,
-                                client.undo_quick_add(&id).await.map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.undo_quick_add(&id).await.map(|_| ()));
                         }
                         Ok(Action::DeleteEntry(id)) => {
-                            report(
-                                &tx,
-                                client.delete_entry(&id).await.map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.delete_entry(&id).await.map(|_| ()));
                         }
                         Ok(Action::ArchiveProject(id)) => {
-                            report(
-                                &tx,
-                                client
-                                    .set_archived(&id, true)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.set_archived(&id, true).await.map(|_| ()));
                         }
                         Ok(Action::AddProject(name)) => {
-                            report(
-                                &tx,
-                                client
-                                    .add_project(&name)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.add_project(&name).await.map(|_| ()));
+                        }
+                        Ok(Action::UpdateProject { id, name }) => {
+                            // Colour keeps its value: -1 is the service's
+                            // keep sentinel.
+                            report(&tx, client.update_project(&id, &name, -1).await.map(|_| ()));
                         }
                         Ok(Action::AddEntry {
                             project,
@@ -195,8 +180,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                 client
                                     .add(&project, &description, started_at, ended_at)
                                     .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
+                                    .map(|_| ()),
                             );
                         }
                         Ok(Action::SetTimes {
@@ -209,37 +193,38 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                 client
                                     .set_times(&id, started_at, ended_at)
                                     .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
+                                    .map(|_| ()),
                             );
                         }
                         Ok(Action::SetText { id, description }) => {
-                            report(
-                                &tx,
-                                client
-                                    .set_text(&id, &description)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.set_text(&id, &description).await.map(|_| ()));
+                        }
+                        Ok(Action::SplitEntry { id, at_ms }) => {
+                            report(&tx, client.split(&id, at_ms).await.map(|_| ()));
+                        }
+                        Ok(Action::MergeEntries { ids }) => {
+                            report(&tx, client.merge(&ids).await.map(|_| ()));
                         }
                         Ok(Action::ExportCsv { scope, path }) => {
-                            let outcome = match client.export_csv(&scope).await {
+                            // The service refusal stays typed; a local write
+                            // failure is a local note, not a service error.
+                            match client.export_csv(&scope).await {
                                 Ok(csv) => match std::fs::write(&path, &csv) {
-                                    Ok(()) => Ok(format!(
-                                        "exported {} entries ({scope}) to {path}",
-                                        csv.lines().count().saturating_sub(1)
-                                    )),
-                                    Err(e) => Err(format!("could not write {path}: {e}")),
+                                    Ok(()) => {
+                                        let _ = tx.send(Msg::Status(format!(
+                                            "exported {} entries ({scope}) to {path}",
+                                            csv.lines().count().saturating_sub(1)
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(Msg::Error(StatusMsg {
+                                            text: format!("could not write {path}: {e}"),
+                                            kind: StatusKind::Local,
+                                        }));
+                                    }
                                 },
-                                Err(e) => Err(e.to_string()),
-                            };
-                            match outcome {
-                                Ok(note) => {
-                                    let _ = tx.send(Msg::Status(note));
-                                }
                                 Err(e) => {
-                                    let _ = tx.send(Msg::Error(e));
+                                    let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
                                 }
                             }
                         }
@@ -248,14 +233,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                             // activation; `Client::connect` just asks for a
                             // proxy, so make a real call to force the bus to
                             // start the service if it can.
-                            report(
-                                &tx,
-                                client
-                                    .snapshot()
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|e| e.to_string()),
-                            );
+                            report(&tx, client.snapshot().await.map(|_| ()));
                         }
                         Err(TryRecvError::Empty) => break,
                         // The window is gone; nothing left to do.
@@ -269,7 +247,7 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         }
                     }
                     Err(e) => {
-                        if tx.send(Msg::Error(e.to_string())).is_err() {
+                        if tx.send(Msg::Error(StatusMsg::from(&e))).is_err() {
                             return;
                         }
                     }
@@ -281,19 +259,90 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
     (rx, action_tx)
 }
 
-/// Forward a command outcome to the UI, keeping the service's own wording
-/// on failure.
+/// What kind of problem a status line reports.
 ///
-/// Takes an already-rendered message rather than a `Result`, because `Result`
-/// is ambiguous in this crate: `anyhow` exports a one-parameter alias and gpui
-/// re-exports its own, so naming either one here is a coin flip.
-fn report(tx: &Sender<Msg>, outcome: std::result::Result<(), String>) {
+/// The kind drives behaviour -- a missing service offers to start it, and
+/// only connection notices clear on recovery -- so it travels with the text
+/// rather than being re-parsed out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusKind {
+    /// Nothing owns the service name.
+    NoService,
+    /// The service answered unknown-interface or unknown-method.
+    VersionMismatch,
+    /// The service refused an action; the text is its own wording.
+    Service,
+    /// Local UI notes and bus-level failures, not service refusals.
+    Local,
+}
+
+/// The footer status line: what to show, and what kind of problem it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusMsg {
+    text: String,
+    kind: StatusKind,
+}
+
+impl StatusMsg {
+    /// A local UI note or bus-level failure: shown as-is, never offered the
+    /// start-service action, and dismissed by the next action's success.
+    fn local(text: impl Into<String>) -> Self {
+        StatusMsg {
+            text: text.into(),
+            kind: StatusKind::Local,
+        }
+    }
+}
+
+/// The "service is not running" guidance, shown for `NoService`.
+fn no_service_hint() -> String {
+    "the timetrack service is not running. Start it with:\ntimetrack-service &\n(or install it to a systemd user unit -- see the README)".to_string()
+}
+
+/// The version-skew guidance, shown for `VersionMismatch`.
+fn version_mismatch_hint() -> String {
+    format!(
+        "The GUI and the service are different versions.\nReinstall whichever one is older so both speak\n{}.",
+        timetrack_proto::INTERFACE
+    )
+}
+
+impl From<&ClientError> for StatusMsg {
+    /// Map a call failure to footer text without matching on message text:
+    /// the variant decides both the wording and the kind.
+    fn from(error: &ClientError) -> Self {
+        match error {
+            ClientError::NoService => StatusMsg {
+                text: no_service_hint(),
+                kind: StatusKind::NoService,
+            },
+            ClientError::VersionMismatch { .. } => StatusMsg {
+                text: version_mismatch_hint(),
+                kind: StatusKind::VersionMismatch,
+            },
+            ClientError::Service(service) => StatusMsg {
+                text: service.to_string(),
+                kind: StatusKind::Service,
+            },
+            ClientError::Transport(detail) => StatusMsg {
+                text: detail.clone(),
+                kind: StatusKind::Local,
+            },
+        }
+    }
+}
+
+/// Forward a command outcome to the UI, keeping the error typed.
+///
+/// The kind travels with the text so the view never has to recognise a
+/// failure by sniffing its wording.
+fn report(tx: &Sender<Msg>, outcome: std::result::Result<(), ClientError>) {
     match outcome {
         Ok(()) => {
             let _ = tx.send(Msg::ActionOk);
         }
         Err(e) => {
-            let _ = tx.send(Msg::Error(e));
+            let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
         }
     }
 }
@@ -309,6 +358,12 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The snapshot's zone: prefer the name, fall back to the fixed offset for
+/// old services that send no name.
+fn snapshot_tz(snap: &timetrack_proto::Snapshot) -> timetrack_core::Tz {
+    timetrack_core::Tz::from_snapshot(&snap.tz, snap.local_offset_ms)
 }
 
 /// Which field of the entry dialog receives keystrokes.
@@ -412,23 +467,23 @@ impl EntryDialog {
     }
 
     /// Label for the start row: the hint in edit mode says what empty keeps.
-    fn start_hint(&self, offset_ms: i64) -> String {
+    fn start_hint(&self, tz: &timetrack_core::Tz) -> String {
         match &self.edit_id {
             None => "(-90, 90, now, HH:MM)".to_string(),
             Some(_) => format!(
                 "(empty keeps {})",
-                timetrack_core::format_local_hm(self.orig_start, offset_ms)
+                timetrack_core::format_local_hm(self.orig_start, tz)
             ),
         }
     }
 
     /// Label for the end row, as above.
-    fn end_hint(&self, offset_ms: i64) -> String {
+    fn end_hint(&self, tz: &timetrack_core::Tz) -> String {
         match &self.edit_id {
             None => "(-90, 90, now, HH:MM)".to_string(),
             Some(_) => format!(
                 "(empty keeps {})",
-                timetrack_core::format_local_hm(self.orig_end, offset_ms)
+                timetrack_core::format_local_hm(self.orig_end, tz)
             ),
         }
     }
@@ -484,7 +539,7 @@ enum SaveOutcome {
     Invalid(String),
 }
 
-fn resolve_save(dlg: &EntryDialog, now: i64, offset_ms: i64) -> SaveOutcome {
+fn resolve_save(dlg: &EntryDialog, now: i64, tz: &timetrack_core::Tz) -> SaveOutcome {
     match &dlg.edit_id {
         None => {
             if dlg.start.trim().is_empty() {
@@ -493,12 +548,11 @@ fn resolve_save(dlg: &EntryDialog, now: i64, offset_ms: i64) -> SaveOutcome {
             if dlg.end.trim().is_empty() {
                 return SaveOutcome::Invalid("end cannot be empty".to_string());
             }
-            let started_at = match timetrack_core::parse_moment(&dlg.start, "start", now, offset_ms)
-            {
+            let started_at = match timetrack_core::parse_moment(&dlg.start, "start", now, tz) {
                 Ok(t) => t,
                 Err(e) => return SaveOutcome::Invalid(e.to_string()),
             };
-            let ended_at = match timetrack_core::parse_moment(&dlg.end, "end", now, offset_ms) {
+            let ended_at = match timetrack_core::parse_moment(&dlg.end, "end", now, tz) {
                 Ok(t) => t,
                 Err(e) => return SaveOutcome::Invalid(e.to_string()),
             };
@@ -518,7 +572,7 @@ fn resolve_save(dlg: &EntryDialog, now: i64, offset_ms: i64) -> SaveOutcome {
             let started_at = if dlg.start.trim().is_empty() {
                 dlg.orig_start
             } else {
-                match timetrack_core::parse_moment(&dlg.start, "start", now, offset_ms) {
+                match timetrack_core::parse_moment(&dlg.start, "start", now, tz) {
                     Ok(t) => t,
                     Err(e) => return SaveOutcome::Invalid(e.to_string()),
                 }
@@ -526,7 +580,7 @@ fn resolve_save(dlg: &EntryDialog, now: i64, offset_ms: i64) -> SaveOutcome {
             let ended_at = if dlg.end.trim().is_empty() {
                 dlg.orig_end
             } else {
-                match timetrack_core::parse_moment(&dlg.end, "end", now, offset_ms) {
+                match timetrack_core::parse_moment(&dlg.end, "end", now, tz) {
                     Ok(t) => t,
                     Err(e) => return SaveOutcome::Invalid(e.to_string()),
                 }
@@ -564,6 +618,151 @@ fn newest_quick_add(snap: &Snapshot) -> Option<String> {
         .map(|e| e.id.clone())
 }
 
+/// The split prompt: one moment field for the selected entry.
+///
+/// Plain keystroke editing like the entry dialog (type to append, backspace
+/// to delete, enter to split, escape to cancel), and likewise pure state
+/// over strings so the whole interaction is unit-testable without a window.
+#[derive(Debug, Clone)]
+struct SplitPrompt {
+    /// The entry being split.
+    entry_id: String,
+    /// Its interval, for the title and the range pre-check.
+    started_at: i64,
+    ended_at: i64,
+    /// The typed split point (`-30`, `09:30`, `now` -- the shared spellings).
+    at: String,
+    error: Option<String>,
+}
+
+/// Resolve a split prompt to the split instant.
+///
+/// Pure over the prompt plus an explicit clock and zone, like `resolve_save`,
+/// so parsing, the range pre-check and the empty-field refusal are all
+/// testable without a view or a service. The service re-validates the range
+/// on execute; this pre-check only phrases the refusal for the typed moment.
+fn resolve_split(prompt: &SplitPrompt, now: i64, tz: &timetrack_core::Tz) -> Result<i64, String> {
+    if prompt.at.trim().is_empty() {
+        return Err("enter a split point, e.g. -30 or 09:30".to_string());
+    }
+    let at_ms =
+        timetrack_core::parse_moment(&prompt.at, "at", now, tz).map_err(|e| e.to_string())?;
+    if at_ms <= prompt.started_at || at_ms >= prompt.ended_at {
+        return Err(format!(
+            "split point is outside entry '{}'",
+            prompt.entry_id
+        ));
+    }
+    Ok(at_ms)
+}
+
+/// Entries `m` would merge: the selected entry plus every same-project entry
+/// it overlaps or touches.
+///
+/// Free over the snapshot like `newest_quick_add`, for the same reason.
+/// Touching counts: joining end-to-end entries is the lossless case §8
+/// exists for, and stopping at "overlap only" would refuse exactly that.
+fn merge_targets(snapshot: &Snapshot, selected: usize) -> Vec<String> {
+    let Some(picked) = snapshot.entries.get(selected) else {
+        return Vec::new();
+    };
+    let mut ids = vec![picked.id.clone()];
+    for e in &snapshot.entries {
+        if e.id != picked.id
+            && e.project_id == picked.project_id
+            && e.started_at <= picked.ended_at
+            && e.ended_at >= picked.started_at
+        {
+            ids.push(e.id.clone());
+        }
+    }
+    if ids.len() < 2 { Vec::new() } else { ids }
+}
+
+/// A pending merge confirmation: the ids to send, and the one-line summary
+/// the banner shows (count, project, and how the total changes).
+#[derive(Debug, Clone)]
+struct MergeConfirm {
+    ids: Vec<String>,
+    summary: String,
+}
+
+/// Build the merge confirmation for the selection, if there is anything to
+/// merge. The delta comes from the shared core preview so the GUI can never
+/// word it differently from the CLI.
+fn merge_offer(snapshot: &Snapshot, selected: usize) -> Option<MergeConfirm> {
+    let ids = merge_targets(snapshot, selected);
+    if ids.len() < 2 {
+        return None;
+    }
+    let by_id: std::collections::HashMap<&str, &timetrack_proto::EntryView> = snapshot
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    let intervals: Vec<(i64, i64)> = ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .map(|e| (e.started_at, e.ended_at))
+        .collect();
+    let delta = timetrack_core::format_merge_delta(timetrack_core::merge_shrink_ms(&intervals));
+    let project = by_id
+        .get(ids[0].as_str())
+        .and_then(|e| {
+            snapshot
+                .projects
+                .iter()
+                .find(|p| p.id == e.project_id)
+                .map(|p| p.name.clone())
+        })
+        .unwrap_or_default();
+    Some(MergeConfirm {
+        summary: format!(
+            "MERGE {} ENTRIES on {project}? {delta} — m to confirm, esc to cancel",
+            ids.len()
+        ),
+        ids,
+    })
+}
+
+/// The project prompt: one name field, for creating (`edit_id` none) or
+/// renaming (`edit_id` set, prefilled with the current name).
+///
+/// Plain keystroke editing like the other prompts, and likewise pure state
+/// so resolving is unit-testable without a window.
+#[derive(Debug, Clone)]
+struct ProjectPrompt {
+    edit_id: Option<String>,
+    /// The typed name. Prefilled when renaming, so saving untouched would
+    /// be a no-op the service round-trips harmlessly.
+    name: String,
+    error: Option<String>,
+}
+
+/// What saving a project prompt means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectSave {
+    Create { name: String },
+    Update { id: String, name: String },
+}
+
+/// Resolve a project prompt. Empty stays open with an error rather than
+/// storing a label no picker could show; duplicates travel to the service,
+/// which owns name uniqueness and reports them typed.
+fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String> {
+    if prompt.name.trim().is_empty() {
+        return Err("enter a project name".to_string());
+    }
+    let name = prompt.name.trim().to_string();
+    match &prompt.edit_id {
+        None => Ok(ProjectSave::Create { name }),
+        Some(id) => Ok(ProjectSave::Update {
+            id: id.clone(),
+            name,
+        }),
+    }
+}
+
 /// The three tabs (REQUIREMENTS §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -586,11 +785,40 @@ impl Tab {
     }
 }
 
+/// The tab after Tab / Shift+Tab from `current`, wrapping around both ends.
+///
+/// Free of the view so the cycle order is unit-testable: the key handler
+/// only forwards the shift state.
+fn cycle_tab(current: Tab, backward: bool) -> Tab {
+    let tabs = Tab::all();
+    let at = tabs.iter().position(|t| *t == current).unwrap_or(0);
+    let next = if backward {
+        (at + tabs.len() - 1) % tabs.len()
+    } else {
+        (at + 1) % tabs.len()
+    };
+    tabs[next]
+}
+
+/// Width of the per-project bar track on Home.
+const PROJECT_BAR_TRACK_PX: f32 = 120.0;
+
+/// Bar fill width for one per-project row: longest fills the track.
+///
+/// Pure arithmetic so the proportion is unit-testable; the renderer only
+/// turns the number into pixels.
+fn bar_width(ms: i64, max_ms: i64) -> f32 {
+    if max_ms <= 0 {
+        return 0.0;
+    }
+    (ms.max(0) as f32 / max_ms as f32) * PROJECT_BAR_TRACK_PX
+}
+
 pub struct TimetrackView {
     rx: Receiver<Msg>,
     actions: Sender<Action>,
     snapshot: Snapshot,
-    status: Option<String>,
+    status: Option<StatusMsg>,
     selected: usize,
     tab: Tab,
     /// Index into the active projects, for quick-add attribution.
@@ -613,6 +841,14 @@ pub struct TimetrackView {
     /// The manual-entry dialog, when open. Modal: while this is `Some` every
     /// keystroke goes to the dialog and the app shortcuts are suspended.
     dialog: Option<EntryDialog>,
+    /// The project prompt, when open. Modal like the dialog: `None` creates,
+    /// `Some` with an id renames.
+    project_prompt: Option<ProjectPrompt>,
+    /// The split prompt, when open. Modal like the dialog.
+    split_prompt: Option<SplitPrompt>,
+    /// A pending merge confirmation. Only `m` (confirm), escape (cancel)
+    /// and `q` (quit) do anything while this is `Some`.
+    merge_confirm: Option<MergeConfirm>,
 }
 
 /// Where a GUI export lands by default.
@@ -640,6 +876,9 @@ impl TimetrackView {
             focus: cx.focus_handle(),
             focused_once: false,
             dialog: None,
+            project_prompt: None,
+            split_prompt: None,
+            merge_confirm: None,
         };
         view.schedule_poll(cx);
         view
@@ -689,12 +928,12 @@ impl TimetrackView {
     /// repainting several times a second forever.
     fn drain(&mut self) -> bool {
         let mut changed = false;
-        // Set the status only when the text differs: the service thread
-        // resends nothing, but snapshots arrive every second and must not
-        // count as change on their own.
-        let set_status = |status: &mut Option<String>, text: String, changed: &mut bool| {
-            if status.as_deref() != Some(text.as_str()) {
-                *status = Some(text);
+        // Set the status only when it differs: the service thread resends
+        // nothing, but snapshots arrive every second and must not count as
+        // change on their own.
+        let set_status = |status: &mut Option<StatusMsg>, note: StatusMsg, changed: &mut bool| {
+            if status.as_ref() != Some(&note) {
+                *status = Some(note);
                 *changed = true;
             }
         };
@@ -733,8 +972,10 @@ impl TimetrackView {
                         }
                     }
                 }
-                Ok(Msg::Error(e)) => set_status(&mut self.status, e, &mut changed),
-                Ok(Msg::Status(note)) => set_status(&mut self.status, note, &mut changed),
+                Ok(Msg::Error(note)) => set_status(&mut self.status, note, &mut changed),
+                Ok(Msg::Status(note)) => {
+                    set_status(&mut self.status, StatusMsg::local(note), &mut changed)
+                }
                 Ok(Msg::ActionOk) => {
                     // A success dismisses the previous error -- but only one
                     // the actions own. The "service is not running" notice
@@ -748,7 +989,7 @@ impl TimetrackView {
                 Err(TryRecvError::Disconnected) => {
                     set_status(
                         &mut self.status,
-                        "the service thread stopped".to_string(),
+                        StatusMsg::local("the service thread stopped"),
                         &mut changed,
                     );
                     break;
@@ -784,6 +1025,25 @@ impl TimetrackView {
         if self.dialog.is_some() {
             return self.on_dialog_key(ev);
         }
+        // The project prompt owns the keyboard the same way.
+        if self.project_prompt.is_some() {
+            return self.on_project_key(ev);
+        }
+        // The split prompt owns the keyboard the same way.
+        if self.split_prompt.is_some() {
+            return self.on_split_key(ev);
+        }
+        // A pending merge only listens for its own answer.
+        if self.merge_confirm.is_some() {
+            return self.on_merge_key(ev);
+        }
+        // Tab cycles the three tabs (§11); shift goes backward. The Tab key
+        // carries no printable char, so this keys on the key name, like the
+        // dialog's field cycling does.
+        if ev.keystroke.key.as_str() == "tab" {
+            self.tab = cycle_tab(self.tab, ev.keystroke.modifiers.shift);
+            return true;
+        }
         let Some(ch) = ev.keystroke.key_char.as_deref() else {
             return true;
         };
@@ -801,10 +1061,15 @@ impl TimetrackView {
             "a" => self.open_new_dialog(),
             "e" => self.open_edit_dialog(),
 
+            // Projects (§11): `n` names a new one, `r` renames the current
+            // one. No numbered placeholders anywhere: every name is typed.
+            "n" => self.open_project_prompt(),
+            "r" => self.open_rename_prompt(),
+
             // Undo removes only the quick-added entry; delete is explicit.
             "u" => match newest_quick_add(&self.snapshot) {
                 Some(id) => self.send(Action::UndoQuickAdd(id)),
-                None => self.status = Some("nothing to undo".into()),
+                None => self.status = Some(StatusMsg::local("nothing to undo")),
             },
             "d" => {
                 if let Some(e) = self.snapshot.entries.get(self.selected) {
@@ -812,6 +1077,10 @@ impl TimetrackView {
                     self.send(Action::DeleteEntry(id));
                 }
             }
+
+            // Split and merge (REQUIREMENTS §8).
+            "s" => self.open_split_prompt(),
+            "m" => self.open_merge_confirm(),
 
             "h" => self.project_cursor = self.project_cursor.saturating_sub(1),
             "l" => {
@@ -881,8 +1150,9 @@ impl TimetrackView {
                 self.dialog = Some(EntryDialog::new(id, name));
             }
             None => {
-                self.status =
-                    Some("create a project on the Projects tab before adding time".into());
+                self.status = Some(StatusMsg::local(
+                    "create a project on the Projects tab before adding time",
+                ));
             }
         }
     }
@@ -908,7 +1178,196 @@ impl TimetrackView {
                     e.ended_at,
                 ));
             }
-            None => self.status = Some("nothing to edit".into()),
+            None => self.status = Some(StatusMsg::local("nothing to edit")),
+        }
+    }
+
+    /// Open the project prompt for a new, typed name.
+    fn open_project_prompt(&mut self) {
+        self.status = None;
+        self.project_prompt = Some(ProjectPrompt {
+            edit_id: None,
+            name: String::new(),
+            error: None,
+        });
+    }
+
+    /// Open the project prompt to rename the current project, prefilled so
+    /// small fixes keep most of the name.
+    fn open_rename_prompt(&mut self) {
+        let current = self
+            .current_project()
+            .map(|p| (p.id.clone(), p.name.clone()));
+        match current {
+            Some((id, name)) => {
+                self.status = None;
+                self.project_prompt = Some(ProjectPrompt {
+                    edit_id: Some(id),
+                    name,
+                    error: None,
+                });
+            }
+            None => self.status = Some(StatusMsg::local("nothing to rename")),
+        }
+    }
+
+    /// Handle a key press while the project prompt is open. Always returns
+    /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_project_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.project_prompt = None;
+            }
+            "enter" => self.project_save(),
+            "backspace" => {
+                if let Some(prompt) = self.project_prompt.as_mut() {
+                    prompt.name.pop();
+                    prompt.error = None;
+                }
+            }
+            _ => {
+                // Printable text, and only that: same gate as the other
+                // prompts, so shortcuts never leak into the name.
+                let m = &ev.keystroke.modifiers;
+                if !m.control && !m.alt && !m.platform {
+                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
+                        if let Some(prompt) = self.project_prompt.as_mut() {
+                            prompt.name.push_str(ch);
+                            prompt.error = None;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Validate the project prompt and send it. Stays open with an error on
+    /// empty input; closes on success. Duplicate names travel to the service,
+    /// which owns uniqueness and reports them typed.
+    fn project_save(&mut self) {
+        let Some(prompt) = self.project_prompt.clone() else {
+            return;
+        };
+        match resolve_project_prompt(&prompt) {
+            Err(msg) => {
+                if let Some(open) = self.project_prompt.as_mut() {
+                    open.error = Some(msg);
+                }
+            }
+            Ok(ProjectSave::Create { name }) => {
+                self.send(Action::AddProject(name));
+                self.project_prompt = None;
+            }
+            Ok(ProjectSave::Update { id, name }) => {
+                self.send(Action::UpdateProject { id, name });
+                self.project_prompt = None;
+            }
+        }
+    }
+
+    /// Open the split prompt for the selected entry, if there is one.
+    fn open_split_prompt(&mut self) {
+        match self.snapshot.entries.get(self.selected).cloned() {
+            Some(e) => {
+                self.status = None;
+                self.split_prompt = Some(SplitPrompt {
+                    entry_id: e.id,
+                    started_at: e.started_at,
+                    ended_at: e.ended_at,
+                    at: String::new(),
+                    error: None,
+                });
+            }
+            None => self.status = Some(StatusMsg::local("nothing to split")),
+        }
+    }
+
+    /// Handle a key press while the split prompt is open. Always returns
+    /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_split_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.split_prompt = None;
+            }
+            "enter" => self.split_save(),
+            "backspace" => {
+                if let Some(prompt) = self.split_prompt.as_mut() {
+                    prompt.at.pop();
+                    prompt.error = None;
+                }
+            }
+            _ => {
+                // Printable text, and only that: same gate as the dialog, so
+                // shortcuts and special keys never leak into the moment.
+                let m = &ev.keystroke.modifiers;
+                if !m.control && !m.alt && !m.platform {
+                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
+                        if let Some(prompt) = self.split_prompt.as_mut() {
+                            prompt.at.push_str(ch);
+                            prompt.error = None;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Validate the split prompt and send it. Stays open with an error on
+    /// invalid input; closes on success.
+    fn split_save(&mut self) {
+        let Some(prompt) = self.split_prompt.clone() else {
+            return;
+        };
+        let tz = snapshot_tz(&self.snapshot);
+        match resolve_split(&prompt, now_ms(), &tz) {
+            Err(msg) => {
+                if let Some(open) = self.split_prompt.as_mut() {
+                    open.error = Some(msg);
+                }
+            }
+            Ok(at_ms) => {
+                self.send(Action::SplitEntry {
+                    id: prompt.entry_id,
+                    at_ms,
+                });
+                self.split_prompt = None;
+            }
+        }
+    }
+
+    /// Offer the merge confirmation for the selection, if the selected entry
+    /// overlaps or touches anything on its project.
+    fn open_merge_confirm(&mut self) {
+        match merge_offer(&self.snapshot, self.selected) {
+            Some(confirm) => {
+                self.status = None;
+                self.merge_confirm = Some(confirm);
+            }
+            None => {
+                self.status = Some(StatusMsg::local("nothing to merge with it"));
+            }
+        }
+    }
+
+    /// Handle a key press while a merge confirmation is pending. Only the
+    /// confirmation's own answers do anything; anything else is swallowed so
+    /// no other action can sneak in mid-confirmation.
+    fn on_merge_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if ev.keystroke.key.as_str() == "escape" {
+            self.merge_confirm = None;
+            return true;
+        }
+        match ev.keystroke.key_char.as_deref() {
+            Some("m") => {
+                if let Some(confirm) = self.merge_confirm.take() {
+                    self.send(Action::MergeEntries { ids: confirm.ids });
+                }
+                true
+            }
+            Some("q") => false,
+            _ => true,
         }
     }
 
@@ -919,7 +1378,8 @@ impl TimetrackView {
             return;
         };
         let (orig_start, orig_end) = (dlg.orig_start, dlg.orig_end);
-        match resolve_save(dlg, now_ms(), self.snapshot.local_offset_ms) {
+        let tz = snapshot_tz(&self.snapshot);
+        match resolve_save(dlg, now_ms(), &tz) {
             SaveOutcome::Invalid(msg) => {
                 if let Some(dlg) = self.dialog.as_mut() {
                     dlg.error = Some(msg);
@@ -976,18 +1436,20 @@ impl TimetrackView {
                 });
             }
             None => {
-                self.status =
-                    Some("create a project on the Projects tab before adding time".into());
+                self.status = Some(StatusMsg::local(
+                    "create a project on the Projects tab before adding time",
+                ));
             }
         }
     }
 
     /// Whether the service has not been seen yet, in which case the window
-    /// offers to start it instead of just complaining.
+    /// offers to start it instead of just complaining. Keys on the status
+    /// kind, never on its wording.
     fn service_missing(&self) -> bool {
         self.status
-            .as_deref()
-            .is_some_and(|s| s.contains("not running"))
+            .as_ref()
+            .is_some_and(|s| s.kind == StatusKind::NoService)
     }
 
     fn try_start_service(&self) {
@@ -995,11 +1457,20 @@ impl TimetrackView {
     }
 
     fn footer(&self) -> String {
-        self.status.clone().unwrap_or_else(|| {
+        self.status
+            .as_ref()
+            .map(|s| s.text.clone())
+            .unwrap_or_else(|| {
             if self.dialog.is_some() {
                 "type to edit · tab next field · enter save · esc cancel".to_string()
+            } else if self.split_prompt.is_some() {
+                "type a moment · enter split · esc cancel".to_string()
+            } else if self.merge_confirm.is_some() {
+                "m to confirm the merge · esc to cancel".to_string()
+            } else if self.project_prompt.is_some() {
+                "type a name · enter save · esc cancel".to_string()
             } else {
-                "1-4 quick add · a add · e edit · u undo · d delete · j/k move · h/l project · q quit"
+                "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · tab tabs · j/k move · h/l project · q quit"
                     .to_string()
             }
         })
@@ -1161,6 +1632,15 @@ impl TimetrackView {
             .when_some(self.dialog.clone(), |el, dlg| {
                 el.child(self.render_entry_dialog(&dlg))
             })
+            .when_some(self.split_prompt.clone(), |el, prompt| {
+                el.child(self.render_split_prompt(&prompt))
+            })
+            .when_some(self.merge_confirm.clone(), |el, confirm| {
+                el.child(self.render_merge_confirm(&confirm))
+            })
+            .when_some(self.project_prompt.clone(), |el, prompt| {
+                el.child(self.render_project_prompt(&prompt))
+            })
             .child(hero)
             .child(warning)
             .child(self.render_quick_add())
@@ -1175,7 +1655,7 @@ impl TimetrackView {
     /// eye already is rather than competing from below. Keyboard-driven like
     /// everything else here — no mouse targets, no toolkit text field.
     fn render_entry_dialog(&self, dlg: &EntryDialog) -> impl IntoElement {
-        let off = self.snapshot.local_offset_ms;
+        let tz = snapshot_tz(&self.snapshot);
         let title = match &dlg.edit_id {
             None => format!("NEW ENTRY → {}", dlg.project_name),
             Some(id) => format!("EDIT ENTRY {id} · {}", dlg.project_name),
@@ -1238,13 +1718,13 @@ impl TimetrackView {
             .child(field_row(
                 "start",
                 &dlg.start,
-                &dlg.start_hint(off),
+                &dlg.start_hint(&tz),
                 dlg.field == DialogField::Start,
             ))
             .child(field_row(
                 "end",
                 &dlg.end,
-                &dlg.end_hint(off),
+                &dlg.end_hint(&tz),
                 dlg.field == DialogField::End,
             ))
             .child(
@@ -1255,6 +1735,138 @@ impl TimetrackView {
                     .child("type to edit · tab next field · enter save · esc cancel"),
             );
         if let Some(err) = &dlg.error {
+            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+        }
+        panel
+    }
+
+    /// The split prompt: one moment field, same panel styling as the entry
+    /// dialog, above the week total where the eye already is.
+    fn render_split_prompt(&self, prompt: &SplitPrompt) -> impl IntoElement {
+        let mut panel = div()
+            .mx_6()
+            .mt_3()
+            .mb_1()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1a1a26))
+            .child(
+                div()
+                    .text_color(rgb(0x7fd3ff))
+                    .child(format!("SPLIT ENTRY {}", prompt.entry_id)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(div().w(px(110.)).text_color(rgb(0xffffff)).child("> at"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgba(0x2a2a3aff))
+                            .text_color(rgb(0xe6e6f0))
+                            .child(format!("{}_", prompt.at)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x6a6a80))
+                            .child("(-90, 90, now, HH:MM)"),
+                    ),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("type a moment · enter split · esc cancel"),
+            );
+        if let Some(err) = &prompt.error {
+            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+        }
+        panel
+    }
+
+    /// The merge confirmation banner: what would merge and how the total
+    /// changes, computed when the confirmation opened. The amount is the
+    /// point (§8): merging overlapping entries shrinks the total, and the
+    /// user states the overlap was a mistake by confirming.
+    fn render_merge_confirm(&self, confirm: &MergeConfirm) -> impl IntoElement {
+        div()
+            .mx_6()
+            .mt_3()
+            .mb_1()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1a1a26))
+            .child(
+                div()
+                    .text_color(rgb(0x7fd3ff))
+                    .child(confirm.summary.clone()),
+            )
+    }
+
+    /// The project prompt: one name field, same panel styling as the other
+    /// prompts, above the week total where the eye already is.
+    fn render_project_prompt(&self, prompt: &ProjectPrompt) -> impl IntoElement {
+        let title = match &prompt.edit_id {
+            None => "NEW PROJECT".to_string(),
+            Some(_) => "RENAME PROJECT".to_string(),
+        };
+        let mut panel = div()
+            .mx_6()
+            .mt_3()
+            .mb_1()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1a1a26))
+            .child(div().text_color(rgb(0x7fd3ff)).child(title))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(div().w(px(110.)).text_color(rgb(0xffffff)).child("> name"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgba(0x2a2a3aff))
+                            .text_color(rgb(0xe6e6f0))
+                            .child(format!("{}_", prompt.name)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x6a6a80))
+                            .child("a short name, e.g. Work"),
+                    ),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("type a name · enter save · esc cancel"),
+            );
+        if let Some(err) = &prompt.error {
             panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
         }
         panel
@@ -1328,6 +1940,7 @@ impl TimetrackView {
         // Longest first, ties by name, so the order never flickers between
         // refreshes.
         rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let max_ms = rows.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
 
         let mut list = div().flex().flex_col();
         if rows.is_empty() {
@@ -1342,11 +1955,34 @@ impl TimetrackView {
             list = list.child(
                 div()
                     .flex()
-                    .justify_between()
+                    .items_center()
+                    .gap_3()
                     .py_1()
-                    .child(div().text_color(rgb(0xc8c8d8)).child(name.to_string()))
                     .child(
                         div()
+                            .flex_1()
+                            .text_color(rgb(0xc8c8d8))
+                            .child(name.to_string()),
+                    )
+                    // A bar proportional to the longest row (§11), so the
+                    // distribution reads without reading every number.
+                    .child(
+                        div()
+                            .w(px(PROJECT_BAR_TRACK_PX))
+                            .h(px(8.))
+                            .rounded_md()
+                            .bg(rgb(0x2a2a3a))
+                            .child(
+                                div()
+                                    .w(px(bar_width(ms, max_ms)))
+                                    .h_full()
+                                    .rounded_md()
+                                    .bg(rgb(0x7fd3ff)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(110.))
                             .text_color(rgb(0x7fd3ff))
                             .child(timetrack_core::format_duration(ms)),
                     ),
@@ -1442,8 +2078,8 @@ impl TimetrackView {
     /// archive action. Archived projects stay listed, because their history
     /// still counts (REQUIREMENTS §14).
     fn render_projects(&self) -> impl IntoElement {
-        // A "New project" row rather than a dead action: creating a project is
-        // the one thing on this tab with no other route into it.
+        // A "New project" row rather than a dead action: it opens the naming
+        // prompt, so every project name is typed -- never invented.
         let new_project = {
             let entity = self.entity.clone();
             div()
@@ -1460,12 +2096,7 @@ impl TimetrackView {
                 .when_some(entity, |this, entity| {
                     this.on_click(move |_ev, _window, cx| {
                         entity.update(cx, |view, cx| {
-                            // A typed name needs a text field, which this tab
-                            // does not have yet. A dated default the user can
-                            // rename is a working button rather than a dead
-                            // one, and it is removed once the field lands.
-                            let name = format!("Project {}", view.snapshot.projects.len() + 1);
-                            view.send(Action::AddProject(name));
+                            view.open_project_prompt();
                             cx.notify();
                         });
                     })
@@ -1488,31 +2119,23 @@ impl TimetrackView {
         }
 
         let rows = self.snapshot.projects.iter().map(|p| {
-            let week = self
-                .snapshot
-                .week
-                .per_project
-                .get(&p.id)
-                .copied()
-                .unwrap_or(0);
-            // The all-time total is summed from the entries rather than taken
-            // from the service, because the service's snapshot carries week
-            // and month only. Same rule either way: a sum of durations.
-            let all = self
-                .snapshot
-                .entries
-                .iter()
-                .filter(|e| e.project_id == p.id)
-                .map(|e| e.duration_ms())
-                .sum::<i64>();
+            // Both columns come from the service's aggregates, never re-summed
+            // here: the snapshot may carry only recent entries while the
+            // aggregates cover the whole store, and re-summing under-reports
+            // a large store's all-time column next to a correct week column.
+            let (week, all) = self.snapshot.project_totals(&p.id);
             let id = p.id.clone();
             let name = p.name.clone();
+            // The project's colour, if it has one, else the neutral row grey:
+            // recolours set from the CLI show up here without another action.
+            let dot = rgb(p.colour.unwrap_or(0x7a7a90));
             div()
                 .flex()
                 .items_center()
                 .gap_3()
                 .px_6()
                 .py_2()
+                .child(div().w(px(12.)).h(px(12.)).rounded_md().bg(dot))
                 .child(
                     div()
                         .flex_1()
@@ -1722,10 +2345,12 @@ impl TimetrackView {
                 .px_6()
                 .py_3()
                 .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0xc8c8d8))
-                        .child(self.status.clone().unwrap_or_default()),
+                    div().text_sm().text_color(rgb(0xc8c8d8)).child(
+                        self.status
+                            .as_ref()
+                            .map(|s| s.text.clone())
+                            .unwrap_or_default(),
+                    ),
                 )
                 .child(
                     div()
@@ -1759,7 +2384,7 @@ impl TimetrackView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use timetrack_proto::{EntrySource, EntryView};
+    use timetrack_proto::{ClientError, EntrySource, EntryView, ServiceError};
 
     #[test]
     fn quick_add_buckets_are_5_15_30_60() {
@@ -1814,6 +2439,27 @@ mod tests {
             started_at: start,
             ended_at: start + 3_600_000,
             source,
+            note: None,
+        }
+    }
+
+    fn project(id: &str, name: &str) -> ProjectView {
+        ProjectView {
+            id: id.into(),
+            name: name.into(),
+            colour: None,
+            archived: false,
+        }
+    }
+
+    fn entry_on(id: &str, project: &str, start: i64, end: i64) -> EntryView {
+        EntryView {
+            id: id.into(),
+            project_id: project.into(),
+            description: id.into(),
+            started_at: start,
+            ended_at: end,
+            source: EntrySource::Manual,
             note: None,
         }
     }
@@ -1882,7 +2528,8 @@ mod tests {
         dlg.description = "review".into();
         // now = 12:00 UTC; -60 → 11:00, now → 12:00.
         let now = 12 * 3_600_000;
-        match resolve_save(&dlg, now, 0) {
+        let utc = timetrack_core::Tz::utc();
+        match resolve_save(&dlg, now, &utc) {
             SaveOutcome::Create {
                 project_id,
                 description,
@@ -1903,7 +2550,8 @@ mod tests {
         let mut dlg = new_dialog();
         dlg.start = "now".into();
         dlg.end = "-60".into();
-        match resolve_save(&dlg, 12 * 3_600_000, 0) {
+        let utc = timetrack_core::Tz::utc();
+        match resolve_save(&dlg, 12 * 3_600_000, &utc) {
             SaveOutcome::Invalid(msg) => assert!(msg.contains("must not end before")),
             other => panic!("expected Invalid, got {other:?}"),
         }
@@ -1924,7 +2572,11 @@ mod tests {
     #[test]
     fn an_untouched_edit_dialog_is_a_no_op() {
         let dlg = EntryDialog::edit("e1".into(), "Work".into(), "kept".into(), 0, 3_600_000);
-        assert_eq!(resolve_save(&dlg, 12 * 3_600_000, 0), SaveOutcome::NoChange);
+        let utc = timetrack_core::Tz::utc();
+        assert_eq!(
+            resolve_save(&dlg, 12 * 3_600_000, &utc),
+            SaveOutcome::NoChange
+        );
     }
 
     #[test]
@@ -1934,7 +2586,8 @@ mod tests {
         let mut dlg = EntryDialog::edit("e1".into(), "Work".into(), "kept".into(), 0, 3_600_000);
         dlg.end = "-60".into();
         let now = 12 * 3_600_000;
-        match resolve_save(&dlg, now, 0) {
+        let utc = timetrack_core::Tz::utc();
+        match resolve_save(&dlg, now, &utc) {
             SaveOutcome::Update {
                 id,
                 started_at,
@@ -1954,7 +2607,8 @@ mod tests {
     fn rewritten_text_sends_a_description_update() {
         let mut dlg = EntryDialog::edit("e1".into(), "Work".into(), "typo".into(), 0, 3_600_000);
         dlg.description = "review".into();
-        match resolve_save(&dlg, 12 * 3_600_000, 0) {
+        let utc = timetrack_core::Tz::utc();
+        match resolve_save(&dlg, 12 * 3_600_000, &utc) {
             SaveOutcome::Update { description, .. } => {
                 assert_eq!(description.as_deref(), Some("review"))
             }
@@ -1972,7 +2626,271 @@ mod tests {
             3_600_000,
             7_200_000,
         );
-        assert_eq!(dlg.start_hint(0), "(empty keeps 01:00)");
-        assert_eq!(dlg.end_hint(0), "(empty keeps 02:00)");
+        let utc = timetrack_core::Tz::utc();
+        assert_eq!(dlg.start_hint(&utc), "(empty keeps 01:00)");
+        assert_eq!(dlg.end_hint(&utc), "(empty keeps 02:00)");
+    }
+
+    #[test]
+    fn the_keep_hints_use_the_named_zone() {
+        // 22:30 UTC is 00:30 the next day in Rome (summer, +2).
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        let dlg = EntryDialog::edit(
+            "e1".into(),
+            "Work".into(),
+            String::new(),
+            1_783_290_600_000,
+            1_783_290_600_000 + 3_600_000,
+        );
+        assert_eq!(dlg.start_hint(&rome), "(empty keeps 00:30)");
+    }
+
+    // --- typed status kinds (no string parsing) ---
+
+    fn status_for(error: &ClientError) -> StatusMsg {
+        StatusMsg::from(error)
+    }
+
+    #[test]
+    fn no_service_offers_to_start_it() {
+        let note = status_for(&ClientError::NoService);
+        assert_eq!(note.kind, StatusKind::NoService);
+        assert!(
+            note.text.contains("not running"),
+            "must keep the start-service wording: {}",
+            note.text
+        );
+    }
+
+    #[test]
+    fn version_mismatch_names_the_fix() {
+        let note = status_for(&ClientError::VersionMismatch {
+            name: "org.freedesktop.DBus.Error.UnknownInterface".into(),
+        });
+        assert_eq!(note.kind, StatusKind::VersionMismatch);
+        assert!(
+            note.text.contains("different versions"),
+            "must keep the reinstall wording: {}",
+            note.text
+        );
+    }
+
+    #[test]
+    fn refusals_show_the_services_own_wording() {
+        // Backward-compatible strings, dispatched by variant.
+        let note = status_for(&ClientError::Service(ServiceError::Rule(
+            timetrack_core::RuleError::NotQuickAdd("e1".into()),
+        )));
+        assert_eq!(note.kind, StatusKind::Service);
+        assert_eq!(
+            note.text,
+            "entry 'e1' was not created by a quick add, so it cannot be undone"
+        );
+    }
+
+    #[test]
+    fn hostile_names_never_steer_dispatch() {
+        // A project literally named after an error state must still land in
+        // the Service bucket: dispatch keys on the variant, never on the
+        // text it happens to contain.
+        for name in [
+            "org.freedesktop.DBus.Error.UnknownInterface",
+            "the service is not running, honestly",
+            "ServiceUnknown",
+        ] {
+            let note = status_for(&ClientError::Service(ServiceError::Rule(
+                timetrack_core::RuleError::DuplicateProject(name.into()),
+            )));
+            assert_eq!(
+                note.kind,
+                StatusKind::Service,
+                "project name {name:?} must not steer dispatch"
+            );
+            assert!(
+                note.text.contains(name),
+                "wording must survive: {}",
+                note.text
+            );
+        }
+    }
+
+    #[test]
+    fn transport_failures_are_local_notes() {
+        let note = status_for(&ClientError::Transport("d-bus wobble".into()));
+        assert_eq!(note.kind, StatusKind::Local);
+        assert_eq!(note.text, "d-bus wobble");
+    }
+
+    // --- split prompt ---
+
+    fn split_prompt(at: &str) -> SplitPrompt {
+        SplitPrompt {
+            entry_id: "e1".into(),
+            started_at: 0,
+            ended_at: 3_600_000,
+            at: at.into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn split_resolves_an_interior_moment() {
+        let utc = timetrack_core::Tz::utc();
+        // now = 00:45 on day 0; -15 lands at 00:30, inside [0h, 1h].
+        let now = 45 * 60_000;
+        assert_eq!(
+            resolve_split(&split_prompt("-15"), now, &utc),
+            Ok(30 * 60_000)
+        );
+    }
+
+    #[test]
+    fn split_refuses_empty_garbage_and_outside_points() {
+        let utc = timetrack_core::Tz::utc();
+        let now = 45 * 60_000;
+        assert!(resolve_split(&split_prompt(""), now, &utc).is_err());
+        assert!(resolve_split(&split_prompt("soon"), now, &utc).is_err());
+        // Endpoints are not interior: the service would refuse these too.
+        assert!(resolve_split(&split_prompt("00:00"), now, &utc).is_err());
+        let err = resolve_split(&split_prompt("02:00"), now, &utc).unwrap_err();
+        assert!(
+            err.contains("outside entry 'e1'"),
+            "must name the entry: {err}"
+        );
+    }
+
+    // --- merge confirmation ---
+
+    fn merge_snapshot() -> Snapshot {
+        // e1 [0h,1h] and e2 [0.5h,1.5h] overlap on p1; e3 is disjoint on p1;
+        // e4 overlaps e1 but lives on p2 and must never join.
+        Snapshot {
+            entries: vec![
+                entry_on("e1", "p1", 0, 3_600_000),
+                entry_on("e2", "p1", 1_800_000, 5_400_000),
+                entry_on("e3", "p1", 10 * 3_600_000, 11 * 3_600_000),
+                entry_on("e4", "p2", 0, 3_600_000),
+            ],
+            projects: vec![project("p1", "Work"), project("p2", "Home")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_targets_are_the_overlapping_same_project_entries() {
+        let snap = merge_snapshot();
+        assert_eq!(
+            merge_targets(&snap, 0),
+            vec!["e1".to_string(), "e2".to_string()]
+        );
+        // The disjoint entry has nothing to merge with.
+        assert!(merge_targets(&snap, 2).is_empty());
+        // Nothing selected, nothing offered.
+        assert!(merge_targets(&snap, 99).is_empty());
+        assert!(merge_targets(&Snapshot::default(), 0).is_empty());
+    }
+
+    #[test]
+    fn merge_targets_include_touching_entries() {
+        let snap = Snapshot {
+            entries: vec![entry_on("a", "p1", 0, 100), entry_on("b", "p1", 100, 200)],
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_targets(&snap, 0),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_offer_states_count_project_and_shrink() {
+        let snap = merge_snapshot();
+        let offer = merge_offer(&snap, 0).expect("e1 and e2 overlap");
+        assert_eq!(offer.ids, vec!["e1".to_string(), "e2".to_string()]);
+        assert!(
+            offer.summary.contains("MERGE 2 ENTRIES"),
+            "must state the count: {}",
+            offer.summary
+        );
+        assert!(
+            offer.summary.contains("Work"),
+            "must name the project: {}",
+            offer.summary
+        );
+        assert!(
+            offer.summary.contains("total shrinks by 00:30:00"),
+            "must state the shrink (§8): {}",
+            offer.summary
+        );
+    }
+
+    #[test]
+    fn merge_offer_is_none_without_targets() {
+        let snap = merge_snapshot();
+        assert!(merge_offer(&snap, 2).is_none());
+    }
+
+    // --- project prompt ---
+
+    fn project_prompt(edit_id: Option<&str>, name: &str) -> ProjectPrompt {
+        ProjectPrompt {
+            edit_id: edit_id.map(str::to_string),
+            name: name.into(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn project_prompt_creates_or_renames() {
+        assert_eq!(
+            resolve_project_prompt(&project_prompt(None, "Work")),
+            Ok(ProjectSave::Create {
+                name: "Work".into()
+            })
+        );
+        assert_eq!(
+            resolve_project_prompt(&project_prompt(Some("p1"), "Deep Work")),
+            Ok(ProjectSave::Update {
+                id: "p1".into(),
+                name: "Deep Work".into()
+            })
+        );
+    }
+
+    #[test]
+    fn project_prompt_trims_and_refuses_empty() {
+        assert_eq!(
+            resolve_project_prompt(&project_prompt(None, "  Work  ")),
+            Ok(ProjectSave::Create {
+                name: "Work".into()
+            })
+        );
+        assert!(resolve_project_prompt(&project_prompt(None, "")).is_err());
+        assert!(resolve_project_prompt(&project_prompt(Some("p1"), "   ")).is_err());
+    }
+
+    // --- tabs and bars (§11) ---
+
+    #[test]
+    fn tab_cycles_forward_through_all_three() {
+        assert_eq!(cycle_tab(Tab::Home, false), Tab::Projects);
+        assert_eq!(cycle_tab(Tab::Projects, false), Tab::Export);
+        assert_eq!(cycle_tab(Tab::Export, false), Tab::Home);
+    }
+
+    #[test]
+    fn tab_cycles_backward_through_all_three() {
+        assert_eq!(cycle_tab(Tab::Home, true), Tab::Export);
+        assert_eq!(cycle_tab(Tab::Export, true), Tab::Projects);
+        assert_eq!(cycle_tab(Tab::Projects, true), Tab::Home);
+    }
+
+    #[test]
+    fn bars_fill_the_track_proportionally() {
+        assert_eq!(bar_width(3_600_000, 3_600_000), PROJECT_BAR_TRACK_PX);
+        assert_eq!(bar_width(1_800_000, 3_600_000), PROJECT_BAR_TRACK_PX / 2.0);
+        assert_eq!(bar_width(0, 3_600_000), 0.0);
+        // No entries (or no time) anywhere: zero width, never NaN.
+        assert_eq!(bar_width(0, 0), 0.0);
     }
 }

@@ -58,9 +58,9 @@ impl Entry {
         (self.ended_at - self.started_at).max(0)
     }
 
-    /// This entry's local-time day, given the zone's offset at that instant.
-    pub fn local_day(&self, local_offset_ms: i64) -> i64 {
-        local_day_of(self.started_at, local_offset_ms)
+    /// This entry's local-time day, using the offset in force at its start.
+    pub fn local_day(&self, tz: &crate::tz::Tz) -> i64 {
+        tz.day_of(self.started_at)
     }
 }
 
@@ -144,12 +144,14 @@ impl Store {
     }
 }
 
-/// Local-time helpers.
+/// Local-time helpers (fixed-offset primitives).
 ///
 /// Day and week bucketing is the single most error-prone part of this app
-/// (see PLAN.md), so it lives in one place and takes the UTC offset as an
-/// explicit parameter rather than reading a clock or a timezone database. The
-/// service resolves the offset; the core stays pure and testable.
+/// (see PLAN.md). The public entry point is [`crate::tz::Tz`], which resolves
+/// the offset per instant (notably across DST) and delegates here only for
+/// fixed-offset zones. These free functions stay as the pure arithmetic core
+/// for a single known offset, and for the pre-existing unit tests that pin
+/// the sign conventions down.
 pub const MS_PER_DAY: i64 = 86_400_000;
 
 /// The local-time day index of a UTC instant, given the zone's offset there.

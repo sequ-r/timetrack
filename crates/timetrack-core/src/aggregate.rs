@@ -13,7 +13,8 @@
 //! Totals are **sums of durations**, never wall-clock unions (§4), so
 //! overlapping entries are counted separately.
 
-use crate::model::{Store, local_day_of};
+use crate::model::Store;
+use crate::tz::Tz;
 use std::collections::BTreeMap;
 
 /// A calendar week, as ISO-8601 defines it: Monday 00:00 to Sunday 23:59.
@@ -140,13 +141,13 @@ fn days_in_month(year: i64, month: u32) -> i64 {
 }
 
 /// Totals for the ISO week containing local day `day`.
-pub fn week_totals(store: &Store, day: i64, local_offset_ms: i64) -> Totals {
+pub fn week_totals(store: &Store, day: i64, tz: &Tz) -> Totals {
     let week = iso_week_of(day);
-    totals_in_day_range(store, week.start_day, week.start_day + 7, local_offset_ms)
+    totals_in_day_range(store, week.start_day, week.start_day + 7, tz)
 }
 
 /// Totals for the calendar month containing local day `day`.
-pub fn month_totals(store: &Store, day: i64, local_offset_ms: i64) -> Totals {
+pub fn month_totals(store: &Store, day: i64, tz: &Tz) -> Totals {
     let (year, month) = month_of(day);
     let first = day_of_month(year, month, 1);
     let next = if month == 12 {
@@ -154,19 +155,38 @@ pub fn month_totals(store: &Store, day: i64, local_offset_ms: i64) -> Totals {
     } else {
         day_of_month(year, month + 1, 1)
     };
-    totals_in_day_range(store, first, next, local_offset_ms)
+    totals_in_day_range(store, first, next, tz)
 }
 
 /// Totals for the entries falling in local days `[from, to)`.
-pub fn totals_in_day_range(store: &Store, from: i64, to: i64, local_offset_ms: i64) -> Totals {
+///
+/// Each entry buckets by the offset in force at its own start, so a week
+/// spanning a DST transition still splits exactly on local midnights.
+pub fn totals_in_day_range(store: &Store, from: i64, to: i64, tz: &Tz) -> Totals {
     let mut t = Totals::default();
     for e in &store.entries {
-        let d = local_day_of(e.started_at, local_offset_ms);
+        let d = tz.day_of(e.started_at);
         if d >= from && d < to {
             t.total_ms += e.duration_ms();
             t.entry_count += 1;
             *t.per_project.entry(e.project_id.clone()).or_insert(0) += e.duration_ms();
         }
+    }
+    t
+}
+
+/// Totals across all time, overall and per project.
+///
+/// The Projects tab's all-time column comes from the service rather than
+/// being re-summed by each client, so both UIs agree even when the snapshot
+/// carries only recent entries. Like every other total this is a sum of
+/// durations (§4): overlapping entries count twice.
+pub fn all_totals(store: &Store) -> Totals {
+    let mut t = Totals::default();
+    for e in &store.entries {
+        t.total_ms += e.duration_ms();
+        t.entry_count += 1;
+        *t.per_project.entry(e.project_id.clone()).or_insert(0) += e.duration_ms();
     }
     t
 }
@@ -184,8 +204,17 @@ fn day_of_month(year: i64, month: u32, day: i64) -> i64 {
 mod tests {
     use super::*;
     use crate::model::{Entry, EntrySource, MS_PER_DAY, Project};
+    use crate::tz::Tz;
 
     const D: i64 = MS_PER_DAY;
+
+    fn utc() -> Tz {
+        Tz::utc()
+    }
+
+    fn fixed(offset_ms: i64) -> Tz {
+        Tz::fixed_ms(offset_ms)
+    }
 
     fn store_with(entries: &[(&str, i64, i64)]) -> Store {
         let mut s = Store::default();
@@ -355,7 +384,7 @@ mod tests {
     #[test]
     fn week_totals_sum_durations() {
         let s = store_with(&[("p1", 0, 3_600_000), ("p1", 7_200_000, 9_000_000)]);
-        let t = week_totals(&s, 0, 0);
+        let t = week_totals(&s, 0, &utc());
         assert_eq!(t.total_ms, 3_600_000 + 1_800_000);
         assert_eq!(t.entry_count, 2);
     }
@@ -366,14 +395,14 @@ mod tests {
             ("p1", 0, 8 * 3_600_000),
             ("p1", 4 * 3_600_000, 12 * 3_600_000),
         ]);
-        let t = week_totals(&s, 0, 0);
+        let t = week_totals(&s, 0, &utc());
         assert_eq!(t.total_ms, 8 * 3_600_000 + 8 * 3_600_000);
     }
 
     #[test]
     fn per_project_totals_are_separate() {
         let s = store_with(&[("p1", 0, 3_600_000), ("p2", 3_600_000, 5_400_000)]);
-        let t = week_totals(&s, 0, 0);
+        let t = week_totals(&s, 0, &utc());
         assert_eq!(t.total_ms, 3_600_000 + 1_800_000);
         assert_eq!(t.per_project.get("p1"), Some(&3_600_000));
         assert_eq!(t.per_project.get("p2"), Some(&1_800_000));
@@ -386,7 +415,7 @@ mod tests {
             ("big", 60_000, 7_260_000),
             ("mid", 0, 600_000),
         ]);
-        let t = week_totals(&s, 0, 0);
+        let t = week_totals(&s, 0, &utc());
         let order: Vec<&str> = t.ranked().iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(order, ["big", "mid", "small"]);
     }
@@ -395,7 +424,7 @@ mod tests {
     fn entries_outside_the_week_are_excluded() {
         // An entry a fortnight later must not appear in this week's total.
         let s = store_with(&[("p1", 0, 3_600_000), ("p1", 14 * D, 15 * D)]);
-        let t = week_totals(&s, 0, 0);
+        let t = week_totals(&s, 0, &utc());
         assert_eq!(t.entry_count, 1);
         assert_eq!(t.total_ms, 3_600_000);
     }
@@ -406,7 +435,7 @@ mod tests {
         // ISO week can straddle two months, and the month view must not
         // double-count.
         let s = store_with(&[("p1", 0, 3_600_000)]);
-        let t = month_totals(&s, 0, 0); // Jan 1970
+        let t = month_totals(&s, 0, &utc()); // Jan 1970
         assert_eq!(t.total_ms, 3_600_000);
     }
 
@@ -419,27 +448,105 @@ mod tests {
         let late = 3 * D + 23 * 3_600_000 + 1_800_000; // Sunday 23:30 local
         let s = store_with(&[("p1", late, late + 60_000)]);
         assert_eq!(
-            week_totals(&s, 3, 0).entry_count,
+            week_totals(&s, 3, &utc()).entry_count,
             1,
             "in UTC the entry is on the Sunday of week 1"
         );
         // At UTC+1 the entry sits on local day 4, the Monday that opens week 2.
+        let plus1 = fixed(3_600_000);
         assert_eq!(
-            week_totals(&s, 4, 3_600_000).entry_count,
+            week_totals(&s, 4, &plus1).entry_count,
             1,
             "so it now belongs to week 2"
         );
         assert_eq!(
-            week_totals(&s, 3, 3_600_000).entry_count,
+            week_totals(&s, 3, &plus1).entry_count,
             0,
             "and no longer to week 1, whose last day is day 3"
         );
     }
 
     #[test]
+    fn named_zone_buckets_by_its_own_offset_per_instant() {
+        // 2026-07-05 22:30 UTC is Sunday in UTC but Monday 00:30 in Rome
+        // (CEST, +2): the two bucket into different ISO weeks. A fixed-offset
+        // fallback of UTC gets this wrong; the tz database gets it right.
+        let rome = Tz::parse("Europe/Rome").expect("Europe/Rome must parse");
+        let utc_ms = 1_783_290_600_000; // 2026-07-05 22:30 UTC
+        assert_eq!(rome.offset_at_ms(utc_ms), 7_200_000);
+        let rome_day = rome.day_of(utc_ms);
+        let utc_day = utc().day_of(utc_ms);
+        assert_eq!(rome_day, utc_day + 1, "00:30 next day in Rome");
+        assert_ne!(
+            iso_week_of(utc_day),
+            iso_week_of(rome_day),
+            "Sunday week 27 vs Monday week 28"
+        );
+        let s = store_with(&[("p1", utc_ms, utc_ms + 60_000)]);
+        assert_eq!(week_totals(&s, utc_day, &utc()).entry_count, 1);
+        assert_eq!(
+            week_totals(&s, utc_day, &rome).entry_count,
+            0,
+            "in Rome the entry is not on the Sunday"
+        );
+        assert_eq!(week_totals(&s, rome_day, &rome).entry_count, 1);
+    }
+
+    #[test]
+    fn named_zone_tracks_dst_across_seasons() {
+        // The same zone is +1 in winter and +2 in summer, and one `Tz` must
+        // bucket both correctly — a single fixed offset cannot.
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        let winter = 1_768_478_400_000; // 2026-01-15 12:00 UTC
+        let summer = 1_784_116_800_000; // 2026-07-15 12:00 UTC
+        assert_eq!(rome.offset_at_ms(winter), 3_600_000);
+        assert_eq!(rome.offset_at_ms(summer), 7_200_000);
+        // Late-evening UTC instants land on the next local day in both
+        // seasons, but by different offsets.
+        let winter_late = 1_767_569_400_000; // 2026-01-04 23:30 UTC
+        let summer_late = 1_783_290_600_000; // 2026-07-05 22:30 UTC
+        assert_eq!(rome.day_of(winter_late), utc().day_of(winter_late) + 1);
+        assert_eq!(rome.day_of(summer_late), utc().day_of(summer_late) + 1);
+    }
+
+    #[test]
+    fn named_zone_handles_the_transition_days() {
+        // Spring forward 2026-03-29 01:00 UTC (CET -> CEST) and fall back
+        // 2026-10-25 01:00 UTC (CEST -> CET): the offset changes mid-day, and
+        // per-instant lookup follows it.
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        assert_eq!(rome.offset_at_ms(1_774_744_200_000), 3_600_000); // Mar 29 00:30 UTC
+        assert_eq!(rome.offset_at_ms(1_774_747_800_000), 7_200_000); // Mar 29 01:30 UTC
+        assert_eq!(rome.offset_at_ms(1_792_888_200_000), 7_200_000); // Oct 25 00:30 UTC
+        assert_eq!(rome.offset_at_ms(1_792_895_400_000), 3_600_000); // Oct 25 02:30 UTC
+        // Both sides of each transition still bucket as the same local day:
+        // a 23h/25h day is one day, not two.
+        let spring_day = rome.day_of(1_774_744_200_000);
+        assert_eq!(rome.day_of(1_774_747_800_000), spring_day);
+        let autumn_day = rome.day_of(1_792_888_200_000);
+        assert_eq!(rome.day_of(1_792_895_400_000), autumn_day);
+    }
+
+    #[test]
     fn empty_store_totals_are_zero() {
         let s = Store::default();
-        assert_eq!(week_totals(&s, 0, 0).total_ms, 0);
-        assert!(week_totals(&s, 0, 0).per_project.is_empty());
+        assert_eq!(week_totals(&s, 0, &utc()).total_ms, 0);
+        assert!(week_totals(&s, 0, &utc()).per_project.is_empty());
+    }
+
+    #[test]
+    fn all_time_totals_span_every_entry() {
+        // Entries weeks apart still land in one total, split per project.
+        // Overlapping entries count twice here too (§4).
+        let s = store_with(&[
+            ("p1", 0, 3_600_000),
+            ("p2", 3_600_000, 5_400_000),
+            ("p1", 30 * D, 30 * D + 3_600_000),
+        ]);
+        let t = all_totals(&s);
+        assert_eq!(t.total_ms, 3_600_000 + 1_800_000 + 3_600_000);
+        assert_eq!(t.entry_count, 3);
+        assert_eq!(t.per_project.get("p1"), Some(&7_200_000));
+        assert_eq!(t.per_project.get("p2"), Some(&1_800_000));
     }
 }

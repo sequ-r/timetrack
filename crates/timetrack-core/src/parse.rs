@@ -18,6 +18,7 @@
 //! offset; callers pass it in (the CLI and GUI read it from the snapshot).
 
 use crate::model::MS_PER_DAY;
+use crate::tz::Tz;
 
 /// Why a typed moment or duration was refused.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -59,13 +60,15 @@ pub type ParseResult<T> = Result<T, ParseError>;
 /// - `09:30` — today at that wall-clock time, in local time;
 /// - `now` — this instant.
 ///
-/// `now_ms` is the caller's clock reading and `local_offset_ms` the service's
-/// UTC offset: `HH:MM` anchors on local midnight, not UTC midnight, or
-/// entries land hours out for anyone east or west of Greenwich.
+/// `now_ms` is the caller's clock reading and `tz` the service's zone:
+/// `HH:MM` anchors on local midnight, not UTC midnight, or entries land hours
+/// out for anyone east or west of Greenwich. Midnight itself comes from the
+/// zone (`Tz::day_start`), so days either side of a DST transition still
+/// anchor on their own midnight.
 ///
 /// A leading `-` is why the CLI passes these through clap with
 /// `allow_hyphen_values`: `-90` is a perfectly ordinary thing to type.
-pub fn parse_moment(text: &str, what: &str, now_ms: i64, local_offset_ms: i64) -> ParseResult<i64> {
+pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult<i64> {
     let text = text.trim();
     if text.is_empty() {
         return Err(ParseError::EmptyMoment(what.to_string()));
@@ -105,8 +108,7 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, local_offset_ms: i64) -
         });
     }
 
-    let local_midnight =
-        (now_ms + local_offset_ms).div_euclid(MS_PER_DAY) * MS_PER_DAY - local_offset_ms;
+    let local_midnight = tz.day_start(tz.day_of(now_ms));
     Ok(local_midnight + (h * 3_600_000 + m * 60_000))
 }
 
@@ -165,14 +167,18 @@ pub fn parse_duration(text: &str) -> ParseResult<i64> {
 /// dialog can show "keep 09:30" and mean it — provided the entry is from
 /// today. Callers must only use this for entries whose local day is today;
 /// otherwise `HH:MM` would silently move the endpoint to today.
-pub fn format_local_hm(utc_ms: i64, local_offset_ms: i64) -> String {
-    let rem = (utc_ms + local_offset_ms).rem_euclid(MS_PER_DAY);
+pub fn format_local_hm(utc_ms: i64, tz: &Tz) -> String {
+    let rem = (utc_ms + tz.offset_at_ms(utc_ms)).rem_euclid(MS_PER_DAY);
     format!("{:02}:{:02}", rem / 3_600_000, (rem % 3_600_000) / 60_000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utc() -> Tz {
+        Tz::utc()
+    }
 
     #[test]
     fn durations_parse_with_units() {
@@ -208,21 +214,24 @@ mod tests {
 
     #[test]
     fn now_means_now() {
-        assert_eq!(parse_moment("now", "end", 1_000, 0).unwrap(), 1_000);
-        assert_eq!(parse_moment("NOW", "end", 1_000, 0).unwrap(), 1_000);
-        assert_eq!(parse_moment("  now  ", "end", 1_000, 0).unwrap(), 1_000);
+        assert_eq!(parse_moment("now", "end", 1_000, &utc()).unwrap(), 1_000);
+        assert_eq!(parse_moment("NOW", "end", 1_000, &utc()).unwrap(), 1_000);
+        assert_eq!(
+            parse_moment("  now  ", "end", 1_000, &utc()).unwrap(),
+            1_000
+        );
     }
 
     #[test]
     fn minutes_ago_parses_relative_to_now() {
-        let t = parse_moment("-90", "start", 10_000_000, 0).unwrap();
+        let t = parse_moment("-90", "start", 10_000_000, &utc()).unwrap();
         assert_eq!(t, 10_000_000 - 5_400_000);
     }
 
     #[test]
     fn minutes_from_now_parses_forward() {
         assert_eq!(
-            parse_moment("30", "start", 10_000_000, 0).unwrap(),
+            parse_moment("30", "start", 10_000_000, &utc()).unwrap(),
             11_800_000
         );
     }
@@ -231,36 +240,44 @@ mod tests {
     fn a_wall_clock_time_lands_today() {
         // now = 12:00 UTC on day 1; 09:30 must fall inside that UTC day.
         let noon_day1 = MS_PER_DAY + 12 * 3_600_000;
-        let t = parse_moment("09:30", "start", noon_day1, 0).unwrap();
+        let t = parse_moment("09:30", "start", noon_day1, &utc()).unwrap();
         assert_eq!(t, MS_PER_DAY + 9 * 3_600_000 + 30 * 60_000);
     }
 
     #[test]
     fn a_wall_clock_time_is_local_not_utc() {
         // UTC+2: anchoring on UTC midnight would put 00:30 two hours out.
-        let off = 2 * 3_600_000;
+        let tz = Tz::fixed_ms(2 * 3_600_000);
         let now = MS_PER_DAY + 12 * 3_600_000; // 12:00 UTC, 14:00 local
-        let t = parse_moment("00:30", "start", now, off).unwrap();
-        assert_eq!((t + off).rem_euclid(MS_PER_DAY), 30 * 60_000);
-        assert_eq!(
-            (t + off).div_euclid(MS_PER_DAY),
-            (now + off).div_euclid(MS_PER_DAY)
-        );
+        let t = parse_moment("00:30", "start", now, &tz).unwrap();
+        assert_eq!(tz.day_of(t), tz.day_of(now));
+        assert_eq!(format_local_hm(t, &tz), "00:30");
+    }
+
+    #[test]
+    fn a_wall_clock_time_uses_the_named_zone() {
+        // Rome in summer is +2: 00:30 local is 22:30 UTC the day before.
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        // 2026-07-06 12:00 Rome = 10:00 UTC.
+        let now = 1_783_332_000_000;
+        let t = parse_moment("00:30", "start", now, &rome).unwrap();
+        assert_eq!(rome.day_of(t), rome.day_of(now));
+        assert_eq!(format_local_hm(t, &rome), "00:30");
     }
 
     #[test]
     fn impossible_times_are_refused() {
-        assert!(parse_moment("25:00", "start", 0, 0).is_err());
-        assert!(parse_moment("09:70", "start", 0, 0).is_err());
-        assert!(parse_moment("nonsense", "start", 0, 0).is_err());
-        assert!(parse_moment("", "start", 0, 0).is_err());
-        assert!(parse_moment("-soon", "start", 0, 0).is_err());
+        assert!(parse_moment("25:00", "start", 0, &utc()).is_err());
+        assert!(parse_moment("09:70", "start", 0, &utc()).is_err());
+        assert!(parse_moment("nonsense", "start", 0, &utc()).is_err());
+        assert!(parse_moment("", "start", 0, &utc()).is_err());
+        assert!(parse_moment("-soon", "start", 0, &utc()).is_err());
     }
 
     #[test]
     fn the_error_names_the_field() {
         assert!(
-            parse_moment("99:99", "end", 0, 0)
+            parse_moment("99:99", "end", 0, &utc())
                 .unwrap_err()
                 .to_string()
                 .contains("end")
@@ -269,13 +286,13 @@ mod tests {
 
     #[test]
     fn hm_formats_midnight_and_round_trips() {
-        assert_eq!(format_local_hm(0, 0), "00:00");
-        assert_eq!(format_local_hm(0, 3_600_000), "01:00");
+        assert_eq!(format_local_hm(0, &utc()), "00:00");
+        assert_eq!(format_local_hm(0, &Tz::fixed_ms(3_600_000)), "01:00");
         // 09:30 UTC parses back to itself on the same day.
         let t = 9 * 3_600_000 + 30 * 60_000;
-        assert_eq!(format_local_hm(t, 0), "09:30");
+        assert_eq!(format_local_hm(t, &utc()), "09:30");
         assert_eq!(
-            parse_moment(&format_local_hm(t, 0), "start", t, 0).unwrap(),
+            parse_moment(&format_local_hm(t, &utc()), "start", t, &utc()).unwrap(),
             t
         );
     }

@@ -12,9 +12,14 @@
 //! module deterministic and testable without I/O (PLAN.md).
 
 use crate::model::{Entry, EntrySource, MS_PER_DAY, Project, Store};
+use serde::{Deserialize, Serialize};
 
 /// Why an operation was refused.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+///
+/// Serializable because the typed service error embeds it verbatim on the
+/// wire (`timetrack-proto::ServiceError`); the human-readable strings below
+/// are the contract CLI output and scripts match on, so they never change.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuleError {
     #[error("no entry with id '{0}'")]
     UnknownEntry(String),
@@ -22,6 +27,10 @@ pub enum RuleError {
     UnknownProject(String),
     #[error("a project named '{0}' already exists")]
     DuplicateProject(String),
+    /// A project name trimmed to nothing. Renaming states it plainly rather
+    /// than storing an empty label no picker could show.
+    #[error("project name cannot be blank")]
+    BlankProjectName,
     #[error("an entry must not end before it starts")]
     NegativeDuration,
     #[error("cannot delete the last project")]
@@ -156,6 +165,9 @@ pub fn update_project(
     // uniqueness scan cannot also borrow `store.projects`.
     let trimmed = name.map(str::trim);
     if let Some(new_name) = trimmed {
+        if new_name.is_empty() {
+            return Err(RuleError::BlankProjectName);
+        }
         if store
             .projects
             .iter()
@@ -487,14 +499,53 @@ pub fn merge_entries(store: &mut Store, ids: &[String]) -> RuleResult<Entry> {
     Ok(merged)
 }
 
+/// How much summed time a merge of `intervals` would drop, in milliseconds
+/// (REQUIREMENTS §8).
+///
+/// Positive when overlapping entries collapse (the overlap was a mistake, so
+/// the total shrinks), zero when touching entries join losslessly, negative
+/// when disjoint entries span a gap (the merged entry covers time none of
+/// its parts occupied, so the total grows). Both UIs state this number in
+/// the merge confirmation, computed here so they cannot disagree.
+pub fn merge_shrink_ms(intervals: &[(i64, i64)]) -> i64 {
+    if intervals.is_empty() {
+        return 0;
+    }
+    let sum: i64 = intervals
+        .iter()
+        .map(|&(start, end)| (end - start).max(0))
+        .sum();
+    let start = intervals.iter().map(|&(start, _)| start).min().unwrap_or(0);
+    let end = intervals.iter().map(|&(_, end)| end).max().unwrap_or(0);
+    sum - (end - start).max(0)
+}
+
+/// State what a merge does to the summed total, for confirmations.
+///
+/// The overlap case is the point of §8 (merging states the overlap was a
+/// mistake); the other two keep the confirmation honest when entries merely
+/// touch or span a gap.
+pub fn format_merge_delta(shrink_ms: i64) -> String {
+    if shrink_ms > 0 {
+        format!("total shrinks by {}", crate::format_duration(shrink_ms))
+    } else if shrink_ms < 0 {
+        format!("total grows by {}", crate::format_duration(-shrink_ms))
+    } else {
+        "total unchanged".to_string()
+    }
+}
+
 /// Whether any day's summed time exceeds 24 hours (REQUIREMENTS §4).
 ///
 /// Flagged, never rejected: overlapping entries are legal, and the point is
 /// to surface a probable duplicate rather than to forbid the data.
-pub fn days_exceeding_24h(store: &Store, local_offset_ms: i64) -> Vec<i64> {
+///
+/// Each entry buckets by the offset in force at its own start, so days either
+/// side of a DST transition are still whole local days.
+pub fn days_exceeding_24h(store: &Store, tz: &crate::tz::Tz) -> Vec<i64> {
     let mut per_day = std::collections::BTreeMap::new();
     for e in &store.entries {
-        *per_day.entry(e.local_day(local_offset_ms)).or_insert(0i64) += e.duration_ms();
+        *per_day.entry(e.local_day(tz)).or_insert(0i64) += e.duration_ms();
     }
     per_day
         .into_iter()
@@ -504,11 +555,8 @@ pub fn days_exceeding_24h(store: &Store, local_offset_ms: i64) -> Vec<i64> {
 }
 
 /// Convenience: does any entry land on `day`, in local time?
-pub fn has_entry_on(store: &Store, day: i64, local_offset_ms: i64) -> bool {
-    store
-        .entries
-        .iter()
-        .any(|e| e.local_day(local_offset_ms) == day)
+pub fn has_entry_on(store: &Store, day: i64, tz: &crate::tz::Tz) -> bool {
+    store.entries.iter().any(|e| e.local_day(tz) == day)
 }
 
 #[cfg(test)]
@@ -614,6 +662,45 @@ mod tests {
             delete_project(&mut s, "p1").unwrap_err(),
             RuleError::LastProject
         );
+    }
+
+    #[test]
+    fn rename_changes_only_the_name() {
+        let mut s = store_with_project();
+        let p = update_project(&mut s, "p1", Some("Deep Work"), None).unwrap();
+        assert_eq!(p.name, "Deep Work");
+        assert_eq!(s.project("p1").unwrap().name, "Deep Work");
+    }
+
+    #[test]
+    fn recolour_sets_and_clears() {
+        let mut s = store_with_project();
+        let p = update_project(&mut s, "p1", None, Some(Some(0x2ea043))).unwrap();
+        assert_eq!(p.colour, Some(0x2ea043));
+        let p = update_project(&mut s, "p1", None, Some(None)).unwrap();
+        assert_eq!(p.colour, None);
+    }
+
+    #[test]
+    fn rename_rejects_unknown_blank_and_duplicate_names() {
+        let mut s = store_with_project();
+        let mut c = Counter::continuing(&s);
+        create_project(&mut s, &mut c, "Personal").unwrap();
+        assert_eq!(
+            update_project(&mut s, "nope", Some("X"), None).unwrap_err(),
+            RuleError::UnknownProject("nope".into())
+        );
+        assert_eq!(
+            update_project(&mut s, "p1", Some("   "), None).unwrap_err(),
+            RuleError::BlankProjectName
+        );
+        assert_eq!(
+            update_project(&mut s, "p1", Some("Personal"), None).unwrap_err(),
+            RuleError::DuplicateProject("Personal".into())
+        );
+        // Keeping the same name is not a duplicate of anything.
+        assert!(update_project(&mut s, "p1", Some("Work"), None).is_ok());
+        assert_eq!(s.project("p1").unwrap().name, "Work");
     }
 
     // --- creating entries ---
@@ -848,6 +935,41 @@ mod tests {
     }
 
     #[test]
+    fn merge_preview_matches_the_merge_it_describes() {
+        // The confirmation number must equal what the merge will actually
+        // drop: check the preview against real merges, not just arithmetic.
+        let mut s = store_with_project();
+        let mut c = ids();
+        let a = create_entry(&mut s, &mut c, "p1", "", 0, D).unwrap();
+        let b = create_entry(&mut s, &mut c, "p1", "", D / 2, D + D / 2).unwrap();
+        let before = s.total_ms();
+        let preview = merge_shrink_ms(&[(0, D), (D / 2, D + D / 2)]);
+        merge_entries(&mut s, &[a.id, b.id]).unwrap();
+        assert_eq!(preview, before - s.total_ms());
+    }
+
+    #[test]
+    fn merge_shrink_is_positive_for_overlap_zero_for_touching() {
+        assert_eq!(merge_shrink_ms(&[(0, 100), (50, 150)]), 50);
+        assert_eq!(merge_shrink_ms(&[(0, 100), (100, 200)]), 0);
+        assert_eq!(merge_shrink_ms(&[]), 0);
+    }
+
+    #[test]
+    fn merge_shrink_is_negative_across_a_gap() {
+        // Disjoint entries span the gap between them, so the merged entry
+        // is longer than the sum of its parts.
+        assert_eq!(merge_shrink_ms(&[(0, 100), (200, 300)]), -100);
+    }
+
+    #[test]
+    fn merge_delta_says_shrink_grow_or_unchanged() {
+        assert_eq!(format_merge_delta(3_600_000), "total shrinks by 01:00:00");
+        assert_eq!(format_merge_delta(0), "total unchanged");
+        assert_eq!(format_merge_delta(-900_000), "total grows by 00:15:00");
+    }
+
+    #[test]
     fn merge_with_itself_is_refused_not_a_panic() {
         // Merging [e1, e1] used to remove the survivor and then panic on the
         // lookup that assumed it was still there.
@@ -917,7 +1039,11 @@ mod tests {
         create_entry(&mut s, &mut c, "p1", "", 6 * 3_600_000, 18 * 3_600_000).unwrap();
         create_entry(&mut s, &mut c, "p1", "", 12 * 3_600_000, 24 * 3_600_000).unwrap();
         assert_eq!(s.entries.len(), 3, "the data is still stored");
-        assert_eq!(days_exceeding_24h(&s, 0), vec![0], "but it is flagged");
+        assert_eq!(
+            days_exceeding_24h(&s, &crate::tz::Tz::utc()),
+            vec![0],
+            "but it is flagged"
+        );
     }
 
     #[test]
@@ -929,7 +1055,7 @@ mod tests {
         create_entry(&mut s, &mut c, "p1", "", 0, 12 * 3_600_000).unwrap();
         create_entry(&mut s, &mut c, "p1", "", 12 * 3_600_000, 24 * 3_600_000).unwrap();
         assert_eq!(s.total_ms(), D);
-        assert!(days_exceeding_24h(&s, 0).is_empty());
+        assert!(days_exceeding_24h(&s, &crate::tz::Tz::utc()).is_empty());
     }
 
     #[test]
@@ -938,6 +1064,39 @@ mod tests {
         let mut c = ids();
         create_entry(&mut s, &mut c, "p1", "", 0, 8 * 3_600_000).unwrap();
         create_entry(&mut s, &mut c, "p1", "", 9 * 3_600_000, 10 * 3_600_000).unwrap();
-        assert!(days_exceeding_24h(&s, 0).is_empty());
+        assert!(days_exceeding_24h(&s, &crate::tz::Tz::utc()).is_empty());
+    }
+
+    #[test]
+    fn over_24h_buckets_by_named_zone_per_instant() {
+        // Entries straddling local midnight in Rome must flag the Rome day,
+        // not the UTC day.
+        let rome = crate::tz::Tz::parse("Europe/Rome").unwrap();
+        let mut s = store_with_project();
+        let mut c = ids();
+        // 2026-07-05 22:00 UTC = 2026-07-06 00:00 Rome. Three overlapping 12h
+        // entries starting there sum to 36h on one Rome day.
+        let base = 1_783_288_800_000;
+        create_entry(&mut s, &mut c, "p1", "", base, base + 12 * 3_600_000).unwrap();
+        create_entry(
+            &mut s,
+            &mut c,
+            "p1",
+            "",
+            base + 6 * 3_600_000,
+            base + 18 * 3_600_000,
+        )
+        .unwrap();
+        create_entry(
+            &mut s,
+            &mut c,
+            "p1",
+            "",
+            base + 12 * 3_600_000,
+            base + 24 * 3_600_000,
+        )
+        .unwrap();
+        let flagged = days_exceeding_24h(&s, &rome);
+        assert_eq!(flagged, vec![rome.day_of(base)]);
     }
 }

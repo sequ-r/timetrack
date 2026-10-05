@@ -11,6 +11,7 @@ description = "Shared D-Bus contract and client for TimeTrack"
 timetrack-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 zbus = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

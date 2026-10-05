@@ -16,8 +16,9 @@
 //! UTC offset explicitly, so it is testable without I/O or a clock.
 
 use crate::aggregate::{iso_week_of, month_of};
-use crate::model::{MS_PER_DAY, Store, local_day_of};
-use crate::{format_duration, local_day_start};
+use crate::format_duration;
+use crate::model::{MS_PER_DAY, Store};
+use crate::tz::Tz;
 
 /// What an export covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,33 +57,33 @@ pub const CSV_HEADER: &str =
     "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note";
 
 /// Entries in `scope`, oldest first (the order a stakeholder reads).
-pub fn entries_in_scope(
-    store: &Store,
+pub fn entries_in_scope<'a>(
+    store: &'a Store,
     scope: ExportScope,
     now_ms: i64,
-    offset_ms: i64,
-) -> Vec<&crate::Entry> {
+    tz: &Tz,
+) -> Vec<&'a crate::Entry> {
     let mut out: Vec<&crate::Entry> = match scope {
         ExportScope::All => store.entries.iter().collect(),
         ExportScope::Week => {
-            let today = local_day_of(now_ms, offset_ms);
+            let today = tz.day_of(now_ms);
             let week = iso_week_of(today);
             store
                 .entries
                 .iter()
                 .filter(|e| {
-                    let d = local_day_of(e.started_at, offset_ms);
+                    let d = tz.day_of(e.started_at);
                     d >= week.start_day && d < week.start_day + 7
                 })
                 .collect()
         }
         ExportScope::Month => {
-            let today = local_day_of(now_ms, offset_ms);
+            let today = tz.day_of(now_ms);
             let (year, month) = month_of(today);
             store
                 .entries
                 .iter()
-                .filter(|e| month_of(local_day_of(e.started_at, offset_ms)) == (year, month))
+                .filter(|e| month_of(tz.day_of(e.started_at)) == (year, month))
                 .collect()
         }
     };
@@ -92,8 +93,11 @@ pub fn entries_in_scope(
 
 /// Format a UTC instant as a local ISO 8601 timestamp without offset
 /// (`2026-09-29T14:00:00`), per §10.
-pub fn format_local_iso8601(utc_ms: i64, offset_ms: i64) -> String {
-    let local_ms = utc_ms + offset_ms;
+///
+/// Uses the offset in force at that instant, so entries on either side of a
+/// DST transition render with their own wall-clock time.
+pub fn format_local_iso8601(utc_ms: i64, tz: &Tz) -> String {
+    let local_ms = utc_ms + tz.offset_at_ms(utc_ms);
     let day = local_ms.div_euclid(MS_PER_DAY);
     let rem = local_ms.rem_euclid(MS_PER_DAY);
     let (y, m, d) = day_to_ymd(day);
@@ -168,13 +172,10 @@ pub fn escape_field(s: &str) -> String {
 }
 
 /// Render the store (or the scoped subset) as CSV, including the header.
-pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, offset_ms: i64) -> String {
-    // Touch local_day_start so week/month bucketing stays anchored on the
-    // same local-midnight definition the service uses.
-    let _ = local_day_start(0, offset_ms);
+pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, tz: &Tz) -> String {
     let mut out = String::from(CSV_HEADER);
     out.push('\n');
-    for e in entries_in_scope(store, scope, now_ms, offset_ms) {
+    for e in entries_in_scope(store, scope, now_ms, tz) {
         let project = store
             .project(&e.project_id)
             .map(|p| p.name.as_str())
@@ -189,8 +190,8 @@ pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, offset_ms: i64
             escape_field(&e.id),
             escape_field(project),
             escape_field(&e.description),
-            escape_field(&format_local_iso8601(e.started_at, offset_ms)),
-            escape_field(&format_local_iso8601(e.ended_at, offset_ms)),
+            escape_field(&format_local_iso8601(e.started_at, tz)),
+            escape_field(&format_local_iso8601(e.ended_at, tz)),
             escape_field(&format_duration(e.duration_ms())),
             minutes,
             source.to_string(),
@@ -206,6 +207,10 @@ pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, offset_ms: i64
 mod tests {
     use super::*;
     use crate::{Entry, EntrySource, Project};
+
+    fn utc() -> Tz {
+        Tz::utc()
+    }
 
     fn store() -> Store {
         let mut s = Store::default();
@@ -246,23 +251,43 @@ mod tests {
 
     #[test]
     fn epoch_formats_as_midnight() {
-        assert_eq!(format_local_iso8601(0, 0), "1970-01-01T00:00:00");
+        assert_eq!(format_local_iso8601(0, &utc()), "1970-01-01T00:00:00");
     }
 
     #[test]
     fn offset_shifts_the_wall_clock() {
-        assert_eq!(format_local_iso8601(0, 3_600_000), "1970-01-01T01:00:00");
-        assert_eq!(format_local_iso8601(0, -3_600_000), "1969-12-31T23:00:00");
+        assert_eq!(
+            format_local_iso8601(0, &Tz::fixed_ms(3_600_000)),
+            "1970-01-01T01:00:00"
+        );
+        assert_eq!(
+            format_local_iso8601(0, &Tz::fixed_ms(-3_600_000)),
+            "1969-12-31T23:00:00"
+        );
     }
 
     #[test]
     fn known_date_formats() {
         // 2026-09-29T14:00:00Z as epoch millis.
-        let utc = 1_790_690_400_000;
-        assert_eq!(format_local_iso8601(utc, 0), "2026-09-29T14:00:00");
+        let utc_ms = 1_790_690_400_000;
+        assert_eq!(format_local_iso8601(utc_ms, &utc()), "2026-09-29T14:00:00");
         assert_eq!(
-            format_local_iso8601(utc, 2 * 3_600_000),
+            format_local_iso8601(utc_ms, &Tz::fixed_ms(2 * 3_600_000)),
             "2026-09-29T16:00:00"
+        );
+    }
+
+    #[test]
+    fn named_zone_formats_with_its_own_offset_per_instant() {
+        // Winter is +1, summer is +2 in Rome.
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        assert_eq!(
+            format_local_iso8601(1_768_478_400_000, &rome), // 2026-01-15 12:00 UTC
+            "2026-01-15T13:00:00"
+        );
+        assert_eq!(
+            format_local_iso8601(1_784_116_800_000, &rome), // 2026-07-15 12:00 UTC
+            "2026-07-15T14:00:00"
         );
     }
 
@@ -287,7 +312,7 @@ mod tests {
     #[test]
     fn export_has_header_plus_one_row_per_entry() {
         let s = store();
-        let csv = export_csv(&s, ExportScope::All, 0, 0);
+        let csv = export_csv(&s, ExportScope::All, 0, &utc());
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], CSV_HEADER);
@@ -301,7 +326,7 @@ mod tests {
     fn week_scope_excludes_other_weeks() {
         let s = store();
         // e1/e2 are in Jan 1970; "now" a fortnight later is a different week.
-        let csv = export_csv(&s, ExportScope::Week, 14 * MS_PER_DAY, 0);
+        let csv = export_csv(&s, ExportScope::Week, 14 * MS_PER_DAY, &utc());
         assert_eq!(csv.lines().count(), 1, "header only");
     }
 

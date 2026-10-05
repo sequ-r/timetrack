@@ -105,10 +105,8 @@ Built:
 
 Not built:
 
-- Split and merge (§8). On the service, unreachable from the UI.
-- A text field for naming a project, so "New project" invents `Project 1`.
-- Tab switching by keyboard, and the merge confirmation that must warn the total
-  will shrink.
+(none left from this increment's list — remaining GUI work is tracked in
+TODO tasks 11–13.)
 
 Built since:
 
@@ -200,14 +198,39 @@ or `45s`.
 2. **The manual-entry dialog** in the GUI (§5 methods 1 and 2). **Done
    2026-10-05:** `a` / `e`, shared spellings in `core/src/parse.rs`, new
    `SetText` D-Bus method; the `notify` refresh fix from the same increment.
-3. **A real timezone database lookup per instant.** §9's local-time bucketing
-   assumes this. A named `TZ` currently falls back to UTC, and a DST-observing
-   zone can mis-bucket near a week boundary. This is the likeliest remaining
-   source of wrong numbers.
-4. **Split and merge in the GUI** (§8), with the confirmation that states the
-   total will shrink by the overlap.
+3. **A real timezone database lookup per instant.** **Done 2026-10-06:**
+   `core/src/tz.rs` (`Tz::Utc`/`Fixed`/`Named` via `chrono-tz`, `offset_at_ms`
+   per instant, `day_of`/`day_start` with fixed-point midnight); aggregate,
+   rules, export and parse all take `&Tz`; service holds `Tz::from_env()` and
+   snapshots carry `tz` name + per-instant `local_offset_ms` (backward-compat
+   fallback via `Tz::from_snapshot`); CLI/GUI resolve from the snapshot.
+   DST tests: Rome winter +1/summer +2, spring/fall transition days, Sunday
+   22:30 UTC → Monday 00:30 Rome week-split, export renders Rome wall-clock.
+   Live check: `TZ=Europe/Rome` snapshot reports `"tz":"Europe/Rome"` with
+   the correct CEST offset (previously UTC fallback).
+4. **Split and merge in the GUI + CLI** (§8). **Done 2026-10-06:** GUI `s`
+   split prompt (typed moment, shared `parse_when` spellings) + `m` merge
+   confirm banner stating count/project/delta; CLI `split ID --at MOMENT` +
+   `merge IDS... [--yes]` (TTY prompt, off-terminal refusal without `--yes`);
+   shared `merge_shrink_ms`/`format_merge_delta` in core so both UIs word the
+   delta identically. E2e covers halves, touching + overlap merges and 5
+   refusal guards; gui-smoke covers prompt/confirm paint + keyboard split
+   and merge.
 5. **A project text field**, so projects can be named rather than numbered.
-6. **Tab shortcuts**, and the proportional bars from §11.
+   **Done 2026-10-06:** `core::update_project` (new `BlankProjectName` guard)
+   exported + tested; D-Bus `UpdateProject(id, name, colour)` with keep
+   sentinels (`""`/`-1`, since D-Bus has no `Option`); CLI `rename` (blank
+   refused locally, same wording) + `recolour` (strict RRGGBB parse); GUI
+   naming prompt (`n` new / `r` rename, prefilled) replacing the invented
+   `Project N`, plus a colour dot on project rows. E2e covers rename,
+   recolour and 5 guards with snapshot asserts; gui-smoke types a name and
+   a rename through the prompt.
+6. **Tab shortcuts**, and the proportional bars from §11. **Done 2026-10-06:**
+   `Tab`/`Shift+Tab` cycles the three tabs via pure `cycle_tab` (the entry
+   dialog keeps `Tab` for field cycling); Home per-project week rows gain a
+   bar proportional to the longest row (`bar_width`, 120px track). GUI tests
+   pin the cycle both directions and the proportions; gui-smoke asserts a
+   Tab changes the window and three presses return it pixel-identical.
 
 ## Deferred, deliberately
 
@@ -220,11 +243,14 @@ or `45s`.
 - **Timezone handling in aggregation** is the most likely source of off-by-one
   bugs, particularly around DST and month boundaries. The ISO-week rule is
   stated precisely in §9 for that reason, and it belongs in one place. *This
-  risk has already materialised once* — see item 3 above.
+  risk materialised and is now fixed* — per-instant lookup in `core/src/tz.rs`
+  (item 3 above); the residual risk is zones with midnight transitions and
+  skipped `HH:MM` inputs on spring-forward days, which map arithmetically
+  rather than being rejected.
 - **Merge reducing the total** (§8) will look like a bug to a user who has not
-  read the confirmation text. The confirmation has to say the duration will
-  shrink by the overlap, and it does not exist yet, so the feature is unwired
-  rather than misused.
+  read the confirmation text. The confirmation now states the delta in both
+  UIs (GUI banner, CLI prompt/`--yes` output), shared from
+  `rules.rs::format_merge_delta` so the wording cannot drift.
 - **A stale service binary outliving an interface rename** cost the most time
   during the last round: a GUI speaking `.Entries` against a service still
   answering to `.Timer` looks like a dead app, not a version mismatch. The GUI

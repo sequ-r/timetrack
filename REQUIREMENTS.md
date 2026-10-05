@@ -436,39 +436,29 @@ specification and the implementation do not quietly diverge.
 | §5 Undo refuses a non-quick-add | `rules.rs` + service | e2e and unit tests |
 | §6 Quick-add 5/15/30/60, own entry each | `rules.rs::quick_add` | e2e |
 | §7 Timer cut; no `running` anywhere | whole tree | a test asserts no `running` field exists |
-| §8 Split and merge | core + service D-Bus | unit tests; **not in the GUI** |
+| §8 Split and merge | core + service D-Bus, GUI `s`/`m`, CLI `split`/`merge` | unit tests + e2e + gui-smoke |
+| §8 Split/merge confirmation stating the shrink | shared `merge_shrink_ms`/`format_merge_delta` in `rules.rs`; GUI confirm banner, CLI prompt/`--yes` | core/GUI/CLI tests + e2e (touching + overlap merges, 5 refusal guards) |
 | §8 Merge takes the union, may shrink the total | `rules.rs::merge_entries` | tests assert both cases |
 | §9 ISO weeks, months, per-project | `core/src/aggregate.rs` | boundary tests |
 | §9 Aggregation applied by the service | `service/src/interface.rs` | e2e |
 | §6 Quick-add from the GUI — by click and by keystroke | `gui/src/app.rs` | `gui-smoke.sh`, XTest click and key |
 | §11 Three tabs | `gui/src/app.rs` | `gui-smoke.sh` (screenshot) |
+| §11 Tabs switch by keyboard (`Tab`/`Shift+Tab`) | `gui/src/app.rs::cycle_tab` | GUI tests + gui-smoke (away-change, 3-press return) |
+| §11 Per-project rows show proportional bars | `gui/src/app.rs::bar_width` (week rows) | GUI tests |
 | §11 Week total large, at the top, nothing above it | `gui/src/app.rs`, 72px | `gui-smoke.sh` (text drawn; the value itself is not read back) |
 | §14 Archived projects stay in totals | `rules.rs::set_archived` | service test |
 | §2 Version field, no migration | `model.rs::STORE_VERSION` | storage test |
 | §2 Corrupt store refused, not reset | `storage.rs` | storage test |
 | §5 Methods 1 and 2 as one dialog, GUI + CLI | `core/src/parse.rs` (shared spellings), GUI dialog (`a` new / `e` edit), CLI wrappers | core/GUI tests + gui-smoke (open, cancel, save, typed text) |
 | §10 CSV export, ISO 8601 local time, `HH:MM:SS` + minutes, `source`, GUI + CLI, week/month/all | `core/src/export.rs`, service `ExportCsv`, CLI `export`, GUI Export tab | core/service tests + e2e (65 checks) |
+| §9 Named-zone DST bucketing per instant | `core/src/tz.rs` (`Tz`, tz-database via `chrono-tz`), service `Tz::from_env`, snapshot `tz` + per-instant `local_offset_ms`, CLI/GUI `Tz::from_snapshot` | core DST tests (Rome winter/summer, transition days, week-split), service DST test, live `TZ=Europe/Rome` snapshot check |
+| §11 Project rename and recolour | `core::update_project`, service `UpdateProject`, CLI `rename`/`recolour`, GUI naming prompt (`n` new / `r` rename) + colour dot | core/service/CLI/GUI tests + e2e (rename, recolour, 5 guards, snapshot asserts) + gui-smoke (prompt paint, keyboard create/rename) |
 | §13 Core free of GUI/IPC/async/clock | `core/` | by construction |
 
 ### Specified but not built
 
 - **§5 drag-to-trim.** Deferred by decision, not by omission.
-- **§11 proportional bars** on the per-project rows. Rows show the time; the bar
-  is not drawn.
-- **§11 project rename and recolour.** Create and archive exist; rename and
-  recolour do not, and the GUI's "New project" invents a numbered default name
-  because there is no text field.
-- **§8 split/merge in the GUI.** On the service and core, unreachable from the
-  UI.
-- **§11 tabs switched by keyboard.** Tabs respond to clicks; the shortcuts are
-  not wired.
 
 ### Known defects and gaps
 
-- **The timezone offset is resolved once at startup, fixed-offset only.** A
-  named `TZ` such as `Europe/Rome` falls back to UTC, and a zone observing DST
-  can bucket an entry into the wrong local day near a week boundary. §9 assumes
-  correct local-time bucketing, so this is a real shortfall against the spec,
-  not a nicety. A tz-database lookup per instant is the fix.
-- **The GUI's "New project" name is a placeholder** (`Project 1`, `Project 2`).
-  Functional but not what §11 asks for.
+(none open — the placeholder project names are gone: every name is typed.)

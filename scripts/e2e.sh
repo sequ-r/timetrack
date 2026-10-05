@@ -138,6 +138,86 @@ out=$("$CLI" project "Home"); contains "create Home" "created project" "$out"
 # p1 is the seeded General, p2 Work, p3 Home. The archive check below uses p2.
 
 echo
+echo "== projects rename and recolour =="
+# A fourth project, so the renames below never disturb Work/Home/General
+# and no later absolute total moves.
+out=$("$CLI" project "RenameMe"); contains "create RenameMe" "created project" "$out"
+out=$("$CLI" rename p4 Renamed)
+contains "rename reports old and new" "renamed RenameMe to Renamed (p4)" "$out"
+out=$("$CLI" recolour p4 2ea043)
+contains "recolour reports the colour" "recoloured Renamed (p4) to #2ea043" "$out"
+SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries.Snapshot \
+  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
+import json, sys
+snap = json.load(sys.stdin)
+probs = []
+ps = {p["id"]: p for p in snap["projects"]}
+if ps.get("p4", {}).get("name") != "Renamed":
+    probs.append("p4 not renamed")
+if ps.get("p4", {}).get("colour") != 0x2EA043:
+    probs.append("p4 not recoloured")
+print(";".join(probs))
+'); then
+  check "rename and recolour reached the snapshot" "" "$AGREE"
+else
+  bad "rename and recolour reached the snapshot" "could not parse the snapshot"
+fi
+out=$("$CLI" rename p99 X 2>&1); contains "rename of an unknown id fails" "no project with id" "$out"
+out=$("$CLI" rename p4 "" 2>&1); contains "blank rename refused" "cannot be blank" "$out"
+out=$("$CLI" rename p4 Work 2>&1); contains "duplicate rename refused" "already exists" "$out"
+out=$("$CLI" recolour p4 zzzzzz 2>&1); contains "bad hex refused" "RRGGBB" "$out"
+out=$("$CLI" recolour p99 2ea043 2>&1); contains "recolour of an unknown id fails" "no project with id" "$out"
+
+echo
+echo "== set-text, set-project and unarchive =="
+# One scratch entry for the editing commands: added and removed here, so
+# no later absolute total moves.
+out=$("$CLI" add -p Work -S -60 -E -30 -d "editable")
+EE=$(id_of "$out"); created=$((created+1))
+out=$("$CLI" set-text "$EE" "edited")
+contains "text rewritten" "set text on $EE to \"edited\"" "$out"
+if "$CLI" list | grep -E " $EE " | grep -q "edited"; then
+  ok "new text reads back in the list"
+else
+  bad "new text reads back in the list" "edited missing"
+fi
+out=$("$CLI" set-project "$EE" Home)
+contains "entry moved projects" "moved $EE to Home (p3)" "$out"
+contains "export shows the new project" "$EE,Home," "$("$CLI" export --scope all | grep -E "^$EE,")"
+out=$("$CLI" set-text e9999 "x" 2>&1); contains "set-text of an unknown id fails" "no entry with id" "$out"
+out=$("$CLI" set-project e9999 Work 2>&1); contains "set-project of an unknown entry fails" "no entry with id" "$out"
+out=$("$CLI" set-project "$EE" Nope 2>&1); contains "set-project onto an unknown project fails" "no project with id" "$out"
+"$CLI" delete "$EE" >/dev/null; removed=$((removed+1))
+check "scratch entry removed" "0" "$(listed)"
+# Archive then unarchive p3: the snapshot must show both transitions, and
+# the last one leaves history untouched.
+out=$("$CLI" archive "p3")
+contains "archived" "archived" "$out"
+out=$("$CLI" unarchive "p3")
+contains "unarchived" "unarchived Home (p3)" "$out"
+SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries.Snapshot \
+  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
+import json, sys
+snap = json.load(sys.stdin)
+probs = []
+ps = {p["id"]: p for p in snap["projects"]}
+if ps.get("p3", {}).get("archived", True) is not False:
+    probs.append("p3 not unarchived")
+print(";".join(probs))
+'); then
+  check "unarchive restored the project" "" "$AGREE"
+else
+  bad "unarchive restored the project" "could not parse the snapshot"
+fi
+out=$("$CLI" unarchive p99 2>&1); contains "unarchive of an unknown id fails" "no project with id" "$out"
+
+echo
 echo "== method 1: explicit start and end =="
 out=$("$CLI" add -p Work -S -120 -E -60 -d "writing")
 contains "explicit interval added" "added 01:00:00" "$out"
@@ -242,6 +322,57 @@ contains "24h warning shown" "more than 24h" "$("$CLI" status)"
 check "all three long entries were stored" "$((created-removed))" "$(listed)"
 
 echo
+echo "== split divides one entry in two, total unchanged =="
+# Wall-clock moments, so every boundary is exact: relative moments drift by
+# the seconds between two CLI calls, which would turn 00:30:00 into 00:29:59.
+out=$("$CLI" add -p Work -S 09:00 -E 10:00 -d "splittable")
+E_SPLIT=$(id_of "$out"); created=$((created+1))
+out=$("$CLI" split "$E_SPLIT" --at 09:30)
+contains "split reports both halves" "00:30:00" "$out"
+H1=$(printf '%s' "$out" | grep -oE '\(e[0-9]+\)' | tr -d '()' | sed -n '1p')
+H2=$(printf '%s' "$out" | grep -oE '\(e[0-9]+\)' | tr -d '()' | sed -n '2p')
+created=$((created+1))
+check "first half is 30m" "00:30:00" "$(duration_of "$H1")"
+check "second half is 30m" "00:30:00" "$(duration_of "$H2")"
+check "splitting changed nothing in the total" "49:30:00" "$(total)"
+
+echo
+echo "== merge fuses entries and states the delta =="
+# The halves touch at exactly 09:30, so joining them is lossless.
+out=$("$CLI" merge "$H1" "$H2" --yes)
+contains "touching merge is lossless" "total unchanged" "$out"
+removed=$((removed+1))
+check "merged back to one hour" "01:00:00" "$(duration_of "$H1")"
+check "total still 49:30" "49:30:00" "$(total)"
+# Two overlapping hours: the union is 90 minutes, so merging states the
+# 30-minute shrink up front (REQUIREMENTS §8) and the total drops by it.
+out=$("$CLI" add -p Work -S 09:00 -E 10:00 -d "ov1"); OV1=$(id_of "$out"); created=$((created+1))
+out=$("$CLI" add -p Work -S 09:30 -E 10:30 -d "ov2"); OV2=$(id_of "$out"); created=$((created+1))
+check "two overlapping hours added" "51:30:00" "$(total)"
+out=$("$CLI" merge "$OV1" "$OV2" --yes)
+contains "merge states the shrink" "total shrinks by 00:30:00" "$out"
+MOV=$(id_of "$out"); removed=$((removed+1))
+check "overlapping merge dropped the 30m overlap" "51:00:00" "$(total)"
+
+echo
+echo "== split and merge refuse bad input without changing anything =="
+before=$(listed)
+out=$("$CLI" split "$E_SPLIT" --at 11:00 2>&1)
+contains "split outside the entry refused" "split point is outside" "$out"
+out=$("$CLI" split e9999 --at -90 2>&1)
+contains "split of an unknown id fails" "no entry with id" "$out"
+out=$("$CLI" merge "$E_SPLIT" --yes 2>&1)
+contains "merge needs two entries" "need two" "$out"
+out=$("$CLI" merge "$E_SPLIT" "$MOV" </dev/null 2>&1)
+contains "merge without --yes refuses off-terminal" "re-run with --yes" "$out"
+out=$("$CLI" quick -p Home -m 5); HX=$(id_of "$out"); created=$((created+1))
+out=$("$CLI" merge "$E_SPLIT" "$HX" --yes 2>&1)
+contains "merge across projects refused" "different projects" "$out"
+"$CLI" delete "$HX" >/dev/null; removed=$((removed+1))
+check "refusals stored nothing" "$before" "$(listed)"
+check "counts still balance" "$((created-removed))" "$(listed)"
+
+echo
 echo "== persistence across a service restart =="
 before_all=$(total)
 before_n=$(listed)
@@ -287,6 +418,41 @@ contains "export timestamps are ISO 8601" "T" "$(cat "$WORK/export.csv")"
 out=$("$CLI" export --scope bogus 2>&1); contains "bad scope refused" "unknown export scope" "$out"
 
 echo
+echo "== service aggregates agree on a large store =="
+# The Projects tab reads its week and all-time columns from the snapshot's
+# aggregates. If the all-time breakdown drifted from the entries, the tab
+# would show disagreeing totals -- so grow the store past a handful of
+# entries and compare the aggregates against the entries in the same
+# snapshot. Uneven per-project durations keep the comparison honest.
+for i in $(seq 1 15); do
+  "$CLI" add -p Work -S -600 -E -540 -d "bulk work $i" >/dev/null; created=$((created+1))
+  "$CLI" add -p Home -S -300 -E -270 -d "bulk home $i" >/dev/null; created=$((created+1))
+done
+SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries.Snapshot \
+  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
+import json, sys
+snap = json.load(sys.stdin)
+probs = []
+if snap["all"]["total_ms"] != snap["total_ms"]:
+    probs.append("all.total_ms != total_ms")
+if snap["all"]["entry_count"] != len(snap["entries"]):
+    probs.append("all.entry_count != len(entries)")
+sums = {}
+for e in snap["entries"]:
+    sums[e["project_id"]] = sums.get(e["project_id"], 0) + max(0, e["ended_at"] - e["started_at"])
+if sums != snap["all"]["per_project"]:
+    probs.append("per_project mismatch: %s vs %s" % (sums, snap["all"]["per_project"]))
+print(";".join(probs))
+'); then
+  check "all-time aggregates agree with the entries" "" "$AGREE"
+else
+  bad "all-time aggregates agree with the entries" "could not parse the snapshot"
+fi
+
+echo
 echo "== the D-Bus surface is the new one =="
 INTRO=$(gdbus introspect --session --dest org.sequ.timetrack --object-path /org/sequ/timetrack 2>/dev/null)
 check "interface is the new one" "org.sequ.timetrack.Entries" \
@@ -294,7 +460,7 @@ check "interface is the new one" "org.sequ.timetrack.Entries" \
 printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
   && bad "stopwatch methods are gone" "Start/Stop/Cancel still exposed" \
   || ok "stopwatch methods are gone"
-for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText UndoQuickAdd DeleteEntry Split Merge AddProject SetArchived ExportCsv; do
+for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived ExportCsv; do
   printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
 done
 

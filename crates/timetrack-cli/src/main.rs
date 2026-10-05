@@ -28,9 +28,19 @@
 //! - `shorten` moves an endpoint, keeping the entry
 //! - `undo`    removes the entry a quick add created
 //! - `delete`  removes any entry, on purpose
+//!
+//! Plus the two §8 restructuring operations:
+//!
+//! - `split` divides one entry in two at a moment (total unchanged)
+//! - `merge` fuses entries into their union (overlaps collapse, so the total
+//!   can shrink -- the confirmation says by how much)
+//!
+//! And the small edits: `set-text` rewrites a description, `set-project`
+//! moves an entry between projects, `unarchive` reverses `archive`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::time::Duration;
 use timetrack_cli::tui;
 use timetrack_proto::{Client, ProjectView, Snapshot};
@@ -127,6 +137,44 @@ enum Command {
     /// Delete an entry outright.
     Delete { id: String },
 
+    /// Rewrite an entry's description.
+    SetText {
+        /// The entry to change.
+        id: String,
+        /// The new description.
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
+
+    /// Move an entry to another project. Totals follow the entry.
+    SetProject {
+        /// The entry to move.
+        id: String,
+        /// The project id or name.
+        project: String,
+    },
+
+    // --- split and merge (REQUIREMENTS §8) ---
+    /// Split one entry into two at a given moment. The total is unchanged.
+    Split {
+        /// The entry to split.
+        id: String,
+        /// Where to split: `-30` for 30 minutes ago, or `09:30` today.
+        #[arg(short = 'A', long, allow_hyphen_values = true)]
+        at: String,
+    },
+
+    /// Merge entries into one spanning earliest start to latest end.
+    /// Merging overlapping entries shrinks the total by the overlap.
+    Merge {
+        /// The entries to merge (two or more; the service refuses fewer).
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Confirm without prompting. The prompt states how the total changes.
+        #[arg(short, long)]
+        yes: bool,
+    },
+
     // --- projects ---
     /// Create a project.
     Project {
@@ -134,8 +182,27 @@ enum Command {
         name: String,
     },
 
+    /// Rename a project.
+    Rename {
+        /// The project id (or its current name).
+        id: String,
+        /// The new name.
+        name: String,
+    },
+
+    /// Recolour a project. Colour is RRGGBB hex, e.g. `2ea043`.
+    Recolour {
+        /// The project id (or its current name).
+        id: String,
+        /// Six hex digits, with or without a leading `#`.
+        colour: String,
+    },
+
     /// Archive a project, keeping its history in totals.
     Archive { id: String },
+
+    /// Unarchive a project, making it selectable again.
+    Unarchive { id: String },
 
     /// Export entries as CSV (REQUIREMENTS §10).
     Export {
@@ -202,8 +269,9 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         } => {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
-            let start_ms = parse_when(&start, "start", snap.local_offset_ms)?;
-            let end_ms = parse_when(&end, "end", snap.local_offset_ms)?;
+            let tz = snapshot_tz(&snap);
+            let start_ms = parse_when(&start, "start", &tz)?;
+            let end_ms = parse_when(&end, "end", &tz)?;
             let e = client.add(&project, &description, start_ms, end_ms).await?;
             println!(
                 "added {} ({})",
@@ -237,7 +305,8 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
             let ms = parse_duration(&for_)?;
-            let end_ms = parse_when(&ended, "ended", snap.local_offset_ms)?;
+            let tz = snapshot_tz(&snap);
+            let end_ms = parse_when(&ended, "ended", &tz)?;
             let e = client
                 .add_duration_ending(&project, &description, ms, end_ms)
                 .await?;
@@ -279,12 +348,13 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let tz = snapshot_tz(&snap);
             let start_ms = match &start {
-                Some(s) => parse_when(s, "start", snap.local_offset_ms)?,
+                Some(s) => parse_when(s, "start", &tz)?,
                 None => existing.started_at,
             };
             let end_ms = match &end {
-                Some(s) => parse_when(s, "end", snap.local_offset_ms)?,
+                Some(s) => parse_when(s, "end", &tz)?,
                 None => existing.ended_at,
             };
             let e = client.set_times(&id, start_ms, end_ms).await?;
@@ -305,9 +375,126 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             println!("deleted: {id}");
         }
 
+        Command::SetText { id, text } => {
+            let snap = client.snapshot().await?;
+            snap.entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let e = client.set_text(&id, &text).await?;
+            println!("set text on {} to \"{}\"", e.id, e.description);
+        }
+
+        Command::SetProject { id, project } => {
+            let snap = client.snapshot().await?;
+            snap.entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let target = find_project(&snap, &project)?;
+            let e = client.set_project(&id, &target.id).await?;
+            println!("moved {} to {} ({})", e.id, target.name, target.id);
+        }
+
+        Command::Split { id, at } => {
+            let snap = client.snapshot().await?;
+            let existing = snap
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let tz = snapshot_tz(&snap);
+            let at_ms = parse_when(&at, "at", &tz)?;
+            if at_ms <= existing.started_at || at_ms >= existing.ended_at {
+                anyhow::bail!("split point is outside entry '{id}'");
+            }
+            let (a, b) = client.split(&id, at_ms).await?;
+            println!(
+                "split into ({}) {} and ({}) {}",
+                a.id,
+                timetrack_core::format_duration(a.duration_ms()),
+                b.id,
+                timetrack_core::format_duration(b.duration_ms()),
+            );
+        }
+
+        Command::Merge { ids, yes } => {
+            let snap = client.snapshot().await?;
+            let mut found = Vec::with_capacity(ids.len());
+            for id in &ids {
+                found.push(
+                    snap.entries
+                        .iter()
+                        .find(|e| e.id == *id)
+                        .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?,
+                );
+            }
+            // Preview from the snapshot so the confirmation states how the
+            // total changes; the service re-validates on execute.
+            let intervals: Vec<(i64, i64)> =
+                found.iter().map(|e| (e.started_at, e.ended_at)).collect();
+            let delta =
+                timetrack_core::format_merge_delta(timetrack_core::merge_shrink_ms(&intervals));
+            let project = snap
+                .projects
+                .iter()
+                .find(|p| p.id == found[0].project_id)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| found[0].project_id.clone());
+            if !yes {
+                if std::io::stdin().is_terminal() {
+                    eprint!(
+                        "Merge {} entries on {project}? {delta}. Confirm? [y/N] ",
+                        ids.len()
+                    );
+                    use std::io::BufRead;
+                    let stdin = std::io::stdin();
+                    let mut line = String::new();
+                    stdin.lock().read_line(&mut line)?;
+                    if !confirmed(&line) {
+                        println!("merge cancelled");
+                        return Ok(());
+                    }
+                } else {
+                    anyhow::bail!("merge needs confirmation ({delta}); re-run with --yes");
+                }
+            }
+            let merged = client.merge(&ids).await?;
+            println!(
+                "merged {} entries into ({}) {} ({delta})",
+                ids.len(),
+                merged.id,
+                timetrack_core::format_duration(merged.duration_ms()),
+            );
+        }
+
         Command::Project { name } => {
             let p = client.add_project(&name).await?;
             println!("created project {} ({})", p.name, p.id);
+        }
+
+        Command::Rename { id, name } => {
+            // Refused here, not just by the service: at the D-Bus level an
+            // empty name means "keep", so passing blank through would
+            // silently succeed as a no-op. Same wording as the core guard.
+            if name.trim().is_empty() {
+                anyhow::bail!("project name cannot be blank");
+            }
+            let snap = client.snapshot().await?;
+            let existing = find_project(&snap, &id)?;
+            let old = existing.name.clone();
+            let p = client.update_project(&existing.id, &name, -1).await?;
+            println!("renamed {old} to {} ({})", p.name, p.id);
+        }
+
+        Command::Recolour { id, colour } => {
+            let snap = client.snapshot().await?;
+            let existing = find_project(&snap, &id)?;
+            let value = parse_colour(&colour)?;
+            let p = client
+                .update_project(&existing.id, "", value as i64)
+                .await?;
+            println!("recoloured {} ({}) to #{value:06x}", p.name, p.id);
         }
 
         Command::Archive { id } => {
@@ -316,6 +503,11 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 "archived {} ({}) -- its entries stay in historical totals",
                 p.name, p.id
             );
+        }
+
+        Command::Unarchive { id } => {
+            let p = client.set_archived(&id, false).await?;
+            println!("unarchived {} ({})", p.name, p.id);
         }
 
         Command::Status => print_status(&client.snapshot().await?),
@@ -380,6 +572,32 @@ fn print_list(s: &Snapshot, limit: usize) {
     }
 }
 
+/// Resolve a project argument to a snapshot entry, for rename/recolour.
+///
+/// Unlike `pick_project` this matches archived projects too: renaming one
+/// is harmless, and refusing would strand the numbered placeholders this
+/// replaced. Matches the id first, then the name case-insensitively.
+fn find_project<'a>(snap: &'a Snapshot, wanted: &str) -> Result<&'a ProjectView> {
+    snap.projects
+        .iter()
+        .find(|p| p.id == wanted)
+        .or_else(|| {
+            snap.projects
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(wanted))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no project with id '{wanted}'"))
+}
+
+/// Parse an `RRGGBB` colour like `2ea043` (leading `#` allowed).
+fn parse_colour(text: &str) -> Result<u32> {
+    let hex = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("'{text}' is not RRGGBB hex (e.g. 2ea043)");
+    }
+    Ok(u32::from_str_radix(hex, 16).expect("six hex digits always fit"))
+}
+
 /// Resolve a project argument to an id, defaulting to the first active one.
 ///
 /// Matches either the id or (case-insensitively) the name: `timetrack quick
@@ -418,18 +636,32 @@ fn now_ms() -> i64 {
 /// - `-90` -- minutes relative to now, so `-90` is 90 minutes ago
 /// - `09:30` -- today at that wall-clock time, in local time
 ///
-/// `local_offset_ms` is the service's UTC offset from the snapshot: `HH:MM`
-/// has to anchor on local midnight, not UTC midnight, or entries land hours
-/// out for anyone east or west of Greenwich.
+/// `tz` is the service's zone from the snapshot: `HH:MM` has to anchor on
+/// local midnight, not UTC midnight, or entries land hours out for anyone
+/// east or west of Greenwich. The zone resolves per instant, so days either
+/// side of a DST transition still anchor correctly.
 ///
 /// A leading `-` is deliberately allowed through clap (`allow_hyphen_values`)
 /// because `-90` is a perfectly ordinary thing to type for "90 minutes ago".
 ///
 /// The spellings live in `timetrack_core::parse_moment` so the CLI and the
 /// GUI cannot disagree; this is a thin wrapper that supplies the clock.
-fn parse_when(text: &str, what: &str, local_offset_ms: i64) -> Result<i64> {
-    timetrack_core::parse_moment(text, what, now_ms(), local_offset_ms)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+fn parse_when(text: &str, what: &str, tz: &timetrack_core::Tz) -> Result<i64> {
+    timetrack_core::parse_moment(text, what, now_ms(), tz).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The snapshot's zone: prefer the name, fall back to the fixed offset for
+/// old services that send no name.
+fn snapshot_tz(snap: &Snapshot) -> timetrack_core::Tz {
+    timetrack_core::Tz::from_snapshot(&snap.tz, snap.local_offset_ms)
+}
+
+/// Whether a typed merge confirmation counts as "yes".
+///
+/// Split out so the actual prompt stays a thin reader: `y`/`yes` in any
+/// case confirms, everything else (including empty) cancels.
+fn confirmed(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Parse a duration like `90m`, `1h30m` or `45s`, in milliseconds.
@@ -482,9 +714,34 @@ mod tests {
     }
 
     #[test]
+    fn confirmations_accept_y_variants_and_reject_the_rest() {
+        for yes in ["y", "Y", "yes", "YES", "  y  "] {
+            assert!(confirmed(yes), "{yes:?} should confirm");
+        }
+        for no in ["", "n", "no", "yess", "1", "cancel"] {
+            assert!(!confirmed(no), "{no:?} should cancel");
+        }
+    }
+
+    #[test]
+    fn colours_parse_as_rrggbb_hex() {
+        assert_eq!(parse_colour("2ea043").unwrap(), 0x2ea043);
+        assert_eq!(parse_colour("#2EA043").unwrap(), 0x2ea043);
+        assert_eq!(parse_colour("  ff0000  ").unwrap(), 0xff0000);
+    }
+
+    #[test]
+    fn bad_colours_name_the_problem() {
+        for bad in ["", "red", "12345", "1234567", "zzzzzz", "#12 34"] {
+            let e = parse_colour(bad).unwrap_err().to_string();
+            assert!(e.contains("RRGGBB"), "{bad:?} should say RRGGBB: {e}");
+        }
+    }
+
+    #[test]
     fn minutes_ago_parses_relative_to_now() {
         let before = now_ms();
-        let t = parse_when("-90", "start", 0).unwrap();
+        let t = parse_when("-90", "start", &timetrack_core::Tz::utc()).unwrap();
         let after = now_ms();
         // 90 minutes before, give or take the time the call itself took.
         assert!(
@@ -496,13 +753,13 @@ mod tests {
     #[test]
     fn minutes_from_now_parses_forward() {
         let before = now_ms();
-        let t = parse_when("30", "start", 0).unwrap();
+        let t = parse_when("30", "start", &timetrack_core::Tz::utc()).unwrap();
         assert!((before + 1_800_000..=now_ms() + 1_800_000).contains(&t));
     }
 
     #[test]
     fn a_wall_clock_time_lands_today() {
-        let t = parse_when("09:30", "start", 0).unwrap();
+        let t = parse_when("09:30", "start", &timetrack_core::Tz::utc()).unwrap();
         let day = 86_400_000;
         let today = now_ms().div_euclid(day) * day;
         assert!(
@@ -522,23 +779,19 @@ mod tests {
     fn a_wall_clock_time_is_local_not_utc() {
         // UTC+2: anchoring on UTC midnight would put 00:30 two hours out and
         // could bucket the entry on the wrong local day.
-        let off = 2 * 3_600_000;
-        let t = parse_when("00:30", "start", off).unwrap();
-        // Thirty minutes past local midnight...
-        assert_eq!((t + off).rem_euclid(86_400_000), 30 * 60_000);
-        // ...on the local today.
-        assert_eq!(
-            (t + off).div_euclid(86_400_000),
-            (now_ms() + off).div_euclid(86_400_000)
-        );
+        let tz = timetrack_core::Tz::fixed_ms(2 * 3_600_000);
+        let t = parse_when("00:30", "start", &tz).unwrap();
+        assert_eq!(timetrack_core::format_local_hm(t, &tz), "00:30");
+        assert_eq!(tz.day_of(t), tz.day_of(now_ms()));
     }
 
     #[test]
     fn impossible_times_are_refused() {
-        assert!(parse_when("25:00", "start", 0).is_err());
-        assert!(parse_when("09:70", "start", 0).is_err());
-        assert!(parse_when("nonsense", "start", 0).is_err());
-        assert!(parse_when("", "start", 0).is_err());
+        let utc = timetrack_core::Tz::utc();
+        assert!(parse_when("25:00", "start", &utc).is_err());
+        assert!(parse_when("09:70", "start", &utc).is_err());
+        assert!(parse_when("nonsense", "start", &utc).is_err());
+        assert!(parse_when("", "start", &utc).is_err());
     }
 
     #[test]
@@ -546,7 +799,7 @@ mod tests {
         // "start" vs "end" matters: a user who typed the wrong one should be
         // told which argument to look at.
         assert!(
-            parse_when("99:99", "end", 0)
+            parse_when("99:99", "end", &timetrack_core::Tz::utc())
                 .unwrap_err()
                 .to_string()
                 .contains("end")

@@ -11,3 +11,6 @@ description = "Domain model, timer state machine and storage for TimeTrack"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+chrono = "0.4"
+chrono-tz = "0.10"
+iana-time-zone = "0.1"

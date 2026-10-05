@@ -18,6 +18,13 @@
 #     the three fields and saves, asserting the entry reached the service
 #     with the typed text -- and that the window refreshed with no pointer
 #     motion at all, proving the background poll repaints on its own.
+#   - splits an entry with `s` by typing a moment, and merges the halves
+#     back with `m` `m` through the confirmation, asserting counts and the
+#     unchanged total through the CLI after each step.
+#   - names a project with `n` and renames one with `r` through the naming
+#     prompt, proving each typed name reached the store.
+#   - cycles the three tabs with `Tab`, asserting the window changed and
+#     that three presses return it pixel-identical to Home.
 #
 # It reads pixels rather than window properties on purpose: a screenshot is the
 # only evidence that the renderer drew something rather than the window merely
@@ -347,6 +354,107 @@ elif "$WORK/xtest" "$DISP" key 1; then
     ok "the window refreshed without any pointer motion ($DIFF pixels changed)"
   else
     bad "the window refreshed without any pointer motion" "the total's band is unchanged after the save"
+  fi
+
+  echo
+  echo "== split and merge by keyboard =="
+  # A disjoint hour for the GUI to cut: far from the dialog hour (-60..0)
+  # and the quick-adds (~now), so the merge below finds exactly its halves.
+  "$CLI" add -S -240 -E -180 -d "gui split" >/dev/null
+  sleep 2.5  # let the GUI's snapshot pick the entry up (it polls each second)
+  # The new entry is the oldest of four, so move down three rows to it.
+  "$WORK/xtest" "$DISP" key j
+  "$WORK/xtest" "$DISP" key j
+  "$WORK/xtest" "$DISP" key j
+  "$WORK/xtest" "$DISP" key s
+  sleep 1.5
+  shot split.png
+  # The prompt sits above the week total and pushes it down, like the
+  # dialog: the total's band must differ while it is open.
+  magick "$WORK/split.png" -crop "$HERO" +repage "$WORK/hero-split.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-split.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the split prompt painted ($DIFF pixels moved)"
+  else
+    bad "the split prompt painted" "the total's band is unchanged with the prompt open"
+  fi
+  # -200 is safely interior to -240..-180 no matter the seconds of drift.
+  for k in minus 2 0 0; do "$WORK/xtest" "$DISP" key "$k"; done
+  "$WORK/xtest" "$DISP" key Return
+  sleep 2.5
+  check "split added exactly one entry" "5" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "split kept the total" "02:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+  # The second half is now selected; `m` offers its touching first half and
+  # states the (zero) delta, and `m` again executes it.
+  "$WORK/xtest" "$DISP" key m
+  sleep 1.5
+  shot merge.png
+  magick "$WORK/merge.png" -crop "$HERO" +repage "$WORK/hero-merge.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-merge.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the merge confirmation painted ($DIFF pixels moved)"
+  else
+    bad "the merge confirmation painted" "the total's band is unchanged with the confirmation open"
+  fi
+  "$WORK/xtest" "$DISP" key m
+  sleep 2.5
+  check "merge fused the halves back into one entry" "4" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "merge kept the total" "02:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+
+  echo
+  echo "== project naming by keyboard =="
+  # `n` opens the naming prompt (no more invented "Project N"); the panel
+  # sits above the week total and pushes it down, like the other prompts.
+  "$WORK/xtest" "$DISP" key n
+  sleep 1.5
+  shot project.png
+  magick "$WORK/project.png" -crop "$HERO" +repage "$WORK/hero-project.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-project.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the project prompt painted ($DIFF pixels moved)"
+  else
+    bad "the project prompt painted" "the total's band is unchanged with the prompt open"
+  fi
+  # "wonton" is all unbound letters, so a closed prompt would swallow every
+  # keystroke harmlessly -- except none of them open anything either, and the
+  # duplicate check below would fail loudly.
+  for k in w o n t o n; do "$WORK/xtest" "$DISP" key "$k"; done
+  "$WORK/xtest" "$DISP" key Return
+  sleep 2.5
+  out=$("$CLI" project "wonton" 2>&1); contains "the prompt created the typed project" "already exists" "$out"
+  # `r` renames the current project (General, cursor untouched throughout):
+  # the prompt prefills it, so typing appends.
+  "$WORK/xtest" "$DISP" key r
+  sleep 1.5
+  for k in i s t; do "$WORK/xtest" "$DISP" key "$k"; done
+  "$WORK/xtest" "$DISP" key Return
+  sleep 2.5
+  out=$("$CLI" project "Generalist" 2>&1); contains "the prompt renamed to the typed text" "already exists" "$out"
+
+  echo
+  echo "== tab switching by keyboard =="
+  shot tabs-home.png
+  "$WORK/xtest" "$DISP" key Tab
+  sleep 1.5
+  shot tabs-away.png
+  DIFF=$(magick compare -metric AE "$WORK/tabs-home.png" "$WORK/tabs-away.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "tab switched away from home ($DIFF pixels changed)"
+  else
+    bad "tab switched away from home" "the window is pixel-identical after Tab"
+  fi
+  # Two more Tabs cycle Projects -> Export -> Home: the window must come
+  # back pixel-identical, proving the cycle order as well as the keys.
+  "$WORK/xtest" "$DISP" key Tab
+  sleep 1.5
+  "$WORK/xtest" "$DISP" key Tab
+  sleep 1.5
+  shot tabs-back.png
+  DIFF=$(magick compare -metric AE "$WORK/tabs-home.png" "$WORK/tabs-back.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" = "0" ]; then
+    ok "three tabs cycled back to home"
+  else
+    bad "three tabs cycled back to home" "$DIFF pixels differ from the home shot"
   fi
 
   "$WORK/xtest" "$DISP" key q

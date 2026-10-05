@@ -23,14 +23,18 @@ mod interface;
 
 use interface::EntryService;
 use timetrack_core::JsonStore;
-use timetrack_proto::{BUS_NAME, OBJECT_PATH};
+use timetrack_proto::{BUS_NAME, OBJECT_PATH, ServiceError};
 use zbus::interface;
 
 struct EntryIface(EntryService);
 
-/// Convert service errors into a D-Bus error the clients can surface verbatim.
-fn to_dbus_err(e: anyhow::Error) -> zbus::fdo::Error {
-    zbus::fdo::Error::Failed(e.to_string())
+/// Convert a service refusal into a D-Bus error.
+///
+/// The typed error travels as JSON in the `Failed` message body, so the
+/// D-Bus signatures never change and old clients still get a readable
+/// message; new clients decode the body back into `ServiceError`.
+fn to_dbus_err(error: ServiceError) -> zbus::fdo::Error {
+    zbus::fdo::Error::Failed(error.to_failed_body())
 }
 
 type Wire = String;
@@ -122,6 +126,15 @@ impl EntryIface {
             .map_err(to_dbus_err)
     }
 
+    /// Reassign an entry to another project.
+    #[zbus(name = "SetProject")]
+    fn set_project(&self, id: &str, project_id: &str) -> zbus::fdo::Result<Wire> {
+        self.0
+            .set_project(id, project_id)
+            .map(|e| encode(&e))
+            .map_err(to_dbus_err)
+    }
+
     /// Undo exactly the entry a quick-add created.
     #[zbus(name = "UndoQuickAdd")]
     fn undo_quick_add(&self, id: &str) -> zbus::fdo::Result<()> {
@@ -151,6 +164,14 @@ impl EntryIface {
     fn add_project(&self, name: &str) -> zbus::fdo::Result<Wire> {
         self.0
             .add_project(name)
+            .map(|p| encode(&p))
+            .map_err(to_dbus_err)
+    }
+
+    #[zbus(name = "UpdateProject")]
+    fn update_project(&self, id: &str, name: &str, colour: i64) -> zbus::fdo::Result<Wire> {
+        self.0
+            .update_project(id, name, colour)
             .map(|p| encode(&p))
             .map_err(to_dbus_err)
     }
@@ -214,7 +235,7 @@ async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use timetrack_proto::{BUS_NAME, INTERFACE, OBJECT_PATH};
+    use timetrack_proto::{BUS_NAME, INTERFACE, OBJECT_PATH, ServiceError};
 
     #[test]
     fn constants_are_consistent() {
@@ -225,5 +246,24 @@ mod tests {
         // reach a half-removed API.
         assert_eq!(INTERFACE, "org.sequ.timetrack.Entries");
         assert_ne!(INTERFACE, "org.sequ.timetrack.Timer");
+    }
+
+    #[test]
+    fn refusals_cross_the_bus_typed() {
+        // What `to_dbus_err` puts on the wire must decode back in the
+        // client, or the typed errors are fiction. The D-Bus name stays
+        // `Failed` so signatures never change.
+        for error in [
+            ServiceError::Rule(timetrack_core::RuleError::NotQuickAdd("e1".into())),
+            ServiceError::UnknownExportScope("bogus".into()),
+            ServiceError::Storage("could not write /s: denied".into()),
+        ] {
+            match super::to_dbus_err(error.clone()) {
+                zbus::fdo::Error::Failed(body) => {
+                    assert_eq!(ServiceError::from_failed_body(&body), error)
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
     }
 }

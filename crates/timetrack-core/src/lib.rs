@@ -26,10 +26,12 @@
 //! # Timezone
 //!
 //! Local-time arithmetic (which day or week an instant falls in) takes an
-//! explicit UTC offset rather than reading a timezone database. The service
-//! resolves the offset; everything below this line is pure arithmetic on
-//! instants. See PLAN.md -- this is the app's likeliest source of off-by-one
-//! bugs, so it is deliberately concentrated in one place.
+//! explicit [`Tz`] rather than reading a clock or the environment. The service
+//! resolves the zone once from `TZ` (or the system zone); every instant below
+//! this line is then mapped through the offset in force *at that instant*,
+//! so DST transitions bucket correctly. See PLAN.md -- this is the app's
+//! likeliest source of off-by-one bugs, so it is deliberately concentrated
+//! in `tz.rs` plus the thin call sites that pass a `&Tz` through.
 
 pub mod aggregate;
 pub mod export;
@@ -37,9 +39,11 @@ pub mod model;
 pub mod parse;
 pub mod rules;
 pub mod storage;
+pub mod tz;
 
 pub use aggregate::{
-    IsoWeek, Totals, iso_week_of, month_of, month_totals, totals_in_day_range, week_totals,
+    IsoWeek, Totals, all_totals, iso_week_of, month_of, month_totals, totals_in_day_range,
+    week_totals,
 };
 pub use export::{
     CSV_HEADER, ExportScope, entries_in_scope, escape_field, export_csv, format_local_iso8601,
@@ -50,10 +54,12 @@ pub use model::{
 pub use parse::{ParseError, ParseResult, format_local_hm, parse_duration, parse_moment};
 pub use rules::{
     Counter, Ids, QUICK_ADD_MS, RuleError, RuleResult, create_duration, create_entry,
-    create_project, days_exceeding_24h, delete_entry, delete_project, merge_entries,
-    next_project_id, quick_add, set_archived, set_project, set_text, set_times, split_entry,
+    create_project, days_exceeding_24h, delete_entry, delete_project, format_merge_delta,
+    merge_entries, merge_shrink_ms, next_project_id, quick_add, set_archived, set_project,
+    set_text, set_times, split_entry, update_project,
 };
 pub use storage::{JsonStore, StorageError, StorageResult};
+pub use tz::Tz;
 
 /// Format a duration in milliseconds as `HH:MM:SS`.
 ///
