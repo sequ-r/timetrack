@@ -13,6 +13,11 @@
 #   - asserts the week total on screen re-rendered after that click,
 #   - presses `1` and then `q`, asserting quick-add by keyboard and that `q`
 #     quits.
+#   - opens the manual-entry dialog with `a` and asserts it painted,
+#     cancels it with Escape, then reopens it, types a description across
+#     the three fields and saves, asserting the entry reached the service
+#     with the typed text -- and that the window refreshed with no pointer
+#     motion at all, proving the background poll repaints on its own.
 #
 # It reads pixels rather than window properties on purpose: a screenshot is the
 # only evidence that the renderer drew something rather than the window merely
@@ -300,6 +305,50 @@ if [ "$KEYMAP" != yes ]; then
 elif "$WORK/xtest" "$DISP" key 1; then
   sleep 2.5
   check "pressing 1 adds 5 minutes" "00:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+
+  echo
+  echo "== the manual-entry dialog =="
+  # `a` opens the dialog; Escape closes it without adding anything.
+  "$WORK/xtest" "$DISP" key a
+  sleep 1.5
+  shot dialog.png
+  # The dialog panel sits above the week total and pushes it down, so the
+  # total's own band must differ while the dialog is open: pixels proving the
+  # dialog rendered rather than the key merely doing nothing.
+  magick "$WORK/dialog.png" -crop "$HERO" +repage "$WORK/hero-dialog.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-dialog.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the entry dialog painted ($DIFF pixels moved)"
+  else
+    bad "the entry dialog painted" "the total's band is unchanged with the dialog open"
+  fi
+  "$WORK/xtest" "$DISP" key Escape
+  sleep 1
+  check "escape closes the dialog with nothing added" "00:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+  # `a` again, then type across the fields and save. Focus starts on the
+  # description; start/end are prefilled (-60/now), so two Tabs and Return
+  # record an hour ending now.
+  "$WORK/xtest" "$DISP" key a
+  sleep 1
+  for k in s m o k e; do "$WORK/xtest" "$DISP" key "$k"; done
+  "$WORK/xtest" "$DISP" key Tab
+  "$WORK/xtest" "$DISP" key Tab
+  "$WORK/xtest" "$DISP" key Return
+  sleep 2.5
+  check "the dialog added an hour" "01:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+  check "it carries the typed description" "1" "$("$CLI" list | grep -c smoke)"
+  # No pointer motion since the keyboard section began, so a repainted total
+  # proves the background poll refreshes the window on its own rather than
+  # waiting for the next hover to happen along.
+  shot saved.png
+  magick "$WORK/saved.png" -crop "$HERO" +repage "$WORK/hero-saved.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/hero-after.png" "$WORK/hero-saved.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the window refreshed without any pointer motion ($DIFF pixels changed)"
+  else
+    bad "the window refreshed without any pointer motion" "the total's band is unchanged after the save"
+  fi
+
   "$WORK/xtest" "$DISP" key q
   QUIT=no
   for _ in $(seq 1 30); do kill -0 "$GUI_PID" 2>/dev/null || { QUIT=yes; break; }; sleep 0.1; done

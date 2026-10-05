@@ -213,6 +213,12 @@ impl EntryService {
         Ok(protocol::entry_to_view(&e))
     }
 
+    /// Edit an entry's description (the manual-entry dialog's text field).
+    pub fn set_text(&self, id: &str, description: &str) -> anyhow::Result<EntryView> {
+        let e = self.mutate(|s, _ids, _| core::set_text(s, id, Some(description), None))?;
+        Ok(protocol::entry_to_view(&e))
+    }
+
     /// Undo exactly the entry a quick-add created.
     ///
     /// Refuses anything not created by quick-add, so a client's "undo" can
@@ -719,5 +725,24 @@ mod tests {
     fn export_rejects_an_unknown_scope() {
         let (svc, _) = service("export-scope");
         assert!(svc.export_csv("everything").is_err());
+    }
+
+    // --- description editing ---
+
+    #[test]
+    fn description_can_be_rewritten() {
+        let (svc, _) = service("settext");
+        let p = project(&svc);
+        let now = now_ms();
+        let e = svc.add(&p.id, "typo", now - 3_600_000, now).unwrap();
+        let edited = svc.set_text(&e.id, "review").unwrap();
+        assert_eq!(edited.description, "review");
+        assert_eq!(svc.snapshot().entries[0].description, "review");
+    }
+
+    #[test]
+    fn editing_an_unknown_entry_is_an_error() {
+        let (svc, _) = service("settext-unknown");
+        assert!(svc.set_text("nope", "x").is_err());
     }
 }

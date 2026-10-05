@@ -257,6 +257,11 @@ impl Client {
         self.call1("SetTimes", &(id, started_at, ended_at)).await
     }
 
+    /// Edit an entry's description.
+    pub async fn set_text(&self, id: &str, description: &str) -> anyhow::Result<EntryView> {
+        self.call1("SetText", &(id, description)).await
+    }
+
     /// Undo exactly the entry a quick-add created.
     pub async fn undo_quick_add(&self, id: &str) -> anyhow::Result<()> {
         self.proxy.call_method("UndoQuickAdd", &(id,)).await?;

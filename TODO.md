@@ -11,7 +11,7 @@ survey (2026-10-05). Ordered by value. Check off as done.
   - GUI: file picker + write. CLI: `timetrack export --week/--month --out file`.
   - Accept: e2e writes a file with the spec'd columns.
 
-- [ ] **2. GUI manual-entry dialog (§5 methods 1+2, one form)**
+- [x] **2. GUI manual-entry dialog (§5 methods 1+2, one form)** — DONE 2026-10-05: `a` new (end=`now` prefilled) / `e` edit (empty keeps endpoint, rewritten text via new `SetText` D-Bus method); spellings shared with CLI in `core/src/parse.rs` (+`now` keyword, `format_local_hm`); 13 core + 10 GUI tests; gui-smoke 15 checks incl. dialog paint/cancel/save + no-motion refresh. Also fixed: `Entity::update` never repaints without `cx.notify()`, so every mutation site + conditional poll-loop notify; one poll loop (was spawned per frame).
   - Scope: `timetrack-gui/src/app.rs:391` (key handling), shared validation in `timetrack-core/src/rules.rs`.
   - Fields: start/end, "end = now" default. Rules: no end-before-start, overlap allowed.
   - Accept: create + shorten an entry without the CLI.

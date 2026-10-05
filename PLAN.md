@@ -105,12 +105,24 @@ Built:
 
 Not built:
 
-- The manual-entry dialog (§5 methods 1 and 2, which share one form). There is
-  no way to type an interval in the GUI at all yet; time can only be quick-added.
 - Split and merge (§8). On the service, unreachable from the UI.
 - A text field for naming a project, so "New project" invents `Project 1`.
 - Tab switching by keyboard, and the merge confirmation that must warn the total
   will shrink.
+
+Built since:
+
+- The manual-entry dialog (§5 methods 1 and 2, one form). `a` opens a new
+  interval prefilled with end = now; `e` adjusts the selected entry, with
+  empty times keeping the current endpoints (the dialog form of `shorten`)
+  and rewritten text saved via a new `SetText` D-Bus method. Spellings are
+  shared with the CLI in `core/src/parse.rs`.
+- View refresh: `Entity::update` never repaints on its own in gpui — only
+  `cx.notify()` schedules a frame — so the window previously repainted
+  solely when pointer motion happened to cause a frame, and typed text or
+  fresh snapshots sat invisible until the next hover. Every mutation site
+  now notifies, and the poll loop notifies only when `drain()` reports a
+  real change rather than repainting several times a second.
 
 The keyboard needs one non-obvious thing and it is easy to get wrong: gpui
 dispatches key events along the ancestor path of the **focused** node, so a root
@@ -185,9 +197,9 @@ or `45s`.
 1. **CSV export** (§10). **Done 2026-10-05:** `core/src/export.rs`, service
    `ExportCsv`, CLI `timetrack export --scope week|month|all [--out FILE]`,
    GUI Export week/month/all buttons. E2e covers header, rows, bad scope.
-2. **The manual-entry dialog** in the GUI (§5 methods 1 and 2). Right now the
-   GUI can only quick-add, so an over-estimated entry has no way to be
-   corrected except the CLI.
+2. **The manual-entry dialog** in the GUI (§5 methods 1 and 2). **Done
+   2026-10-05:** `a` / `e`, shared spellings in `core/src/parse.rs`, new
+   `SetText` D-Bus method; the `notify` refresh fix from the same increment.
 3. **A real timezone database lookup per instant.** §9's local-time bucketing
    assumes this. A named `TZ` currently falls back to UTC, and a DST-observing
    zone can mis-bucket near a week boundary. This is the likeliest remaining

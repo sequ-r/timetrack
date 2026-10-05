@@ -424,85 +424,19 @@ fn now_ms() -> i64 {
 ///
 /// A leading `-` is deliberately allowed through clap (`allow_hyphen_values`)
 /// because `-90` is a perfectly ordinary thing to type for "90 minutes ago".
+///
+/// The spellings live in `timetrack_core::parse_moment` so the CLI and the
+/// GUI cannot disagree; this is a thin wrapper that supplies the clock.
 fn parse_when(text: &str, what: &str, local_offset_ms: i64) -> Result<i64> {
-    let text = text.trim();
-    anyhow::ensure!(!text.is_empty(), "{what} cannot be empty");
-
-    if let Some(rest) = text.strip_prefix('-') {
-        let mins: i64 = rest
-            .parse()
-            .map_err(|_| anyhow::anyhow!("{what}: '{text}' is not a number of minutes ago"))?;
-        return Ok(now_ms() - mins * 60_000);
-    }
-    if let Ok(mins) = text.parse::<i64>() {
-        // A bare positive number reads as "minutes from now", which is the
-        // only sensible reading of `timetrack add -S 30`.
-        return Ok(now_ms() + mins * 60_000);
-    }
-
-    let (h, m) = text
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("{what}: '{text}' is neither -90, 90 nor HH:MM"))?;
-    let h: i64 = h
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{what}: '{text}' has a bad hour"))?;
-    let m: i64 = m
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{what}: '{text}' has a bad minute"))?;
-    anyhow::ensure!(
-        (0..24).contains(&h) && (0..60).contains(&m),
-        "{what}: '{text}' is not a real time of day"
-    );
-
-    // `HH:MM` means today in local time, so anchor on local midnight. The
-    // service owns the timezone and reports its offset in the snapshot; using
-    // UTC midnight here instead put entries hours out for non-UTC zones, an
-    // error that was visible only as a wrong day bucket after the fact.
-    let day_ms = 86_400_000;
-    let local_midnight = (now_ms() + local_offset_ms).div_euclid(day_ms) * day_ms - local_offset_ms;
-    Ok(local_midnight + (h * 3_600_000 + m * 60_000))
+    timetrack_core::parse_moment(text, what, now_ms(), local_offset_ms)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Parse a duration like `90m`, `1h30m` or `45s`, in milliseconds.
+///
+/// Shared with the GUI via `timetrack_core::parse_duration`; see above.
 fn parse_duration(text: &str) -> Result<i64> {
-    let text = text.trim().to_ascii_lowercase();
-    anyhow::ensure!(!text.is_empty(), "duration cannot be empty");
-
-    let mut total: i64 = 0;
-    let mut number = String::new();
-    let mut saw_unit = false;
-
-    for ch in text.chars() {
-        if ch.is_ascii_digit() {
-            number.push(ch);
-            continue;
-        }
-        let n: i64 = number
-            .parse()
-            .map_err(|_| anyhow::anyhow!("'{text}': expected a number before '{ch}'"))?;
-        number.clear();
-        total += match ch {
-            'h' => n * 3_600_000,
-            'm' => n * 60_000,
-            's' => n * 1_000,
-            _ => anyhow::bail!("'{text}': unknown unit '{ch}' (use h, m or s)"),
-        };
-        saw_unit = true;
-    }
-
-    // A trailing number with no unit: read it as minutes, which is what a bare
-    // `timetrack duration -f 30` almost certainly means.
-    if !number.is_empty() {
-        let n: i64 = number
-            .parse()
-            .map_err(|_| anyhow::anyhow!("'{text}': trailing number is not a number"))?;
-        total += n * 60_000;
-        saw_unit = true;
-    }
-
-    anyhow::ensure!(saw_unit, "'{text}' has no unit (try 30m, 1h30m or 45s)");
-    anyhow::ensure!(total > 0, "'{text}' must be a positive duration");
-    Ok(total)
+    timetrack_core::parse_duration(text).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]

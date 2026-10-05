@@ -113,6 +113,15 @@ impl EntryIface {
             .map_err(to_dbus_err)
     }
 
+    /// Edit an entry's description.
+    #[zbus(name = "SetText")]
+    fn set_text(&self, id: &str, description: &str) -> zbus::fdo::Result<Wire> {
+        self.0
+            .set_text(id, description)
+            .map(|e| encode(&e))
+            .map_err(to_dbus_err)
+    }
+
     /// Undo exactly the entry a quick-add created.
     #[zbus(name = "UndoQuickAdd")]
     fn undo_quick_add(&self, id: &str) -> zbus::fdo::Result<()> {

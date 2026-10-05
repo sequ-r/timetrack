@@ -294,7 +294,7 @@ check "interface is the new one" "org.sequ.timetrack.Entries" \
 printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
   && bad "stopwatch methods are gone" "Start/Stop/Cancel still exposed" \
   || ok "stopwatch methods are gone"
-for m in Add AddDuration AddDurationEnding QuickAdd SetTimes UndoQuickAdd DeleteEntry Split Merge AddProject SetArchived ExportCsv; do
+for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText UndoQuickAdd DeleteEntry Split Merge AddProject SetArchived ExportCsv; do
   printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
 done
 

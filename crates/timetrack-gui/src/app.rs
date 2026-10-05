@@ -66,6 +66,21 @@ enum Action {
     ArchiveProject(String),
     /// Create a project.
     AddProject(String),
+    /// Method 1: an explicit start and end (the manual-entry dialog).
+    AddEntry {
+        project: String,
+        description: String,
+        started_at: i64,
+        ended_at: i64,
+    },
+    /// Move an entry's endpoints (the dialog's edit mode). Never deletes.
+    SetTimes {
+        id: String,
+        started_at: i64,
+        ended_at: i64,
+    },
+    /// Edit an entry's description (the dialog's edit mode).
+    SetText { id: String, description: String },
     /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
     /// the CSV over D-Bus and writes it to `path`.
     ExportCsv { scope: String, path: String },
@@ -169,6 +184,45 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                     .map_err(|e| e.to_string()),
                             );
                         }
+                        Ok(Action::AddEntry {
+                            project,
+                            description,
+                            started_at,
+                            ended_at,
+                        }) => {
+                            report(
+                                &tx,
+                                client
+                                    .add(&project, &description, started_at, ended_at)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string()),
+                            );
+                        }
+                        Ok(Action::SetTimes {
+                            id,
+                            started_at,
+                            ended_at,
+                        }) => {
+                            report(
+                                &tx,
+                                client
+                                    .set_times(&id, started_at, ended_at)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string()),
+                            );
+                        }
+                        Ok(Action::SetText { id, description }) => {
+                            report(
+                                &tx,
+                                client
+                                    .set_text(&id, &description)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string()),
+                            );
+                        }
                         Ok(Action::ExportCsv { scope, path }) => {
                             let outcome = match client.export_csv(&scope).await {
                                 Ok(csv) => match std::fs::write(&path, &csv) {
@@ -244,6 +298,259 @@ fn report(tx: &Sender<Msg>, outcome: std::result::Result<(), String>) {
     }
 }
 
+/// The current time, in milliseconds since the epoch.
+///
+/// The GUI needs its own clock reading only to parse what the user typed
+/// ("-90", "now", "09:30" are relative to here), exactly like the CLI does.
+/// The service re-validates the absolute instants, so a skew between the two
+/// clocks can mistime an entry but never store an invalid one.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Which field of the entry dialog receives keystrokes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogField {
+    Description,
+    Start,
+    End,
+}
+
+impl DialogField {
+    fn next(self) -> Self {
+        match self {
+            DialogField::Description => DialogField::Start,
+            DialogField::Start => DialogField::End,
+            DialogField::End => DialogField::Description,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            DialogField::Description => DialogField::End,
+            DialogField::Start => DialogField::Description,
+            DialogField::End => DialogField::Start,
+        }
+    }
+}
+
+/// The manual-entry dialog (REQUIREMENTS §5 methods 1 and 2, one form).
+///
+/// Method 2 is method 1 with "end = now" pre-filled, so a new dialog starts
+/// with `start = "-60"`, `end = "now"` and the user edits from there. In edit
+/// mode the times start empty, meaning "keep the current endpoint" — the
+/// `keep_*` labels say what that is — which is the dialog form of `shorten`:
+/// unspecified endpoints are left alone and the entry is always kept.
+///
+/// Plain keystroke editing (type to append, backspace to delete) rather than
+/// a toolkit text field: the window already routes every key through one
+/// focused root, and three small fields do not need IME or cursor movement.
+/// Everything here is pure state over strings, so the whole interaction is
+/// unit-testable without a window.
+#[derive(Debug, Clone)]
+struct EntryDialog {
+    /// `None` for a new entry; `Some(id)` when editing that entry.
+    edit_id: Option<String>,
+    /// The project a new entry goes to, fixed when the dialog opens.
+    project_id: String,
+    project_name: String,
+    description: String,
+    start: String,
+    end: String,
+    /// Edit mode only: the current endpoints, for the "keep" fallback and
+    /// the labels. New mode leaves these at zero and never reads them.
+    orig_start: i64,
+    orig_end: i64,
+    orig_description: String,
+    field: DialogField,
+    error: Option<String>,
+}
+
+impl EntryDialog {
+    /// A new-entry dialog for `project`, with "end = now" pre-filled.
+    fn new(project_id: String, project_name: String) -> Self {
+        EntryDialog {
+            edit_id: None,
+            project_id,
+            project_name,
+            description: String::new(),
+            start: "-60".to_string(),
+            end: "now".to_string(),
+            orig_start: 0,
+            orig_end: 0,
+            orig_description: String::new(),
+            field: DialogField::Description,
+            error: None,
+        }
+    }
+
+    /// An edit dialog for the entry with these current values. Times start
+    /// empty, meaning "keep the current endpoint".
+    fn edit(
+        id: String,
+        project_name: String,
+        description: String,
+        started_at: i64,
+        ended_at: i64,
+    ) -> Self {
+        EntryDialog {
+            edit_id: Some(id),
+            project_id: String::new(),
+            project_name,
+            description: description.clone(),
+            start: String::new(),
+            end: String::new(),
+            orig_start: started_at,
+            orig_end: ended_at,
+            orig_description: description,
+            field: DialogField::Description,
+            error: None,
+        }
+    }
+
+    /// Label for the start row: the hint in edit mode says what empty keeps.
+    fn start_hint(&self, offset_ms: i64) -> String {
+        match &self.edit_id {
+            None => "(-90, 90, now, HH:MM)".to_string(),
+            Some(_) => format!(
+                "(empty keeps {})",
+                timetrack_core::format_local_hm(self.orig_start, offset_ms)
+            ),
+        }
+    }
+
+    /// Label for the end row, as above.
+    fn end_hint(&self, offset_ms: i64) -> String {
+        match &self.edit_id {
+            None => "(-90, 90, now, HH:MM)".to_string(),
+            Some(_) => format!(
+                "(empty keeps {})",
+                timetrack_core::format_local_hm(self.orig_end, offset_ms)
+            ),
+        }
+    }
+
+    /// Append typed text to the focused field. Any edit clears a stale error:
+    /// the message described the text as it was, not as it is now.
+    fn type_text(&mut self, ch: &str) {
+        let target = match self.field {
+            DialogField::Description => &mut self.description,
+            DialogField::Start => &mut self.start,
+            DialogField::End => &mut self.end,
+        };
+        target.push_str(ch);
+        self.error = None;
+    }
+
+    /// Delete the last character of the focused field.
+    fn backspace(&mut self) {
+        let target = match self.field {
+            DialogField::Description => &mut self.description,
+            DialogField::Start => &mut self.start,
+            DialogField::End => &mut self.end,
+        };
+        target.pop();
+        self.error = None;
+    }
+}
+
+/// What saving a dialog means, resolved purely from its strings.
+///
+/// Pure over the dialog plus an explicit clock and offset, so the whole
+/// save path — parsing, the end-before-start refusal, the keep-fallback — is
+/// testable without a view or a service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SaveOutcome {
+    /// Create `[started_at, ended_at]` on `project_id` with `description`.
+    Create {
+        project_id: String,
+        description: String,
+        started_at: i64,
+        ended_at: i64,
+    },
+    /// Move `id`'s endpoints, and rewrite the description when present.
+    Update {
+        id: String,
+        started_at: i64,
+        ended_at: i64,
+        description: Option<String>,
+    },
+    /// Nothing changed; close without calling the service.
+    NoChange,
+    /// Keep the dialog open and show this instead.
+    Invalid(String),
+}
+
+fn resolve_save(dlg: &EntryDialog, now: i64, offset_ms: i64) -> SaveOutcome {
+    match &dlg.edit_id {
+        None => {
+            if dlg.start.trim().is_empty() {
+                return SaveOutcome::Invalid("start cannot be empty".to_string());
+            }
+            if dlg.end.trim().is_empty() {
+                return SaveOutcome::Invalid("end cannot be empty".to_string());
+            }
+            let started_at = match timetrack_core::parse_moment(&dlg.start, "start", now, offset_ms)
+            {
+                Ok(t) => t,
+                Err(e) => return SaveOutcome::Invalid(e.to_string()),
+            };
+            let ended_at = match timetrack_core::parse_moment(&dlg.end, "end", now, offset_ms) {
+                Ok(t) => t,
+                Err(e) => return SaveOutcome::Invalid(e.to_string()),
+            };
+            if ended_at < started_at {
+                return SaveOutcome::Invalid(
+                    timetrack_core::RuleError::NegativeDuration.to_string(),
+                );
+            }
+            SaveOutcome::Create {
+                project_id: dlg.project_id.clone(),
+                description: dlg.description.clone(),
+                started_at,
+                ended_at,
+            }
+        }
+        Some(id) => {
+            let started_at = if dlg.start.trim().is_empty() {
+                dlg.orig_start
+            } else {
+                match timetrack_core::parse_moment(&dlg.start, "start", now, offset_ms) {
+                    Ok(t) => t,
+                    Err(e) => return SaveOutcome::Invalid(e.to_string()),
+                }
+            };
+            let ended_at = if dlg.end.trim().is_empty() {
+                dlg.orig_end
+            } else {
+                match timetrack_core::parse_moment(&dlg.end, "end", now, offset_ms) {
+                    Ok(t) => t,
+                    Err(e) => return SaveOutcome::Invalid(e.to_string()),
+                }
+            };
+            if ended_at < started_at {
+                return SaveOutcome::Invalid(
+                    timetrack_core::RuleError::NegativeDuration.to_string(),
+                );
+            }
+            let description =
+                (dlg.description != dlg.orig_description).then(|| dlg.description.clone());
+            if started_at == dlg.orig_start && ended_at == dlg.orig_end && description.is_none() {
+                return SaveOutcome::NoChange;
+            }
+            SaveOutcome::Update {
+                id: id.clone(),
+                started_at,
+                ended_at,
+                description,
+            }
+        }
+    }
+}
+
 /// The newest quick-add, which is what undo removes.
 ///
 /// A free function over the snapshot rather than a method on the view, so the
@@ -303,6 +610,9 @@ pub struct TimetrackView {
     /// frame would steal focus back from anything focusable the user reaches
     /// later, which would break Tab navigation.
     focused_once: bool,
+    /// The manual-entry dialog, when open. Modal: while this is `Some` every
+    /// keystroke goes to the dialog and the app shortcuts are suspended.
+    dialog: Option<EntryDialog>,
 }
 
 /// Where a GUI export lands by default.
@@ -329,6 +639,7 @@ impl TimetrackView {
             entity: None,
             focus: cx.focus_handle(),
             focused_once: false,
+            dialog: None,
         };
         view.schedule_poll(cx);
         view
@@ -346,7 +657,17 @@ impl TimetrackView {
                 cx.background_executor()
                     .timer(Duration::from_millis(300))
                     .await;
-                if this.update(cx, |view, _cx| view.drain()).is_err() {
+                // `update` alone does not re-render: gpui only paints after
+                // `notify`, so a drained snapshot with no notify would sit in
+                // state until the next pointer motion happened to repaint.
+                if this
+                    .update(cx, |view, cx| {
+                        if view.drain() {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -362,11 +683,28 @@ impl TimetrackView {
 
     /// Fold every queued message into one refresh. Several may be pending and
     /// only the newest snapshot matters.
-    fn drain(&mut self) {
+    ///
+    /// Returns whether anything visible changed, so the background poll can
+    /// skip the re-render when the service had nothing new to say instead of
+    /// repainting several times a second forever.
+    fn drain(&mut self) -> bool {
+        let mut changed = false;
+        // Set the status only when the text differs: the service thread
+        // resends nothing, but snapshots arrive every second and must not
+        // count as change on their own.
+        let set_status = |status: &mut Option<String>, text: String, changed: &mut bool| {
+            if status.as_deref() != Some(text.as_str()) {
+                *status = Some(text);
+                *changed = true;
+            }
+        };
         loop {
             match self.rx.try_recv() {
                 Ok(Msg::Snapshot(s)) => {
-                    self.snapshot = *s;
+                    if *s != self.snapshot {
+                        self.snapshot = *s;
+                        changed = true;
+                    }
                     // A routine snapshot must not wipe feedback from the last
                     // action: snapshots arrive every second, so clearing here
                     // made error reports from the service thread unreadable.
@@ -374,35 +712,50 @@ impl TimetrackView {
                     // recovery; action errors survive until the next one.
                     if self.service_missing() {
                         self.status = None;
+                        changed = true;
                     }
                     // The lists can shrink under the cursor when something is
                     // removed, which would otherwise index out of bounds.
                     let entries = self.snapshot.entries.len();
                     if self.selected >= entries {
-                        self.selected = entries.saturating_sub(1);
+                        let clamped = entries.saturating_sub(1);
+                        if clamped != self.selected {
+                            self.selected = clamped;
+                            changed = true;
+                        }
                     }
                     let projects = self.active_projects().len();
                     if self.project_cursor >= projects {
-                        self.project_cursor = projects.saturating_sub(1);
+                        let clamped = projects.saturating_sub(1);
+                        if clamped != self.project_cursor {
+                            self.project_cursor = clamped;
+                            changed = true;
+                        }
                     }
                 }
-                Ok(Msg::Error(e)) => self.status = Some(e),
-                Ok(Msg::Status(note)) => self.status = Some(note),
+                Ok(Msg::Error(e)) => set_status(&mut self.status, e, &mut changed),
+                Ok(Msg::Status(note)) => set_status(&mut self.status, note, &mut changed),
                 Ok(Msg::ActionOk) => {
                     // A success dismisses the previous error -- but only one
                     // the actions own. The "service is not running" notice
                     // belongs to the connection, not to any action.
-                    if !self.service_missing() {
+                    if !self.service_missing() && self.status.is_some() {
                         self.status = None;
+                        changed = true;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.status = Some("the service thread stopped".into());
+                    set_status(
+                        &mut self.status,
+                        "the service thread stopped".to_string(),
+                        &mut changed,
+                    );
                     break;
                 }
             }
         }
+        changed
     }
 
     fn send(&self, a: Action) {
@@ -426,6 +779,11 @@ impl TimetrackView {
 
     /// Handle a key press. Returns false when the app should quit.
     fn on_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        // Modal: while the entry dialog is open every keystroke belongs to
+        // it, including the letters the app shortcuts are bound to.
+        if self.dialog.is_some() {
+            return self.on_dialog_key(ev);
+        }
         let Some(ch) = ev.keystroke.key_char.as_deref() else {
             return true;
         };
@@ -437,6 +795,11 @@ impl TimetrackView {
             "2" => self.quick_add(QUICK_ADD_MS[1]),
             "3" => self.quick_add(QUICK_ADD_MS[2]),
             "4" => self.quick_add(QUICK_ADD_MS[3]),
+
+            // The manual-entry dialog (REQUIREMENTS §5): `a` for a new
+            // interval, `e` to adjust the selected entry.
+            "a" => self.open_new_dialog(),
+            "e" => self.open_edit_dialog(),
 
             // Undo removes only the quick-added entry; delete is explicit.
             "u" => match newest_quick_add(&self.snapshot) {
@@ -466,6 +829,140 @@ impl TimetrackView {
             _ => {}
         }
         true
+    }
+
+    /// Handle a key press while the entry dialog is open. Always returns true:
+    /// `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_dialog_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.dialog = None;
+            }
+            "enter" => self.dialog_save(),
+            "tab" => {
+                if let Some(dlg) = self.dialog.as_mut() {
+                    if ev.keystroke.modifiers.shift {
+                        dlg.field = dlg.field.prev();
+                    } else {
+                        dlg.field = dlg.field.next();
+                    }
+                }
+            }
+            "backspace" => {
+                if let Some(dlg) = self.dialog.as_mut() {
+                    dlg.backspace();
+                }
+            }
+            _ => {
+                // Printable text, and only that: with control, alt or the
+                // platform modifier held the keystroke is a shortcut, not
+                // input, and key_char of a special key must not leak in.
+                let m = &ev.keystroke.modifiers;
+                if !m.control && !m.alt && !m.platform {
+                    if let Some(ch) = ev.keystroke.key_char.as_deref() {
+                        if let Some(dlg) = self.dialog.as_mut() {
+                            dlg.type_text(ch);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Open a new-entry dialog for the current project.
+    fn open_new_dialog(&mut self) {
+        let current = self
+            .current_project()
+            .map(|p| (p.id.clone(), p.name.clone()));
+        match current {
+            Some((id, name)) => {
+                self.status = None;
+                self.dialog = Some(EntryDialog::new(id, name));
+            }
+            None => {
+                self.status =
+                    Some("create a project on the Projects tab before adding time".into());
+            }
+        }
+    }
+
+    /// Open an edit dialog for the selected entry: new endpoints, or new
+    /// text, or both. Empty times keep the current endpoints.
+    fn open_edit_dialog(&mut self) {
+        match self.snapshot.entries.get(self.selected).cloned() {
+            Some(e) => {
+                let project = self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|p| p.id == e.project_id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| e.project_id.clone());
+                self.status = None;
+                self.dialog = Some(EntryDialog::edit(
+                    e.id,
+                    project,
+                    e.description,
+                    e.started_at,
+                    e.ended_at,
+                ));
+            }
+            None => self.status = Some("nothing to edit".into()),
+        }
+    }
+
+    /// Validate the dialog and send the action(s). Stays open with an error
+    /// on invalid input; closes on success or when nothing changed.
+    fn dialog_save(&mut self) {
+        let Some(dlg) = self.dialog.as_ref() else {
+            return;
+        };
+        let (orig_start, orig_end) = (dlg.orig_start, dlg.orig_end);
+        match resolve_save(dlg, now_ms(), self.snapshot.local_offset_ms) {
+            SaveOutcome::Invalid(msg) => {
+                if let Some(dlg) = self.dialog.as_mut() {
+                    dlg.error = Some(msg);
+                }
+            }
+            SaveOutcome::NoChange => {
+                self.dialog = None;
+            }
+            SaveOutcome::Create {
+                project_id,
+                description,
+                started_at,
+                ended_at,
+            } => {
+                self.send(Action::AddEntry {
+                    project: project_id,
+                    description,
+                    started_at,
+                    ended_at,
+                });
+                self.dialog = None;
+            }
+            SaveOutcome::Update {
+                id,
+                started_at,
+                ended_at,
+                description,
+            } => {
+                // Only call for what actually changed: an identical SetTimes
+                // would persist and acknowledge a no-op write.
+                if started_at != orig_start || ended_at != orig_end {
+                    self.send(Action::SetTimes {
+                        id: id.clone(),
+                        started_at,
+                        ended_at,
+                    });
+                }
+                if let Some(description) = description {
+                    self.send(Action::SetText { id, description });
+                }
+                self.dialog = None;
+            }
+        }
     }
 
     /// Add one of the quick-add buckets to the selected project.
@@ -499,15 +996,22 @@ impl TimetrackView {
 
     fn footer(&self) -> String {
         self.status.clone().unwrap_or_else(|| {
-            "1-4 quick add · u undo · d delete · j/k move · h/l project · q quit".to_string()
+            if self.dialog.is_some() {
+                "type to edit · tab next field · enter save · esc cancel".to_string()
+            } else {
+                "1-4 quick add · a add · e edit · u undo · d delete · j/k move · h/l project · q quit"
+                    .to_string()
+            }
         })
     }
 }
 
 impl Render for TimetrackView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drain here as well as in the poll loop: a frame already being built
+        // for an event should pick up any snapshot waiting in the channel
+        // rather than painting one frame stale.
         self.drain();
-        self.schedule_poll(cx);
 
         // Focus the root on the first frame. `FocusHandle::focus` needs a
         // `&mut Window`, which `new` does not have, and doing it here is
@@ -538,9 +1042,14 @@ impl Render for TimetrackView {
             .bg(rgb(0x11111b))
             .text_color(rgb(0xe6e6f0))
             .on_key_down(move |ev, _window, cx| {
+                // `update` alone never repaints: it only runs the closure,
+                // and a frame is scheduled solely by `notify`. Without it a
+                // keystroke changes state that no frame ever shows.
                 this.update(cx, |view, cx| {
                     if !view.on_key(ev) {
                         cx.quit();
+                    } else {
+                        cx.notify();
                     }
                 });
             })
@@ -582,7 +1091,10 @@ impl TimetrackView {
                         let entity = self.entity.clone();
                         el.on_click(move |_ev, _window, cx| {
                             if let Some(entity) = entity.clone() {
-                                entity.update(cx, |view, _cx| view.tab = tab);
+                                entity.update(cx, |view, cx| {
+                                    view.tab = tab;
+                                    cx.notify();
+                                });
                             }
                         })
                     }),
@@ -646,11 +1158,106 @@ impl TimetrackView {
             .flex_1()
             .flex_col()
             .overflow_y_scroll()
+            .when_some(self.dialog.clone(), |el, dlg| {
+                el.child(self.render_entry_dialog(&dlg))
+            })
             .child(hero)
             .child(warning)
             .child(self.render_quick_add())
             .child(self.render_week_by_project())
             .child(self.render_entries())
+    }
+
+    /// The manual-entry dialog (REQUIREMENTS §5 methods 1 and 2, one form).
+    ///
+    /// A bordered panel at the top of Home, above the week total: while it is
+    /// open it owns the keyboard (see `on_dialog_key`), so it sits where the
+    /// eye already is rather than competing from below. Keyboard-driven like
+    /// everything else here — no mouse targets, no toolkit text field.
+    fn render_entry_dialog(&self, dlg: &EntryDialog) -> impl IntoElement {
+        let off = self.snapshot.local_offset_ms;
+        let title = match &dlg.edit_id {
+            None => format!("NEW ENTRY → {}", dlg.project_name),
+            Some(id) => format!("EDIT ENTRY {id} · {}", dlg.project_name),
+        };
+        let field_row = |label: &str, value: &str, hint: &str, focused: bool| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_1()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .text_color(if focused {
+                            rgb(0xffffff)
+                        } else {
+                            rgb(0x7a7a90)
+                        })
+                        .child(format!("{} {label}", if focused { ">" } else { " " })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(if focused {
+                            rgba(0x2a2a3aff)
+                        } else {
+                            rgba(0x00000000)
+                        })
+                        .text_color(rgb(0xe6e6f0))
+                        .child(format!("{value}{}", if focused { "_" } else { "" })),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x6a6a80))
+                        .child(hint.to_string()),
+                )
+        };
+
+        let mut panel = div()
+            .mx_6()
+            .mt_3()
+            .mb_1()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1a1a26))
+            .child(div().text_color(rgb(0x7fd3ff)).child(title))
+            .child(field_row(
+                "what",
+                &dlg.description,
+                "optional note",
+                dlg.field == DialogField::Description,
+            ))
+            .child(field_row(
+                "start",
+                &dlg.start,
+                &dlg.start_hint(off),
+                dlg.field == DialogField::Start,
+            ))
+            .child(field_row(
+                "end",
+                &dlg.end,
+                &dlg.end_hint(off),
+                dlg.field == DialogField::End,
+            ))
+            .child(
+                div()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("type to edit · tab next field · enter save · esc cancel"),
+            );
+        if let Some(err) = &dlg.error {
+            panel = panel.child(div().pt_1().text_color(rgb(0xd29922)).child(err.clone()));
+        }
+        panel
     }
 
     /// The 5/15/30/60 row, naming the project it will go to.
@@ -684,8 +1291,9 @@ impl TimetrackView {
                         el.on_click(move |_ev, _window, cx| {
                             let project = target.clone().expect("checked above");
                             if let Some(entity) = entity.clone() {
-                                entity.update(cx, |view, _cx| {
-                                    view.send(Action::QuickAdd { project, ms })
+                                entity.update(cx, |view, cx| {
+                                    view.send(Action::QuickAdd { project, ms });
+                                    cx.notify();
                                 });
                             }
                         })
@@ -851,13 +1459,14 @@ impl TimetrackView {
                 .child("New project")
                 .when_some(entity, |this, entity| {
                     this.on_click(move |_ev, _window, cx| {
-                        entity.update(cx, |view, _cx| {
+                        entity.update(cx, |view, cx| {
                             // A typed name needs a text field, which this tab
                             // does not have yet. A dated default the user can
                             // rename is a working button rather than a dead
                             // one, and it is removed once the field lands.
                             let name = format!("Project {}", view.snapshot.projects.len() + 1);
                             view.send(Action::AddProject(name));
+                            cx.notify();
                         });
                     })
                 })
@@ -952,8 +1561,9 @@ impl TimetrackView {
                                 .child("Archive")
                                 .on_click(move |_ev, _window, cx| {
                                     if let Some(entity) = entity.clone() {
-                                        entity.update(cx, |view, _cx| {
-                                            view.send(Action::ArchiveProject(id.clone()))
+                                        entity.update(cx, |view, cx| {
+                                            view.send(Action::ArchiveProject(id.clone()));
+                                            cx.notify();
                                         });
                                     }
                                 }),
@@ -1041,8 +1651,9 @@ impl TimetrackView {
                             el.on_click(move |_ev, _window, cx| {
                                 let scope = scope.clone();
                                 let path = path.clone();
-                                entity.update(cx, |view, _cx| {
+                                entity.update(cx, |view, cx| {
                                     view.send(Action::ExportCsv { scope, path });
+                                    cx.notify();
                                 });
                             })
                         }),
@@ -1126,7 +1737,10 @@ impl TimetrackView {
                         .bg(rgb(0x2ea043))
                         .text_color(rgb(0xffffff))
                         .on_click(move |_ev, _window, cx| {
-                            this.update(cx, |view, _cx| view.try_start_service());
+                            this.update(cx, |view, cx| {
+                                view.try_start_service();
+                                cx.notify();
+                            });
                         })
                         .child("Start the service"),
                 )
@@ -1221,5 +1835,144 @@ mod tests {
         let mut snap = Snapshot::default();
         snap.entries = vec![entry("e1", EntrySource::Manual, 0)];
         assert_eq!(newest_quick_add(&snap), None);
+    }
+
+    // --- the manual-entry dialog ---
+
+    fn new_dialog() -> EntryDialog {
+        EntryDialog::new("p1".into(), "Work".into())
+    }
+
+    #[test]
+    fn a_new_dialog_prefills_end_at_now() {
+        // Method 2 is method 1 with "end = now" pre-filled (§5): the common
+        // case needs no typing at all.
+        let dlg = new_dialog();
+        assert_eq!(dlg.start, "-60");
+        assert_eq!(dlg.end, "now");
+        assert_eq!(dlg.field, DialogField::Description);
+    }
+
+    #[test]
+    fn typing_appends_and_backspace_deletes() {
+        let mut dlg = new_dialog();
+        dlg.type_text("smoke");
+        assert_eq!(dlg.description, "smoke");
+        dlg.backspace();
+        assert_eq!(dlg.description, "smok");
+    }
+
+    #[test]
+    fn tab_cycles_through_the_fields() {
+        let mut dlg = new_dialog();
+        assert_eq!(dlg.field, DialogField::Description);
+        dlg.field = dlg.field.next();
+        assert_eq!(dlg.field, DialogField::Start);
+        dlg.field = dlg.field.next();
+        assert_eq!(dlg.field, DialogField::End);
+        dlg.field = dlg.field.next();
+        assert_eq!(dlg.field, DialogField::Description);
+        dlg.field = dlg.field.prev();
+        assert_eq!(dlg.field, DialogField::End);
+    }
+
+    #[test]
+    fn saving_a_new_dialog_creates_the_interval() {
+        let mut dlg = new_dialog();
+        dlg.description = "review".into();
+        // now = 12:00 UTC; -60 → 11:00, now → 12:00.
+        let now = 12 * 3_600_000;
+        match resolve_save(&dlg, now, 0) {
+            SaveOutcome::Create {
+                project_id,
+                description,
+                started_at,
+                ended_at,
+            } => {
+                assert_eq!(project_id, "p1");
+                assert_eq!(description, "review");
+                assert_eq!(started_at, 11 * 3_600_000);
+                assert_eq!(ended_at, now);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_backwards_interval_stays_open_with_an_error() {
+        let mut dlg = new_dialog();
+        dlg.start = "now".into();
+        dlg.end = "-60".into();
+        match resolve_save(&dlg, 12 * 3_600_000, 0) {
+            SaveOutcome::Invalid(msg) => assert!(msg.contains("must not end before")),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        // And the dialog keeps the error for the panel to show.
+        dlg.error = Some("x".into());
+        dlg.field = dlg.field.next();
+        assert_eq!(dlg.error, Some("x".into()));
+    }
+
+    #[test]
+    fn typing_clears_a_stale_error() {
+        let mut dlg = new_dialog();
+        dlg.error = Some("bad".into());
+        dlg.type_text("x");
+        assert_eq!(dlg.error, None);
+    }
+
+    #[test]
+    fn an_untouched_edit_dialog_is_a_no_op() {
+        let dlg = EntryDialog::edit("e1".into(), "Work".into(), "kept".into(), 0, 3_600_000);
+        assert_eq!(resolve_save(&dlg, 12 * 3_600_000, 0), SaveOutcome::NoChange);
+    }
+
+    #[test]
+    fn empty_times_keep_the_current_endpoints() {
+        // The dialog form of `shorten`: only the typed endpoint moves, and
+        // the entry is never at risk.
+        let mut dlg = EntryDialog::edit("e1".into(), "Work".into(), "kept".into(), 0, 3_600_000);
+        dlg.end = "-60".into();
+        let now = 12 * 3_600_000;
+        match resolve_save(&dlg, now, 0) {
+            SaveOutcome::Update {
+                id,
+                started_at,
+                ended_at,
+                description,
+            } => {
+                assert_eq!(id, "e1");
+                assert_eq!(started_at, 0, "untouched start is kept");
+                assert_eq!(ended_at, now - 3_600_000);
+                assert_eq!(description, None, "untouched text sends no SetText");
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewritten_text_sends_a_description_update() {
+        let mut dlg = EntryDialog::edit("e1".into(), "Work".into(), "typo".into(), 0, 3_600_000);
+        dlg.description = "review".into();
+        match resolve_save(&dlg, 12 * 3_600_000, 0) {
+            SaveOutcome::Update { description, .. } => {
+                assert_eq!(description.as_deref(), Some("review"))
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_keep_hints_name_the_current_times() {
+        // 01:00 and 02:00 UTC.
+        let dlg = EntryDialog::edit(
+            "e1".into(),
+            "Work".into(),
+            String::new(),
+            3_600_000,
+            7_200_000,
+        );
+        assert_eq!(dlg.start_hint(0), "(empty keeps 01:00)");
+        assert_eq!(dlg.end_hint(0), "(empty keeps 02:00)");
     }
 }

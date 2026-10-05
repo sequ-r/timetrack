@@ -21,8 +21,13 @@ cd "$(dirname "$0")"
 
 rm -rf .flatpak-builder build
 
+# NOTE: --disable-rofiles-fuse is required where FUSE mounts are not
+# permitted (containers, restricted sandboxes). Without it the build fails
+# with "fusermount3: mount failed: Operation not permitted" when spawning
+# rofiles-fuse. Unpacking instead of FUSE-mounting is slower but equivalent.
 exec flatpak-builder \
     --disable-updates \
+    --disable-rofiles-fuse \
     --force-clean \
     --user \
     --install \
