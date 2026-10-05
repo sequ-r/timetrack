@@ -446,16 +446,11 @@ specification and the implementation do not quietly diverge.
 | §14 Archived projects stay in totals | `rules.rs::set_archived` | service test |
 | §2 Version field, no migration | `model.rs::STORE_VERSION` | storage test |
 | §2 Corrupt store refused, not reset | `storage.rs` | storage test |
+| §10 CSV export, ISO 8601 local time, `HH:MM:SS` + minutes, `source`, GUI + CLI, week/month/all | `core/src/export.rs`, service `ExportCsv`, CLI `export`, GUI Export tab | core/service tests + e2e (65 checks) |
 | §13 Core free of GUI/IPC/async/clock | `core/` | by construction |
 
 ### Specified but not built
 
-- **§10 CSV export.** Agreed in full: CSV format, ISO 8601 timestamps, duration
-  in both `HH:MM:SS` and minutes, a `source` column, exportable from the GUI,
-  scoped to a period. **No implementation exists.** The Export tab currently
-  shows the column list and a preview of the rows, and writes no file. This is
-  the largest remaining gap and the only one that blocks the stakeholder
-  workflow §1 exists to serve.
 - **§5 drag-to-trim.** Deferred by decision, not by omission.
 - **§5 Methods 1 and 2 as one dialog.** The *rule* is settled and the CLI
   honours it; the GUI has no entry dialog at all yet, so there is nothing to

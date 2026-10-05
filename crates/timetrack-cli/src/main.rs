@@ -137,6 +137,16 @@ enum Command {
     /// Archive a project, keeping its history in totals.
     Archive { id: String },
 
+    /// Export entries as CSV (REQUIREMENTS §10).
+    Export {
+        /// What to export: `week` (current ISO week), `month` or `all`.
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Write to this file instead of stdout.
+        #[arg(short, long)]
+        out: Option<std::path::PathBuf>,
+    },
+
     // --- reading ---
     /// Print this week, this month and the all-time total.
     Status,
@@ -311,6 +321,17 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         Command::Status => print_status(&client.snapshot().await?),
 
         Command::List { limit } => print_list(&client.snapshot().await?, limit),
+
+        Command::Export { scope, out } => {
+            let csv = client.export_csv(&scope).await?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &csv)?;
+                    println!("exported to {}", path.display());
+                }
+                None => print!("{csv}"),
+            }
+        }
     }
     Ok(())
 }

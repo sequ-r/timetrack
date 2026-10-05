@@ -130,7 +130,7 @@ impl Store {
     /// Entries most recent first, which is the order both UIs show.
     pub fn recent(&self) -> Vec<&Entry> {
         let mut out: Vec<&Entry> = self.entries.iter().collect();
-        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out.sort_by_key(|a| std::cmp::Reverse(a.started_at));
         out
     }
 

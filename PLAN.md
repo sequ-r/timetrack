@@ -182,9 +182,9 @@ or `45s`.
 
 ## Remaining work, in the order it is worth doing
 
-1. **CSV export** (§10). The only remaining gap that blocks the stakeholder
-   workflow §1 exists to serve. It also unblocks the Export tab, which is
-   currently a preview of a file that cannot be produced.
+1. **CSV export** (§10). **Done 2026-10-05:** `core/src/export.rs`, service
+   `ExportCsv`, CLI `timetrack export --scope week|month|all [--out FILE]`,
+   GUI Export week/month/all buttons. E2e covers header, rows, bad scope.
 2. **The manual-entry dialog** in the GUI (§5 methods 1 and 2). Right now the
    GUI can only quick-add, so an over-estimated entry has no way to be
    corrected except the CLI.

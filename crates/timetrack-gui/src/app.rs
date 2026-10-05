@@ -43,6 +43,9 @@ const REFRESH: Duration = Duration::from_millis(1000);
 enum Msg {
     Snapshot(Box<Snapshot>),
     Error(String),
+    /// A success worth showing (e.g. where an export was written). Snapshots
+    /// never clear feedback, so this survives until the next action.
+    Status(String),
     /// An action succeeded. Snapshots never clear feedback (they arrive
     /// every second and would make errors unreadable), so success arrives as
     /// its own message that dismisses the previous error.
@@ -63,6 +66,9 @@ enum Action {
     ArchiveProject(String),
     /// Create a project.
     AddProject(String),
+    /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
+    /// the CSV over D-Bus and writes it to `path`.
+    ExportCsv { scope: String, path: String },
     /// Launch the service binary. The GUI is a flatpak and cannot run host
     /// binaries itself, so this asks the session bus to activate it, which
     /// works when a D-Bus activation file is installed on the host.
@@ -162,6 +168,26 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                                     .map(|_| ())
                                     .map_err(|e| e.to_string()),
                             );
+                        }
+                        Ok(Action::ExportCsv { scope, path }) => {
+                            let outcome = match client.export_csv(&scope).await {
+                                Ok(csv) => match std::fs::write(&path, &csv) {
+                                    Ok(()) => Ok(format!(
+                                        "exported {} entries ({scope}) to {path}",
+                                        csv.lines().count().saturating_sub(1)
+                                    )),
+                                    Err(e) => Err(format!("could not write {path}: {e}")),
+                                },
+                                Err(e) => Err(e.to_string()),
+                            };
+                            match outcome {
+                                Ok(note) => {
+                                    let _ = tx.send(Msg::Status(note));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Msg::Error(e));
+                                }
+                            }
                         }
                         Ok(Action::StartService) => {
                             // Calling a method is what triggers D-Bus
@@ -279,6 +305,16 @@ pub struct TimetrackView {
     focused_once: bool,
 }
 
+/// Where a GUI export lands by default.
+///
+/// The GUI is a flatpak with no file picker yet, so exports go to a
+/// predictable name the status line can report. A portal save dialog is the
+/// follow-up; until then this is a working button rather than a dead one.
+fn default_export_path(scope: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{home}/timetrack-export-{scope}.csv")
+}
+
 impl TimetrackView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (rx, actions) = spawn_service_thread();
@@ -351,6 +387,7 @@ impl TimetrackView {
                     }
                 }
                 Ok(Msg::Error(e)) => self.status = Some(e),
+                Ok(Msg::Status(note)) => self.status = Some(note),
                 Ok(Msg::ActionOk) => {
                     // A success dismisses the previous error -- but only one
                     // the actions own. The "service is not running" notice
@@ -973,10 +1010,53 @@ impl TimetrackView {
                 .text_color(rgb(0x7a7a90))
                 .child("CSV COLUMNS"),
         );
-        body =
-            body.child(div().pt_1().text_color(rgb(0x9a9ab0)).child(
-                "id, project, description, started_at, ended_at, duration_ms, source, note",
-            ));
+        body = body.child(
+            div()
+                .pt_1()
+                .text_color(rgb(0x9a9ab0))
+                .child(timetrack_core::CSV_HEADER),
+        );
+
+        // Export actions: fetch the CSV over D-Bus and write it to a
+        // predictable path the status line reports. Scopes match the CLI's
+        // `timetrack export --scope week|month|all`.
+        {
+            let mut row = div().flex().gap_2().pt_3();
+            for (i, scope) in ["week", "month", "all"].iter().enumerate() {
+                let entity = self.entity.clone();
+                let path = default_export_path(scope);
+                let label = format!("Export {scope}");
+                let scope = scope.to_string();
+                row = row.child(
+                    div()
+                        .id(ElementId::from(("export", i as u64)))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(rgb(0x2ea043))
+                        .text_color(rgb(0xffffff))
+                        .child(label)
+                        .when_some(entity, move |el, entity| {
+                            el.on_click(move |_ev, _window, cx| {
+                                let scope = scope.clone();
+                                let path = path.clone();
+                                entity.update(cx, |view, _cx| {
+                                    view.send(Action::ExportCsv { scope, path });
+                                });
+                            })
+                        }),
+                );
+            }
+            body = body.child(row);
+            body = body.child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgb(0x6a6a80))
+                    .child("Writes ~/timetrack-export-<week|month|all>.csv"),
+            );
+        }
 
         // A preview of the first few rows, so the export can be sanity-checked
         // on screen.

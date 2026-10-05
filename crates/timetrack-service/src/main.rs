@@ -158,6 +158,16 @@ impl EntryIface {
     fn delete_project(&self, id: &str) -> zbus::fdo::Result<()> {
         self.0.delete_project(id).map_err(to_dbus_err)
     }
+
+    /// CSV export (REQUIREMENTS §10). `scope` is `week`, `month` or `all`;
+    /// the reply is the CSV text (JSON-encoded on the wire like the rest).
+    #[zbus(name = "ExportCsv")]
+    fn export_csv(&self, scope: &str) -> zbus::fdo::Result<Wire> {
+        self.0
+            .export_csv(scope)
+            .map(|csv| encode(&csv))
+            .map_err(to_dbus_err)
+    }
 }
 
 /// zbus uses the async-io backend (see the workspace Cargo.toml), so the

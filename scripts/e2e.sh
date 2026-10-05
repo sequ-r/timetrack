@@ -279,6 +279,14 @@ check "store format is the current version" '"version": 1' "$(sed -nE 's/^[[:spa
 check "no stopwatch state in the store" "0" "$(grep -cE '"(running|duration_ms)"' "$STORE")"
 
 echo
+echo "== CSV export writes a file with the spec columns =="
+"$CLI" export --scope all --out "$WORK/export.csv" >/dev/null
+contains "export header" "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note" "$(head -1 "$WORK/export.csv")"
+contains "export has a data row" "manual" "$(cat "$WORK/export.csv")"
+contains "export timestamps are ISO 8601" "T" "$(cat "$WORK/export.csv")"
+out=$("$CLI" export --scope bogus 2>&1); contains "bad scope refused" "unknown export scope" "$out"
+
+echo
 echo "== the D-Bus surface is the new one =="
 INTRO=$(gdbus introspect --session --dest org.sequ.timetrack --object-path /org/sequ/timetrack 2>/dev/null)
 check "interface is the new one" "org.sequ.timetrack.Entries" \
@@ -286,7 +294,7 @@ check "interface is the new one" "org.sequ.timetrack.Entries" \
 printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
   && bad "stopwatch methods are gone" "Start/Stop/Cancel still exposed" \
   || ok "stopwatch methods are gone"
-for m in Add AddDuration AddDurationEnding QuickAdd SetTimes UndoQuickAdd DeleteEntry Split Merge AddProject SetArchived; do
+for m in Add AddDuration AddDurationEnding QuickAdd SetTimes UndoQuickAdd DeleteEntry Split Merge AddProject SetArchived ExportCsv; do
   printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
 done
 

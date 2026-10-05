@@ -260,6 +260,17 @@ impl EntryService {
     pub fn delete_project(&self, id: &str) -> anyhow::Result<()> {
         self.mutate(|s, _ids, _| core::delete_project(s, id).map(|_| ()))
     }
+
+    /// CSV export (REQUIREMENTS §10): one row per entry in `scope`, with a
+    /// header, ISO 8601 local timestamps, `HH:MM:SS` + minutes, and `source`.
+    pub fn export_csv(&self, scope: &str) -> anyhow::Result<String> {
+        let scope = core::ExportScope::parse(scope).ok_or_else(|| {
+            anyhow::anyhow!("unknown export scope '{scope}' (use week, month or all)")
+        })?;
+        let g = self.inner.lock().expect("service state mutex poisoned");
+        let now = now_ms();
+        Ok(core::export_csv(&g.data, scope, now, g.local_offset_ms))
+    }
 }
 
 fn to_totals_view(t: &core::Totals) -> TotalsView {
@@ -686,5 +697,27 @@ mod tests {
     fn now_is_after_2020() {
         // A sanity check on the one place the service reads the clock.
         assert!(now_ms() > 1_577_836_800_000, "clock looks wrong");
+    }
+
+    // --- CSV export ---
+
+    #[test]
+    fn export_returns_a_header_and_one_row_per_entry() {
+        let (svc, _) = service("export");
+        let p = project(&svc);
+        let now = now_ms();
+        svc.add(&p.id, "review", now - 3_600_000, now).unwrap();
+        let csv = svc.export_csv("all").unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], timetrack_core::CSV_HEADER);
+        assert!(lines[1].contains("review"), "row: {}", lines[1]);
+        assert!(lines[1].contains("01:00:00"), "row: {}", lines[1]);
+    }
+
+    #[test]
+    fn export_rejects_an_unknown_scope() {
+        let (svc, _) = service("export-scope");
+        assert!(svc.export_csv("everything").is_err());
     }
 }

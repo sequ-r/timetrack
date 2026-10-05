@@ -296,6 +296,12 @@ impl Client {
         Ok(())
     }
 
+    /// CSV export (REQUIREMENTS §10). `scope` is `week`, `month` or `all`;
+    /// returns the CSV text including the header row.
+    pub async fn export_csv(&self, scope: &str) -> anyhow::Result<String> {
+        self.call1("ExportCsv", &scope).await
+    }
+
     /// Poll until the service appears on the bus, or give up.
     pub async fn wait_for_service(timeout: Duration) -> anyhow::Result<Self> {
         let deadline = std::time::Instant::now() + timeout;

@@ -32,12 +32,16 @@
 //! bugs, so it is deliberately concentrated in one place.
 
 pub mod aggregate;
+pub mod export;
 pub mod model;
 pub mod rules;
 pub mod storage;
 
 pub use aggregate::{
     IsoWeek, Totals, iso_week_of, month_of, month_totals, totals_in_day_range, week_totals,
+};
+pub use export::{
+    CSV_HEADER, ExportScope, entries_in_scope, escape_field, export_csv, format_local_iso8601,
 };
 pub use model::{
     Entry, EntrySource, MS_PER_DAY, Project, STORE_VERSION, Store, local_day_of, local_day_start,

@@ -51,13 +51,13 @@ about where a week starts.
 | Projects | create and archive; archiving keeps the history in totals |
 | Persistence | atomic writes; survives restart; corrupt or newer stores are refused, never silently reset |
 
-**Not built yet.** CSV export (§10 of `REQUIREMENTS.md`) is an agreed
-requirement with no implementation — the Export tab shows the column list and a
-preview, it does not write a file. Split and merge are not wired to the GUI. The
+**Not built yet.** Split and merge are not wired to the GUI. The
 GUI's "New project" button invents a numbered default name, because there is no
 text field yet. Merging overlapping entries shrinks the total by the overlap,
 which is deliberate (§8) but not yet explained in a confirmation dialog, because
-there is no confirmation dialog yet.
+there is no confirmation dialog yet. The GUI Export tab writes
+`~/timetrack-export-<week|month|all>.csv` with no file picker yet (portal save
+dialog is the follow-up).
 
 ## Building
 

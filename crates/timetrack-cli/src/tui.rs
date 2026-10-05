@@ -217,10 +217,10 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.project_cursor = self.project_cursor.saturating_sub(1);
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if self.project_cursor + 1 < active_projects(&self.snapshot).len() {
-                    self.project_cursor += 1;
-                }
+            KeyCode::Right | KeyCode::Char('l')
+                if self.project_cursor + 1 < active_projects(&self.snapshot).len() =>
+            {
+                self.project_cursor += 1;
             }
 
             _ => {}
@@ -305,7 +305,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 fn draw_week(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let week = &app.snapshot.week;
     let mut lines = vec![Line::from(Span::styled(
-        format!("{}", timetrack_core::format_duration(week.total_ms)),
+        timetrack_core::format_duration(week.total_ms).to_string(),
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
