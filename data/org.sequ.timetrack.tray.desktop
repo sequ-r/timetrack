@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=TimeTrack Tray
+GenericName=Time Tracker Tray
+Comment=Track time from the system tray: week totals and per-project quick-add
+Exec=timetrack-tray
+Icon=org.sequ.timetrack
+Terminal=false
+Type=Application
+Categories=Utility;GTK;
+Keywords=time;track;todo;productivity;tray;
+StartupNotify=false

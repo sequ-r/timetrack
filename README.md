@@ -57,9 +57,7 @@ about where a week starts.
 
 **Not built yet.** The GUI Export tab writes
 `~/timetrack-export-<week|month|all>.csv` with no file picker yet (portal save
-dialog is the follow-up). The tray has no autostart entry yet, so it runs by
-hand (see below); on GNOME it needs a tray extension, since GNOME ships no
-StatusNotifier watcher — KDE, XFCE and MATE show it as-is.
+dialog is the follow-up).
 
 ## Building
 
@@ -124,6 +122,39 @@ The tray needs a StatusNotifier watcher on the session bus: KDE, XFCE and
 MATE provide one; on GNOME install a tray extension first, or the icon has
 nowhere to appear. It runs on the host (never sandboxed), next to the
 service.
+
+### The tray has to be installed once
+
+Same pattern as the service: a binary in `~/.local/bin`, the desktop file
+in `~/.local/share/applications`, and a copy of it in `~/.config/autostart`
+so it starts at login:
+
+```sh
+install -Dm755 target/release/timetrack-tray ~/.local/bin/timetrack-tray
+install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.local/share/applications/org.sequ.timetrack.tray.desktop
+install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.config/autostart/org.sequ.timetrack.tray.desktop
+```
+
+D-Bus activation is unchanged by all of this: the tray connects anonymously
+and never owns `org.sequ.timetrack`, so it can neither steal the service's
+name nor keep a stale service alive — it only reads. The flatpak ships no
+tray in v1 (its manifest installs only the app desktop file); the tray is
+host-only until sandboxing is settled.
+
+### Tray on GNOME, and why the flatpak ships none
+
+GNOME Shell provides no StatusNotifier watcher, so the tray icon has nowhere
+to appear there unless a tray extension (e.g. an AppIndicator extension)
+registers one. KDE, XFCE and MATE ship a watcher, and the icon shows as-is.
+
+The tray is host-only in v1, deliberately: it must reach the session bus both
+to register with the watcher (`org.kde.StatusNotifierWatcher`) and to call
+the service (`org.sequ.timetrack`), and neither fits today's sandbox. The
+flatpak manifests grant `--talk-name=org.sequ.timetrack` for the GUI but no
+watcher name — a sandboxed tray would need both
+`--talk-name=org.kde.StatusNotifierWatcher` and
+`--talk-name=org.sequ.timetrack`, plus a host-side watcher to talk to. Until
+that is settled, the tray runs on the host next to the service.
 
 ### The service has to be installed once
 

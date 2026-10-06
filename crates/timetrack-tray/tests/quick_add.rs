@@ -6,66 +6,21 @@
 //! A private bus hosts a minimal watcher (as in `watcher.rs`) plus a fake
 //! timetrack service backed by a real `JsonStore` through the real core
 //! rules -- the same `Snapshot`/`QuickAdd`/`UndoQuickAdd`/`DeleteEntry` wire
-//! the real service speaks. The real tray binary runs against that bus; the
-//! test clicks `+15m` over D-Bus (`com.canonical.dbusmenu` `Event`, the same
-//! call a desktop host makes), asserts a 15-minute `QuickAdd` entry lands
-//! for the seeded project, undoes it, quick-adds `+30m`, cancels its delete
-//! (the entry stays), then confirms and asserts it is gone.
+//! the real service speaks. (`real_service.rs` runs the same round-trips
+//! against the real service binary.) The real tray binary runs against that
+//! bus; the test clicks `+15m` over D-Bus (`com.canonical.dbusmenu` `Event`,
+//! the same call a desktop host makes), asserts a 15-minute `QuickAdd` entry
+//! lands for the seeded project, undoes it, quick-adds `+30m`, cancels its
+//! delete (the entry stays), then confirms and asserts it is gone.
 
-use std::collections::HashMap;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+mod common;
+
+use common::ChildGuard;
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use timetrack_proto::{BUS_NAME, Client, EntrySource, OBJECT_PATH};
 use zbus::interface;
-use zbus::zvariant::{OwnedValue, Value};
-
-/// A private session bus, mirroring `scripts/e2e.sh`: hermetic, no host
-/// activation, so a stale binary can never answer instead of the test.
-const BUS_CONF: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:tmpdir=/tmp</listen>
-  <policy context="default"><allow own="*"/><allow send_destination="*" eavesdrop="true"/><allow receive_sender="*"/></policy>
-</busconfig>
-"#;
-
-/// Just enough of `org.kde.StatusNotifierWatcher` for ksni to register:
-/// the register/unregister methods plus the properties ksni reads.
-struct Watcher {
-    items: Arc<Mutex<Vec<String>>>,
-}
-
-#[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
-impl Watcher {
-    fn register_status_notifier_item(&self, service: &str) {
-        self.items.lock().unwrap().push(service.to_string());
-    }
-
-    fn unregister_status_notifier_item(&self, service: &str) {
-        self.items.lock().unwrap().retain(|s| s != service);
-    }
-
-    fn register_status_notifier_host(&self, _service: &str) {}
-
-    fn unregister_status_notifier_host(&self, _service: &str) {}
-
-    #[zbus(property)]
-    fn registered_status_notifier_items(&self) -> Vec<String> {
-        self.items.lock().unwrap().clone()
-    }
-
-    #[zbus(property)]
-    fn is_status_notifier_host_registered(&self) -> bool {
-        true
-    }
-
-    #[zbus(property)]
-    fn protocol_version(&self) -> i32 {
-        0
-    }
-}
 
 /// The fake service's state: a real store file through the real core rules,
 /// so a quick-add that lands here went through the same validation and
@@ -255,124 +210,15 @@ impl FakeIface {
     }
 }
 
-/// Kill a child on the way out, including on assertion failure, so a red
-/// test never leaves an orphan parking on the bus.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Whether a menu item's properties carry the wanted label.
-fn label_is(props: &HashMap<String, OwnedValue>, want: &str) -> bool {
-    props.get("label").is_some_and(|v| {
-        let as_value: Value = v.clone().into();
-        as_value == Value::new(want)
-    })
-}
-
-/// Whether a menu item is clickable. ksni serves only non-default dbusmenu
-/// properties, and the default is enabled -- so a missing `enabled` means
-/// enabled, and only an explicit false disables.
-fn enabled_is(props: &HashMap<String, OwnedValue>) -> bool {
-    props.get("enabled").is_none_or(|v| {
-        let as_value: Value = v.clone().into();
-        as_value != Value::Bool(false)
-    })
-}
-
-/// Wait up to `timeout` for a menu row with the wanted label, returning the
-/// id a host would click. Ids are probed explicitly: unlike the empty id
-/// list (which numbers items from zero), per-id properties carry ksni's
-/// revision offset, so the id found is the one `Event` accepts -- clicking a
-/// zero-based index misroutes once the menu has rebuilt.
-async fn wait_for_row(
-    menu: &zbus::Proxy<'_>,
-    want: &str,
-    enabled_only: bool,
-    timeout: Duration,
-) -> i32 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let reply = menu
-            .call_method(
-                "GetGroupProperties",
-                &(
-                    (0..200).collect::<Vec<i32>>(),
-                    vec!["label".to_string(), "enabled".to_string()],
-                ),
-            )
-            .await
-            .expect("the menu must answer GetGroupProperties");
-        let props: Vec<(i32, HashMap<String, OwnedValue>)> = reply
-            .body()
-            .deserialize()
-            .expect("menu properties must decode");
-        if let Some((id, _)) = props
-            .iter()
-            .find(|(_, m)| label_is(m, want) && (!enabled_only || enabled_is(m)))
-        {
-            return *id;
-        }
-        if Instant::now() > deadline {
-            panic!("tray menu never offered {want} (saw {} items)", props.len());
-        }
-        async_io::Timer::after(Duration::from_millis(200)).await;
-    }
-}
-
-/// Click a menu row, as a desktop host would: `Event` with `clicked`.
-async fn click_row(menu: &zbus::Proxy<'_>, id: i32) {
-    let data: OwnedValue = Value::new("").try_into().expect("empty data must convert");
-    menu.call_method("Event", &(id, "clicked".to_string(), data, 0u32))
-        .await
-        .expect("the menu must accept the click");
-}
-
 #[test]
 fn tray_menu_quick_add_undo_and_delete_round_trip() {
     async_io::block_on(async {
         let dir =
             std::env::temp_dir().join(format!("timetrack-tray-quickadd-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("bus.conf"), BUS_CONF).unwrap();
+        let address = common::start_private_bus(&dir);
+        common::point_at_private_bus(&address);
 
-        let out = Command::new("dbus-daemon")
-            .arg(format!("--config-file={}", dir.join("bus.conf").display()))
-            .arg("--print-address")
-            .arg("--fork")
-            .output()
-            .expect("dbus-daemon must be installed (see scripts/e2e.sh)");
-        assert!(out.status.success(), "could not start a private bus");
-        let address = String::from_utf8(out.stdout).unwrap();
-        let address = address.trim().to_string();
-        assert!(!address.is_empty(), "empty bus address");
-        // The proto `Client` connects to the session bus, so point this
-        // process (and, by inheritance, the tray child) at the private one.
-        // This file holds the only test in its binary, and nothing reads the
-        // environment concurrently at this point, so the switch is safe.
-        unsafe {
-            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &address);
-        }
-
-        let items: Arc<Mutex<Vec<String>>> = Arc::default();
-        let conn = zbus::connection::Builder::address(address.as_str())
-            .expect("private bus address must parse")
-            .name("org.kde.StatusNotifierWatcher")
-            .expect("watcher name must be valid")
-            .serve_at(
-                "/StatusNotifierWatcher",
-                Watcher {
-                    items: items.clone(),
-                },
-            )
-            .expect("watcher path must be valid")
-            .build()
-            .await
-            .expect("could not serve the test watcher");
+        let (conn, items) = common::serve_watcher(&address).await;
 
         let store_path = dir.join("store.json");
         let _service_conn = zbus::connection::Builder::address(address.as_str())
@@ -397,29 +243,13 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
 
         // The item requests `org.kde.StatusNotifierItem-<pid>-<n>` and then
         // registers it; wait for the register call to land.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let service = loop {
-            if let Some(first) = items.lock().unwrap().first().cloned() {
-                break first;
-            }
-            if Instant::now() > deadline {
-                panic!("tray never registered with the test watcher");
-            }
-            async_io::Timer::after(Duration::from_millis(100)).await;
-        };
+        let service = common::wait_for_registration(&items).await;
 
         // The tray polls every 5s; wait for its menu to offer the seeded
         // project with a +15m row, then click it.
-        let menu = zbus::Proxy::new(
-            &conn,
-            service.as_str(),
-            "/MenuBar",
-            "com.canonical.dbusmenu",
-        )
-        .await
-        .expect("menu proxy must build");
-        let plus_15m = wait_for_row(&menu, "+15m", false, Duration::from_secs(20)).await;
-        click_row(&menu, plus_15m).await;
+        let menu = common::menu_proxy(&conn, &service).await;
+        let plus_15m = common::wait_for_row(&menu, "+15m", false, Duration::from_secs(20)).await;
+        common::click_row(&menu, plus_15m).await;
 
         // The tray's worker thread connects and quick-adds; the entry must
         // land in the store with the 15-minute bucket, tagged quick-add.
@@ -462,8 +292,9 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Tray-6 (#10): the submenu now offers an enabled undo row (the
         // poll loop rebuilds once the worker records the created id); click
         // it, and the entry just created must disappear again.
-        let undo = wait_for_row(&menu, "Undo quick-add", true, Duration::from_secs(20)).await;
-        click_row(&menu, undo).await;
+        let undo =
+            common::wait_for_row(&menu, "Undo quick-add", true, Duration::from_secs(20)).await;
+        common::click_row(&menu, undo).await;
 
         // The undo worker removes exactly the entry the quick-add created.
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -495,8 +326,8 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Tray-7 (#11): quick-add again, then walk the delete confirmation.
         // The menu rebuilt since, so probe the +30m row afresh.
         let thirty = 30 * 60_000;
-        let plus_30m = wait_for_row(&menu, "+30m", false, Duration::from_secs(20)).await;
-        click_row(&menu, plus_30m).await;
+        let plus_30m = common::wait_for_row(&menu, "+30m", false, Duration::from_secs(20)).await;
+        common::click_row(&menu, plus_30m).await;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");
@@ -521,8 +352,8 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Cancel path: the confirm submenu offers "Keep it"; clicking it
         // must delete nothing. The entry is still there afterwards, with
         // its week total intact.
-        let keep_it = wait_for_row(&menu, "Keep it", true, Duration::from_secs(20)).await;
-        click_row(&menu, keep_it).await;
+        let keep_it = common::wait_for_row(&menu, "Keep it", true, Duration::from_secs(20)).await;
+        common::click_row(&menu, keep_it).await;
         async_io::Timer::after(Duration::from_secs(2)).await;
         let snap = client.snapshot().await.expect("snapshot must succeed");
         assert!(
@@ -540,14 +371,14 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Delete round-trip: the confirm row states duration and project.
         // It was already there for the cancel probe; re-probe it since the
         // menu may have rebuilt under the click.
-        let confirm = wait_for_row(
+        let confirm = common::wait_for_row(
             &menu,
             "Delete 30m from General",
             true,
             Duration::from_secs(20),
         )
         .await;
-        click_row(&menu, confirm).await;
+        common::click_row(&menu, confirm).await;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");

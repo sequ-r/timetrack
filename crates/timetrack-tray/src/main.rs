@@ -1212,6 +1212,34 @@ mod tests {
     }
 
     #[test]
+    fn fresh_store_offers_general_with_empty_week() {
+        // Tray-13 (#17): a fresh install seeds one `General` project, so the
+        // menu is never empty -- but every row is inert until time lands.
+        // Models the snapshot a freshly seeded service serves: the project,
+        // no entries, zero totals.
+        let snapshot = snapshot_with(vec![project("p1", "General", false)], &[]);
+        let model = build_menu_model(&snapshot);
+        assert_eq!(model.visible.len(), 1);
+        assert_eq!(model.visible[0].name, "General");
+        assert_eq!(model.visible[0].week_ms, 0);
+        assert_eq!(model.visible[0].last_entry, None);
+        assert!(model.overflow.is_empty());
+
+        let mut tray = tray();
+        tray.set_menu(model);
+        let items = tray.menu();
+        // The project submenu plus the app actions.
+        assert_eq!(items.len(), 3);
+        let sub = project_submenu_named(&items, "General");
+        assert!(!find_standard(sub, "This week: 0m").enabled);
+        assert!(!find_standard(sub, "Undo quick-add").enabled);
+        assert!(!find_standard(sub, "Nothing to delete").enabled);
+        // And the icon idles on a zero total.
+        assert_eq!(tray.status(), ksni::Status::Active);
+        assert_eq!(tray.tool_tip().description, "Week total 0:00 · 0 projects");
+    }
+
+    #[test]
     fn week_total_formats_as_h_mm() {
         // Unpadded, unwrapped hours: a week may legally exceed 168h (§4).
         assert_eq!(format_hmm(0), "0:00");
