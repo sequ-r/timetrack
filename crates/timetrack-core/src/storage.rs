@@ -52,6 +52,40 @@ pub enum StorageError {
     Invalid { path: String, reason: String },
 }
 
+/// Explain an unreadable store, naming the remedy when the shape is
+/// recognisable.
+///
+/// A stopwatch-era file (entries without `project_id`) predates project
+/// attribution, so there is nothing to migrate it onto; the way forward is
+/// moving it aside and starting fresh. Anything else is reported as-is: a
+/// corrupt or newer file may still hold data worth keeping, where "start
+/// fresh" would be the wrong advice.
+fn invalid_reason(text: &str, error: &serde_json::Error) -> String {
+    if looks_like_legacy_store(text) {
+        format!(
+            "{error}; this is the pre-project (stopwatch-era) format, which cannot be migrated -- move the file aside to start fresh"
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+/// Whether `text` parses as JSON shaped like the pre-project store: a
+/// non-empty entry list with no `project_id` anywhere in it.
+///
+/// The legacy writer never emitted `project_id`, so `all` (not `any`) is the
+/// test: a mix of shaped and shapeless entries is hand-editing or
+/// corruption, not the legacy format, and must keep the generic message.
+fn looks_like_legacy_store(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let Some(entries) = value.get("entries").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    !entries.is_empty() && entries.iter().all(|e| e.get("project_id").is_none())
+}
+
 /// Result alias for this module, named to avoid shadowing the prelude's
 /// two-parameter `Result`.
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
@@ -102,7 +136,7 @@ impl JsonStore {
                 let store: Store =
                     serde_json::from_str(&text).map_err(|e| StorageError::Invalid {
                         path: shown.clone(),
-                        reason: e.to_string(),
+                        reason: invalid_reason(&text, &e),
                     })?;
                 if !store.is_readable() {
                     return Err(StorageError::Invalid {
@@ -263,6 +297,64 @@ mod tests {
         let text = format!("{{\"version\":{}}}", STORE_VERSION + 1);
         std::fs::write(&path, text).unwrap();
         assert!(JsonStore::new(path).load().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_store_names_the_remedy() {
+        // The stopwatch-era shape: entries with no `project_id` and no
+        // project table. The error must say what to do, not just what is
+        // wrong, because the service will not start until the file moves.
+        let dir = tmpdir("legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+        std::fs::write(
+            &path,
+            r#"{"entries": [{"id": "e1", "description": "old", "started_at": 1000, "ended_at": 2000}]}"#,
+        )
+        .unwrap();
+        let err = format!("{}", JsonStore::new(path).load().unwrap_err());
+        assert!(
+            err.contains("cannot be migrated"),
+            "must name the dead end: {err}"
+        );
+        assert!(
+            err.contains("move the file aside"),
+            "must name the remedy: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_garbled_store_gets_no_migration_advice() {
+        // "Start fresh" would discard real data here, so the legacy hint
+        // must not fire: unparseable JSON and half-shaped entries keep the
+        // generic message.
+        let dir = tmpdir("garbled");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let not_json = dir.join("store.json");
+        std::fs::write(&not_json, "{ this is not json").unwrap();
+        let err = format!("{}", JsonStore::new(not_json).load().unwrap_err());
+        assert!(
+            !err.contains("move the file aside"),
+            "must not advise discarding possibly real data: {err}"
+        );
+        let mixed = dir.join("mixed.json");
+        std::fs::write(
+            &mixed,
+            r#"{"entries": [
+                {"id": "e1", "project_id": "p1", "description": "x", "started_at": 1, "ended_at": 2, "source": "Manual"},
+                {"id": "e2", "description": "hand-edited", "started_at": 3, "ended_at": 4}
+            ]}"#,
+        )
+        .unwrap();
+        let err = format!("{}", JsonStore::new(mixed).load().unwrap_err());
+        assert!(
+            !err.contains("move the file aside"),
+            "a mixed file is corruption, not the legacy format: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -6,6 +6,7 @@ members = [
     "crates/timetrack-service",
     "crates/timetrack-cli",
     "crates/timetrack-gui",
+    "crates/timetrack-tray",
 ]
 
 [workspace.package]
@@ -48,6 +49,10 @@ anyhow = "1"
 # 0.2.2 ships the backends behind its default features -- font-kit, wayland and
 # x11 -- so a single crates.io dependency replaces both of those.
 gpui = "0.2.2"
+# StatusNotifierItem tray (issue #4 spike: async-io only -- never enable the
+# default tokio feature, or ksni fails to compile by design and zbus would
+# gain the tokio backend this workspace deliberately avoids).
+ksni = { version = "0.3.6", default-features = false, features = ["async-io"] }
 
 [profile.release]
 opt-level = 2

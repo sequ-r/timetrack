@@ -1,0 +1,22 @@
+[package]
+name = "timetrack-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TimeTrack system tray: service presence plus quick add/remove menu"
+
+[[bin]]
+name = "timetrack-tray"
+path = "src/main.rs"
+
+[dependencies]
+timetrack-core = { workspace = true }
+timetrack-proto = { workspace = true }
+ksni = { workspace = true }
+anyhow = { workspace = true }
+async-io = "2"
+
+[dev-dependencies]
+zbus = { workspace = true }

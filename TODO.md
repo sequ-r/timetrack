@@ -69,7 +69,7 @@ survey (2026-10-05). Ordered by value. Check off as done.
   - `cargo clippy --workspace -- -D warnings` fails at `timetrack-core/src/model.rs:133` (`unnecessary_sort_by`); no `[lints]`, no clippy/fmt job in `.github/workflows/release.yml`.
   - Accept: sort fixed, `clippy` + `fmt --check` in CI.
 
-- [ ] **13. E2e / gui-smoke coverage**
+- [x] **13. E2e / gui-smoke coverage**
   - `scripts/e2e.sh` skips split/merge behaviour, `set_*` guards, month nav, export. `scripts/gui-smoke.sh` never reads back the total value, no undo/delete/tab/Export interaction.
   - Add: service DST test, storage empty-file test, month navigation.
   - Accept: new paths covered in scripts.

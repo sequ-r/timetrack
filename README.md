@@ -135,7 +135,7 @@ To run it at login instead:
 ```sh
 mkdir -p ~/.config/systemd/user
 cp data/org.sequ.timetrack.service ~/.config/systemd/user/
-systemctl --user enable --now timetrack.service
+systemctl --user enable --now org.sequ.timetrack.service
 ```
 
 Note that `Exec=` in a D-Bus service file is **not** run through a shell, so it
