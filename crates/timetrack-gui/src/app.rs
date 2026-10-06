@@ -34,7 +34,7 @@ use gpui::{
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
-use timetrack_proto::{ClientError, ProjectView, Snapshot};
+use timetrack_proto::{ClientError, ProjectView, Snapshot, no_service_hint, version_mismatch_hint};
 
 /// How often the service is polled for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(1000);
@@ -299,19 +299,6 @@ impl StatusMsg {
     }
 }
 
-/// The "service is not running" guidance, shown for `NoService`.
-fn no_service_hint() -> String {
-    "the timetrack service is not running. Start it with:\ntimetrack-service &\n(or install it to a systemd user unit -- see the README)".to_string()
-}
-
-/// The version-skew guidance, shown for `VersionMismatch`.
-fn version_mismatch_hint() -> String {
-    format!(
-        "The GUI and the service are different versions.\nReinstall whichever one is older so both speak\n{}.",
-        timetrack_proto::INTERFACE
-    )
-}
-
 impl From<&ClientError> for StatusMsg {
     /// Map a call failure to footer text without matching on message text:
     /// the variant decides both the wording and the kind.
@@ -322,7 +309,7 @@ impl From<&ClientError> for StatusMsg {
                 kind: StatusKind::NoService,
             },
             ClientError::VersionMismatch { .. } => StatusMsg {
-                text: version_mismatch_hint(),
+                text: version_mismatch_hint("GUI"),
                 kind: StatusKind::VersionMismatch,
             },
             ClientError::Service(service) => StatusMsg {

@@ -294,6 +294,22 @@ impl ClientError {
     }
 }
 
+/// The "service is not running" guidance, shared by the GUI footer and
+/// the tray tooltip so both clients say the same thing. Shown for
+/// [`ClientError::NoService`].
+pub fn no_service_hint() -> String {
+    "the timetrack service is not running. Start it with:\ntimetrack-service &\n(or install it to a systemd user unit -- see the README)".to_string()
+}
+
+/// The version-skew guidance, shared by the GUI footer and the tray
+/// tooltip. Names the client (`GUI`, `tray`, ...) so each client states who
+/// disagrees with the service. Shown for [`ClientError::VersionMismatch`].
+pub fn version_mismatch_hint(client: &str) -> String {
+    format!(
+        "The {client} and the service are different versions.\nReinstall whichever one is older so both speak\n{INTERFACE}."
+    )
+}
+
 /// A connection to the running service.
 #[derive(Clone)]
 pub struct Client {
@@ -686,6 +702,28 @@ mod tests {
         // the aggregates are populated, so `entries` stay out of it.
         let snap = snapshot_with_truncated_entries();
         assert_eq!(snap.project_totals("nope"), (0, 0));
+    }
+
+    // --- shared client guidance ---
+
+    #[test]
+    fn service_hints_are_shared_client_wording() {
+        // The GUI footer and the tray tooltip render these verbatim, so
+        // both clients say the same thing: pin the exact strings here.
+        assert_eq!(
+            no_service_hint(),
+            "the timetrack service is not running. Start it with:\ntimetrack-service &\n(or install it to a systemd user unit -- see the README)"
+        );
+        assert_eq!(
+            version_mismatch_hint("GUI"),
+            format!(
+                "The GUI and the service are different versions.\nReinstall whichever one is older so both speak\n{INTERFACE}."
+            )
+        );
+        assert!(
+            version_mismatch_hint("tray").starts_with("The tray and the service"),
+            "each client names itself"
+        );
     }
 
     // --- typed errors ---

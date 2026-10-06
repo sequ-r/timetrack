@@ -149,10 +149,20 @@ fn tray_registers_with_watcher_and_exposes_icon_tooltip() {
             proxy.get_property::<String>("Title").await.unwrap(),
             "TimeTrack"
         );
-        assert_eq!(
-            proxy.get_property::<String>("Status").await.unwrap(),
-            "Active"
-        );
+        // No service runs on this bus: wait for the tray's first poll tick
+        // to observe that and flatten the icon (tray-9, #13), rather than
+        // asserting before the tick lands.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = proxy.get_property::<String>("Status").await.unwrap();
+            if status == "Passive" {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("tray never flattened its icon without a service (saw {status})");
+            }
+            async_io::Timer::after(Duration::from_millis(200)).await;
+        }
         assert_eq!(
             proxy.get_property::<String>("IconName").await.unwrap(),
             "org.sequ.timetrack-symbolic"
@@ -172,6 +182,11 @@ fn tray_registers_with_watcher_and_exposes_icon_tooltip() {
             zbus::zvariant::Value::new("org.sequ.timetrack-symbolic")
         );
         assert_eq!(fields[2], zbus::zvariant::Value::new("TimeTrack"));
-        assert_eq!(fields[3], zbus::zvariant::Value::new("Service running"));
+        // No service runs on this bus, so the icon is flat with the shared
+        // start-service hint (tray-9, #13) rather than live totals.
+        assert_eq!(
+            fields[3],
+            zbus::zvariant::Value::new(timetrack_proto::no_service_hint())
+        );
     });
 }

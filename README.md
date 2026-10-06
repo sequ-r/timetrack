@@ -15,9 +15,10 @@ the terminal never loses anything, and both can be open at once.
 ## Architecture
 
 ```
-  timetrack (GUI, flatpak)        timetrack (CLI, static binary)
-  gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands
-        |                                  |
+  timetrack-gui (flatpak)         timetrack (CLI, static binary)      timetrack-tray (host only)
+  gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands     SNI item: week-total tooltip,
+                                                                            per-project quick-add/undo/delete
+        |                                  |                                   |
         +--------- D-Bus: org.sequ.timetrack.Entries ----+
                            |
               timetrack-service  (D-Bus activated)
@@ -29,10 +30,11 @@ the terminal never loses anything, and both can be open at once.
 | Crate | Role |
 |---|---|
 | `timetrack-core` | Model, rules, aggregation, atomic JSON storage. No GUI, IPC, async, **or clock**. |
-| `timetrack-proto` | The D-Bus contract and a client. Both front ends depend on this. |
+| `timetrack-proto` | The D-Bus contract and a client. All front ends depend on this. |
 | `timetrack-service` | D-Bus server. Owns the store, resolves the clock and timezone, persists on every change. |
 | `timetrack-cli` | Terminal client: a ratatui TUI plus one-shot subcommands. |
 | `timetrack-gui` | Desktop client, built on gpui (upstream, from crates.io). Ships as the flatpak. |
+| `timetrack-tray` | Host-only tray item (StatusNotifierItem): service presence, week total, per-project menu. |
 
 The core takes an explicit timestamp and never reads the clock, so the rules are
 identical everywhere and testable without any I/O. Aggregation is implemented in
@@ -45,19 +47,19 @@ about where a week starts.
 |---|---|
 | Four ways to add time | explicit interval, duration ending now, duration ending earlier, quick-add (5/15/30/60) |
 | Three ways to take it back | `shorten` moves an endpoint, `undo` removes a quick-add, `delete` is explicit |
-| Split and merge | on the core and the service; not yet reachable from the GUI |
-| Totals | this ISO week, this month, all time, per project |
+| Split and merge | in the GUI (`s` split prompt, `m` merge confirm stating the shrink), the CLI, the core and the service |
+| Totals | this ISO week, this month, all time, per project; the service aggregates so both UIs agree |
 | Overlap | counted twice, by design; a day over 24h is flagged, never rejected |
-| Projects | create and archive; archiving keeps the history in totals |
+| Projects | create, rename, archive and unarchive; archiving keeps the history in totals |
 | Persistence | atomic writes; survives restart; corrupt or newer stores are refused, never silently reset |
+| CSV export | week, month or all, from the CLI and the GUI Export tab |
+| System tray | week-total tooltip with over-24h attention state, per-project quick-add / undo / delete-confirm, Open TimeTrack, Quit (host only) |
 
-**Not built yet.** Split and merge are not wired to the GUI. The
-GUI's "New project" button invents a numbered default name, because there is no
-text field yet. Merging overlapping entries shrinks the total by the overlap,
-which is deliberate (§8) but not yet explained in a confirmation dialog, because
-there is no confirmation dialog yet. The GUI Export tab writes
+**Not built yet.** The GUI Export tab writes
 `~/timetrack-export-<week|month|all>.csv` with no file picker yet (portal save
-dialog is the follow-up).
+dialog is the follow-up). The tray has no autostart entry yet, so it runs by
+hand (see below); on GNOME it needs a tray extension, since GNOME ships no
+StatusNotifier watcher — KDE, XFCE and MATE show it as-is.
 
 ## Building
 
@@ -65,9 +67,9 @@ Requires Rust 1.85 or newer (the crates are edition 2024).
 
 ```sh
 cargo build --release
-cargo test --workspace        # 136 unit tests
-bash scripts/e2e.sh           # 60 end-to-end checks against a real service
-bash scripts/gui-smoke.sh     # 10 checks that the GUI paints, clicks, and reads the keyboard
+cargo test --workspace        # 279 unit tests (GUI tests need the system libs below)
+bash scripts/e2e.sh           # 118 end-to-end checks against a real service
+bash scripts/gui-smoke.sh     # headless GUI: paint, quick-add click, keyboard, confirm dialogs, tabs
 ```
 
 On Linux the GUI additionally needs the system libraries gpui links against:
@@ -94,11 +96,13 @@ toolkit.
 
 ## Running
 
-Start the service once, then either client:
+Start the service once, then any client:
 
 ```sh
 timetrack-service &
 timetrack                      # TUI
+timetrack-gui                  # desktop GUI (host build; or the flatpak below)
+timetrack-tray &               # system tray (host only)
 timetrack quick -m 15          # or a one-shot command
 timetrack status
 ```
@@ -106,6 +110,20 @@ timetrack status
 The TUI: `1`-`4` quick-add, `a` 30 minutes, `u` undo, `d` delete, `j`/`k` move,
 `h`/`l` change project, `q` quit. Projects are created from the command line
 (`timetrack project "Work"`), since the TUI has no text field yet.
+
+The tray lists one submenu per unarchived project with its week total:
+`+5m`…`+60m` quick-add rows, an `Undo quick-add` row (enabled only while this
+session's last action on that project was a quick-add), and a
+`Delete last entry (…)` confirm submenu stating duration and project. Its icon
+shows the live week total as a tooltip and flattens with a start-service hint
+when the service is away, or asks for attention on version skew and over-24h
+days. `Open TimeTrack` launches the GUI through the desktop file's `Exec`;
+`Quit` stops the tray only, never the service.
+
+The tray needs a StatusNotifier watcher on the session bus: KDE, XFCE and
+MATE provide one; on GNOME install a tray extension first, or the icon has
+nowhere to appear. It runs on the host (never sandboxed), next to the
+service.
 
 ### The service has to be installed once
 
@@ -224,13 +242,6 @@ reproducible.
 **The GNOME 51 beta manifest is unbuilt.** `org.sequ.timetrack.beta.json`
 is identical to the GNOME 50 one apart from `runtime-version`, and the GNOME
 50 build succeeds, but the 51 build has not been run.
-
-**The timezone offset is resolved once, at startup, and only for fixed-offset
-`TZ` values.** `UTC+2` and `UTC-05:30` work; a named zone such as
-`Europe/Rome` falls back to UTC. So a machine observing DST can bucket an
-entry into the wrong local day within a few hours of a transition, which
-matters most at a week boundary. This is the likeliest remaining source of
-wrong numbers, and a real tz-database lookup per instant is the fix.
 
 ## Licence
 

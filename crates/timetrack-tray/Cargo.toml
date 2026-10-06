@@ -20,3 +20,4 @@ async-io = "2"
 
 [dev-dependencies]
 zbus = { workspace = true }
+serde_json = { workspace = true }

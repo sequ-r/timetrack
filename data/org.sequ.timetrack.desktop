@@ -2,7 +2,7 @@
 Name=TimeTrack
 GenericName=Time Tracker
 Comment=Track time on tasks
-Exec=timetrack
+Exec=timetrack-gui
 Icon=org.sequ.timetrack
 Terminal=false
 Type=Application
