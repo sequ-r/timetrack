@@ -33,6 +33,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --locked
 
+  lint:
+    name: lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Clippy builds the whole workspace including the GUI, so it needs the
+      # same system libraries as the test job.
+      - name: Install the GUI's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # `--all-targets` covers the test helpers too, where the last batch of
+      # warnings lived. `-D warnings` makes any new one fail the build.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo fmt --all -- --check
+
   build:
     name: ${{ matrix.target }}
     runs-on: ubuntu-latest

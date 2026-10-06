@@ -336,11 +336,10 @@ fn to_totals_view(t: &core::Totals) -> TotalsView {
     }
 }
 
-/// Timezone resolution lives in `timetrack-core::Tz`: `Tz::from_env` reads
-/// `TZ` (or the system zone), and offsets are then resolved per instant, so
-/// DST transitions bucket correctly. There is deliberately no offset logic
-/// left here — one implementation, in the core, so both UIs agree.
-
+// Timezone resolution lives in `timetrack-core::Tz`: `Tz::from_env` reads
+// `TZ` (or the system zone), and offsets are then resolved per instant, so
+// DST transitions bucket correctly. There is deliberately no offset logic
+// left here — one implementation, in the core, so both UIs agree.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,7 +958,7 @@ mod tests {
             Some(&3_600_000),
             "the time travels with the entry"
         );
-        assert!(snap.week.per_project.get(&p.id).is_none());
+        assert!(!snap.week.per_project.contains_key(&p.id));
     }
 
     #[test]

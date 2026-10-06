@@ -604,8 +604,10 @@ mod tests {
     fn archived_projects_are_hidden_from_the_picker() {
         // Archiving changes what can be chosen, not what exists: the history
         // stays in totals, but offering it in the picker would defeat it.
-        let mut snap = Snapshot::default();
-        snap.projects = vec![project("p1", "Work", false), project("p2", "Old", true)];
+        let snap = Snapshot {
+            projects: vec![project("p1", "Work", false), project("p2", "Old", true)],
+            ..Default::default()
+        };
         let names: Vec<&str> = active_projects(&snap)
             .iter()
             .map(|p| p.name.as_str())
@@ -633,21 +635,25 @@ mod tests {
 
     #[test]
     fn last_quick_add_prefers_the_one_we_just_made() {
-        let mut snap = Snapshot::default();
-        // Newest first, as the service sends them.
-        snap.entries = vec![
-            entry("e3", EntrySource::QuickAdd, 2_000),
-            entry("e2", EntrySource::Manual, 1_000),
-            entry("e1", EntrySource::QuickAdd, 0),
-        ];
+        let snap = Snapshot {
+            // Newest first, as the service sends them.
+            entries: vec![
+                entry("e3", EntrySource::QuickAdd, 2_000),
+                entry("e2", EntrySource::Manual, 1_000),
+                entry("e1", EntrySource::QuickAdd, 0),
+            ],
+            ..Default::default()
+        };
         // Entries are newest first, so e3 is the most recent quick add.
         assert_eq!(last_quick_add(&snap).as_deref(), Some("e3"));
     }
 
     #[test]
     fn there_is_nothing_to_undo_without_a_quick_add() {
-        let mut snap = Snapshot::default();
-        snap.entries = vec![entry("e1", EntrySource::Manual, 0)];
+        let snap = Snapshot {
+            entries: vec![entry("e1", EntrySource::Manual, 0)],
+            ..Default::default()
+        };
         assert_eq!(last_quick_add(&snap), None);
     }
 

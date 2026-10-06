@@ -23,6 +23,13 @@
 #     unchanged total through the CLI after each step.
 #   - names a project with `n` and renames one with `r` through the naming
 #     prompt, proving each typed name reached the store.
+#   - undoes the newest quick-add with `u`, asserting the total dropped by
+#     exactly that entry through the CLI.
+#   - deletes by keyboard with `d`: the first press only paints the
+#     confirmation, Escape cancels it with nothing deleted, and `d` `d`
+#     removes the entry and moves the total.
+#   - switches to the Export tab with `Tab` `Tab`, clicks "Export all" and
+#     asserts the CSV file landed with the spec header.
 #   - cycles the three tabs with `Tab`, asserting the window changed and
 #     that three presses return it pixel-identical to Home.
 #
@@ -62,6 +69,9 @@ bad()   { fail=$((fail+1));       printf '  FAIL  %s\n' "$1"; [ $# -gt 1 ] && pr
 skip()  { skipped=$((skipped+1)); printf '  skip  %s\n' "$1"; }
 check() { # check <desc> <expected> <actual>
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2] got [$3]"; fi
+}
+contains(){ # contains <desc> <needle> <haystack>
+  case "$3" in *"$2"*) ok "$1";; *) bad "$1" "expected [$2] in [$(printf '%s' "$3" | head -3)]";; esac
 }
 
 cleanup() {
@@ -197,9 +207,11 @@ blobs() { # blobs <png> <#rrggbb>
 echo
 echo "== the window paints =="
 (
-  export DISPLAY=$DISP WAYLAND_DISPLAY= DBUS_SESSION_BUS_ADDRESS TZ=UTC
+  export DISPLAY=$DISP WAYLAND_DISPLAY= DBUS_SESSION_BUS_ADDRESS TZ=UTC HOME=$WORK
   # Empty WAYLAND_DISPLAY is deliberate: gpui picks Wayland when it is set and
   # non-empty, and there is no Wayland compositor on this display.
+  # HOME points at the scratch dir so the Export buttons below write their
+  # files where this script can assert on them, not into the real home.
   [ -n "$SOFTWARE_VULKAN" ] &&
     export VK_DRIVER_FILES="$SOFTWARE_VULKAN/share/vulkan/icd.d/lvp_icd.json" LD_LIBRARY_PATH="$SOFTWARE_VULKAN/lib"
   exec "$GUI"
@@ -430,6 +442,77 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key Return
   sleep 2.5
   out=$("$CLI" project "Generalist" 2>&1); contains "the prompt renamed to the typed text" "already exists" "$out"
+
+  echo
+  echo "== undo by keyboard =="
+  # `u` removes only the newest quick-add (the 5 minutes from the `1`
+  # keypress); the hand-entered hours stay.
+  "$WORK/xtest" "$DISP" key u
+  sleep 2.5
+  check "undo removed the 5-minute quick-add" "02:15:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+  check "undo left three entries" "3" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+
+  echo
+  echo "== delete asks first, by keyboard =="
+  # To the top row (saturating) and one down: the hour-long "smoke" entry,
+  # so the deletion moves the total by an unmistakable hour.
+  for _ in $(seq 1 5); do "$WORK/xtest" "$DISP" key k; done
+  "$WORK/xtest" "$DISP" key j
+  shot delete-base.png
+  magick "$WORK/delete-base.png" -crop "$HERO" +repage "$WORK/hero-delete-base.png" 2>/dev/null
+  # The first `d` only opens the confirmation banner, pushing the total's
+  # band down like the other prompts.
+  "$WORK/xtest" "$DISP" key d
+  sleep 1.5
+  shot delete-confirm.png
+  magick "$WORK/delete-confirm.png" -crop "$HERO" +repage "$WORK/hero-delete-confirm.png" 2>/dev/null
+  DIFF=$(magick compare -metric AE "$WORK/hero-delete-base.png" "$WORK/hero-delete-confirm.png" null: 2>&1 | sed 's/ .*//')
+  if [ "${DIFF:-0}" != "0" ]; then
+    ok "the delete confirmation painted ($DIFF pixels moved)"
+  else
+    bad "the delete confirmation painted" "the total's band is unchanged with the confirmation open"
+  fi
+  # Escape cancels: nothing is deleted.
+  "$WORK/xtest" "$DISP" key Escape
+  sleep 1.5
+  check "escape cancels the delete" "3" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "a cancelled delete moves nothing" "02:15:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+  # `d` again, then `d` to confirm: the hour goes away.
+  "$WORK/xtest" "$DISP" key d
+  sleep 1.5
+  "$WORK/xtest" "$DISP" key d
+  sleep 2.5
+  check "d d deleted one entry" "2" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "the deleted hour left the total" "01:15:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
+  "$CLI" list | grep -q smoke && bad "the deleted entry is gone" "smoke still listed" || ok "the deleted entry is gone"
+
+  echo
+  echo "== export from the GUI writes a file =="
+  # Home -> Projects -> Export. The three green buttons there are the only
+  # green on screen; they carry longer labels than the quick-add row, so the
+  # width filter is wider than the quick-add one.
+  "$WORK/xtest" "$DISP" key Tab
+  sleep 1
+  "$WORK/xtest" "$DISP" key Tab
+  sleep 1.5
+  shot export-tab.png
+  EXPORTS=$(blobs export-tab.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45' | wc -l)
+  check "three export buttons are drawn" "3" "$EXPORTS"
+  # The rightmost button is "Export all".
+  CLICK=$(blobs export-tab.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45 {print $3" "$4" "$1" "$2}' | sort -n | sed -n '3p' | awk '{print int($1 + $3/2), int($2 + $4/2)}')
+  echo "  clicking ($CLICK)"
+  "$WORK/xtest" "$DISP" click ${CLICK}
+  for _ in $(seq 1 30); do [ -f "$WORK/timetrack-export-all.csv" ] && break; sleep 0.3; done
+  if [ -f "$WORK/timetrack-export-all.csv" ]; then
+    ok "the GUI export wrote a file"
+  else
+    bad "the GUI export wrote a file" "no $WORK/timetrack-export-all.csv after 9s"
+  fi
+  check "the GUI export has the spec header" "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note" "$(head -1 "$WORK/timetrack-export-all.csv" 2>/dev/null)"
+  check "the GUI export holds both remaining entries" "3" "$(wc -l <"$WORK/timetrack-export-all.csv" 2>/dev/null)"
+  # Export -> Home, so the tab test below starts where it expects.
+  "$WORK/xtest" "$DISP" key Tab
+  sleep 1.5
 
   echo
   echo "== tab switching by keyboard =="

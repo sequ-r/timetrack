@@ -311,6 +311,16 @@ if [ "$(printf '%s\n%s\n' "$week" "$all" | sort | head -1)" = "$week" ]; then
 else
   bad "week total within all-time" "week=$week all=$all"
 fi
+# The month is a subset of all time, so the same relationship holds one
+# level up. (Week vs month has no fixed order -- a week straddling the 1st
+# holds days from last month -- so only the all-time bound is asserted.)
+month=$(printf '%s' "$out" | sed -nE 's/^this month:[[:space:]]+([0-9:]+).*/\1/p')
+[ -n "$month" ] && ok "month total present ($month)" || bad "month total present" "empty"
+if [ "$(printf '%s\n%s\n' "$month" "$all" | sort | head -1)" = "$month" ]; then
+  ok "month total is within the all-time total"
+else
+  bad "month total within all-time" "month=$month all=$all"
+fi
 
 echo
 echo "== a day over 24h is flagged, not refused =="
@@ -397,6 +407,49 @@ else
 fi
 
 echo
+echo "== a named timezone restarts cleanly and keeps every total =="
+# The service resolves TZ once at startup; a named zone must bucket through
+# the tz database rather than falling back to UTC, without moving any total.
+before_all=$(total)
+before_n=$(listed)
+kill "$SVC_PID"; wait "$SVC_PID" 2>/dev/null
+TZ=Europe/Rome "$SVC" "$STORE" >>"$WORK/svc.log" 2>&1 &
+SVC_PID=$!
+wait_for_service || { echo "service did not come back on Europe/Rome"; cat "$WORK/svc.log"; exit 1; }
+check "all-time total survived the timezone restart" "$before_all" "$(total)"
+check "every entry survived the timezone restart" "$before_n" "$(listed)"
+SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries.Snapshot \
+  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
+import json, sys
+snap = json.load(sys.stdin)
+probs = []
+if snap.get("tz") != "Europe/Rome":
+    probs.append("tz is %r, not Europe/Rome" % snap.get("tz"))
+if snap.get("local_offset_ms") not in (3_600_000, 7_200_000):
+    probs.append("offset %r is not a Rome offset" % snap.get("local_offset_ms"))
+if snap["all"]["total_ms"] != snap["total_ms"]:
+    probs.append("aggregates disagree after the restart")
+print(";".join(probs))
+'); then
+  check "the snapshot names its zone and agrees with itself" "" "$AGREE"
+else
+  bad "the snapshot names its zone and agrees with itself" "could not parse the snapshot"
+fi
+out=$("$CLI" status)
+contains "status still reports the week on a named zone" "this week:" "$out"
+contains "status still reports the month on a named zone" "this month:" "$out"
+# Back to UTC for the remaining sections, so wall-clock assertions below
+# run in the same zone as the entries were written in.
+kill "$SVC_PID"; wait "$SVC_PID" 2>/dev/null
+TZ=UTC "$SVC" "$STORE" >>"$WORK/svc.log" 2>&1 &
+SVC_PID=$!
+wait_for_service || { echo "service did not come back on UTC"; cat "$WORK/svc.log"; exit 1; }
+check "all-time total survived the return to UTC" "$before_all" "$(total)"
+
+echo
 echo "== archiving keeps history in the totals =="
 before_all=$(total)
 out=$("$CLI" archive "p1")
@@ -415,6 +468,22 @@ echo "== CSV export writes a file with the spec columns =="
 contains "export header" "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note" "$(head -1 "$WORK/export.csv")"
 contains "export has a data row" "manual" "$(cat "$WORK/export.csv")"
 contains "export timestamps are ISO 8601" "T" "$(cat "$WORK/export.csv")"
+# Week and month scopes write the same shape, narrowed: neither may hold
+# more rows than the all-time export from the same store. (Week vs month
+# has no fixed order -- a week straddling the 1st holds days from last
+# month -- so only the all-time bound is asserted.)
+"$CLI" export --scope week --out "$WORK/export-week.csv" >/dev/null
+contains "week export header" "id,project,description,started_at,ended_at" "$(head -1 "$WORK/export-week.csv")"
+"$CLI" export --scope month --out "$WORK/export-month.csv" >/dev/null
+contains "month export header" "id,project,description,started_at,ended_at" "$(head -1 "$WORK/export-month.csv")"
+all_rows=$(($(wc -l <"$WORK/export.csv") - 1))
+week_rows=$(($(wc -l <"$WORK/export-week.csv") - 1))
+month_rows=$(($(wc -l <"$WORK/export-month.csv") - 1))
+if [ "$week_rows" -le "$all_rows" ] && [ "$month_rows" -le "$all_rows" ]; then
+  ok "scoped exports narrow the rows (week $week_rows, month $month_rows, all $all_rows)"
+else
+  bad "scoped exports narrow the rows" "week=$week_rows month=$month_rows all=$all_rows"
+fi
 out=$("$CLI" export --scope bogus 2>&1); contains "bad scope refused" "unknown export scope" "$out"
 
 echo

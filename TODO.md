@@ -59,13 +59,13 @@ survey (2026-10-05). Ordered by value. Check off as done.
   - Scope: `timetrack-gui/src/app.rs:391` (`on_key` handles `1-4/u/d/h/l/j/k/q` only, tabs click-only), `render_week_by_project`.
   - Accept: shortcuts switch tabs; per-project rows show proportional bars.
 
-- [ ] **11. Destructive-action confirmations + un-archive**
+- [x] **11. Destructive-action confirmations + un-archive**
   - Scope: `timetrack-gui/src/app.rs` (bare `d` delete, archive without un-archive, no merge shrink warning — see `PLAN.md` risks).
   - Accept: delete/merge confirm, merge text states shrink amount, archive reversible.
 
 ## P3 — engineering hygiene
 
-- [ ] **12. Fix clippy + gate it in CI**
+- [x] **12. Fix clippy + gate it in CI**
   - `cargo clippy --workspace -- -D warnings` fails at `timetrack-core/src/model.rs:133` (`unnecessary_sort_by`); no `[lints]`, no clippy/fmt job in `.github/workflows/release.yml`.
   - Accept: sort fixed, `clippy` + `fmt --check` in CI.
 

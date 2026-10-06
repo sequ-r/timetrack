@@ -64,6 +64,8 @@ enum Action {
     DeleteEntry(String),
     /// Archive a project, keeping its history in totals.
     ArchiveProject(String),
+    /// Reverse an archive, making the project selectable again.
+    UnarchiveProject(String),
     /// Create a project.
     AddProject(String),
     /// Rename a project. Colour is untouched: the GUI names projects, the
@@ -160,6 +162,9 @@ fn spawn_service_thread() -> (Receiver<Msg>, Sender<Action>) {
                         }
                         Ok(Action::ArchiveProject(id)) => {
                             report(&tx, client.set_archived(&id, true).await.map(|_| ()));
+                        }
+                        Ok(Action::UnarchiveProject(id)) => {
+                            report(&tx, client.set_archived(&id, false).await.map(|_| ()));
                         }
                         Ok(Action::AddProject(name)) => {
                             report(&tx, client.add_project(&name).await.map(|_| ()));
@@ -725,6 +730,45 @@ fn merge_offer(snapshot: &Snapshot, selected: usize) -> Option<MergeConfirm> {
     })
 }
 
+/// A pending delete confirmation: the id to send, and the one-line summary
+/// the banner shows (entry, project, duration) so `d` can never remove time
+/// as a side effect of reaching for another key.
+#[derive(Debug, Clone)]
+struct DeleteConfirm {
+    id: String,
+    summary: String,
+}
+
+/// Build the delete confirmation for the selection, if there is one.
+///
+/// Free over the snapshot like `merge_offer`, for the same reason. The
+/// summary names the entry, its project and its duration so the confirm
+/// banner states exactly what would be lost.
+fn delete_offer(snapshot: &Snapshot, selected: usize) -> Option<DeleteConfirm> {
+    let picked = snapshot.entries.get(selected)?.clone();
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|p| p.id == picked.project_id)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| picked.project_id.clone());
+    let what = if picked.description.is_empty() {
+        "no note".to_string()
+    } else {
+        format!("'{}'", picked.description)
+    };
+    Some(DeleteConfirm {
+        summary: format!(
+            "DELETE {} ({} · {} · {})? d to confirm, esc to cancel",
+            picked.id,
+            project,
+            timetrack_core::format_duration(picked.duration_ms()),
+            what,
+        ),
+        id: picked.id,
+    })
+}
+
 /// The project prompt: one name field, for creating (`edit_id` none) or
 /// renaming (`edit_id` set, prefilled with the current name).
 ///
@@ -849,6 +893,9 @@ pub struct TimetrackView {
     /// A pending merge confirmation. Only `m` (confirm), escape (cancel)
     /// and `q` (quit) do anything while this is `Some`.
     merge_confirm: Option<MergeConfirm>,
+    /// A pending delete confirmation. Only `d` (confirm), escape (cancel)
+    /// and `q` (quit) do anything while this is `Some`.
+    delete_confirm: Option<DeleteConfirm>,
 }
 
 /// Where a GUI export lands by default.
@@ -879,6 +926,7 @@ impl TimetrackView {
             project_prompt: None,
             split_prompt: None,
             merge_confirm: None,
+            delete_confirm: None,
         };
         view.schedule_poll(cx);
         view
@@ -1037,6 +1085,10 @@ impl TimetrackView {
         if self.merge_confirm.is_some() {
             return self.on_merge_key(ev);
         }
+        // A pending delete only listens for its own answer.
+        if self.delete_confirm.is_some() {
+            return self.on_delete_key(ev);
+        }
         // Tab cycles the three tabs (§11); shift goes backward. The Tab key
         // carries no printable char, so this keys on the key name, like the
         // dialog's field cycling does.
@@ -1071,12 +1123,7 @@ impl TimetrackView {
                 Some(id) => self.send(Action::UndoQuickAdd(id)),
                 None => self.status = Some(StatusMsg::local("nothing to undo")),
             },
-            "d" => {
-                if let Some(e) = self.snapshot.entries.get(self.selected) {
-                    let id = e.id.clone();
-                    self.send(Action::DeleteEntry(id));
-                }
-            }
+            "d" => self.open_delete_confirm(),
 
             // Split and merge (REQUIREMENTS §8).
             "s" => self.open_split_prompt(),
@@ -1371,6 +1418,40 @@ impl TimetrackView {
         }
     }
 
+    /// Offer the delete confirmation for the selection, if there is one.
+    /// The first `d` only opens the banner; a second `d` executes it.
+    fn open_delete_confirm(&mut self) {
+        match delete_offer(&self.snapshot, self.selected) {
+            Some(confirm) => {
+                self.status = None;
+                self.delete_confirm = Some(confirm);
+            }
+            None => {
+                self.status = Some(StatusMsg::local("nothing to delete"));
+            }
+        }
+    }
+
+    /// Handle a key press while a delete confirmation is pending. Only the
+    /// confirmation's own answers do anything; anything else is swallowed so
+    /// no other action can sneak in mid-confirmation.
+    fn on_delete_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if ev.keystroke.key.as_str() == "escape" {
+            self.delete_confirm = None;
+            return true;
+        }
+        match ev.keystroke.key_char.as_deref() {
+            Some("d") => {
+                if let Some(confirm) = self.delete_confirm.take() {
+                    self.send(Action::DeleteEntry(confirm.id));
+                }
+                true
+            }
+            Some("q") => false,
+            _ => true,
+        }
+    }
+
     /// Validate the dialog and send the action(s). Stays open with an error
     /// on invalid input; closes on success or when nothing changed.
     fn dialog_save(&mut self) {
@@ -1467,6 +1548,8 @@ impl TimetrackView {
                 "type a moment · enter split · esc cancel".to_string()
             } else if self.merge_confirm.is_some() {
                 "m to confirm the merge · esc to cancel".to_string()
+            } else if self.delete_confirm.is_some() {
+                "d to confirm the delete · esc to cancel".to_string()
             } else if self.project_prompt.is_some() {
                 "type a name · enter save · esc cancel".to_string()
             } else {
@@ -1638,6 +1721,9 @@ impl TimetrackView {
             .when_some(self.merge_confirm.clone(), |el, confirm| {
                 el.child(self.render_merge_confirm(&confirm))
             })
+            .when_some(self.delete_confirm.clone(), |el, confirm| {
+                el.child(self.render_delete_confirm(&confirm))
+            })
             .when_some(self.project_prompt.clone(), |el, prompt| {
                 el.child(self.render_project_prompt(&prompt))
             })
@@ -1800,6 +1886,26 @@ impl TimetrackView {
     /// point (§8): merging overlapping entries shrinks the total, and the
     /// user states the overlap was a mistake by confirming.
     fn render_merge_confirm(&self, confirm: &MergeConfirm) -> impl IntoElement {
+        div()
+            .mx_6()
+            .mt_3()
+            .mb_1()
+            .px_4()
+            .py_3()
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x1a1a26))
+            .child(
+                div()
+                    .text_color(rgb(0x7fd3ff))
+                    .child(confirm.summary.clone()),
+            )
+    }
+
+    /// The delete confirmation banner: exactly which entry would go, so a
+    /// destructive action is never one keystroke with no reading step.
+    fn render_delete_confirm(&self, confirm: &DeleteConfirm) -> impl IntoElement {
         div()
             .mx_6()
             .mt_3()
@@ -2163,9 +2269,11 @@ impl TimetrackView {
                         .child(timetrack_core::format_duration(all)),
                 )
                 // Archiving is offered only for live projects; an archived one
-                // has nothing left to hide.
+                // offers the reverse instead, so archiving is reversible
+                // without the CLI.
                 .when(!p.archived, {
                     let entity = self.entity.clone();
+                    let project_id = id.clone();
                     move |el| {
                         el.child(
                             div()
@@ -2185,7 +2293,35 @@ impl TimetrackView {
                                 .on_click(move |_ev, _window, cx| {
                                     if let Some(entity) = entity.clone() {
                                         entity.update(cx, |view, cx| {
-                                            view.send(Action::ArchiveProject(id.clone()));
+                                            view.send(Action::ArchiveProject(project_id.clone()));
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                    }
+                })
+                .when(p.archived, {
+                    let entity = self.entity.clone();
+                    let project_id = id.clone();
+                    move |el| {
+                        el.child(
+                            div()
+                                .id(ElementId::from((
+                                    "unarchive",
+                                    p.id.trim_start_matches('p').parse::<u64>().unwrap_or(0),
+                                )))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgba(0x2ea04366))
+                                .text_color(rgb(0xc8c8d8))
+                                .child("Unarchive")
+                                .on_click(move |_ev, _window, cx| {
+                                    if let Some(entity) = entity.clone() {
+                                        entity.update(cx, |view, cx| {
+                                            view.send(Action::UnarchiveProject(project_id.clone()));
                                             cx.notify();
                                         });
                                     }
@@ -2466,20 +2602,24 @@ mod tests {
 
     #[test]
     fn undo_targets_the_newest_quick_add() {
-        let mut snap = Snapshot::default();
-        // Newest first, as the service sends them.
-        snap.entries = vec![
-            entry("e3", EntrySource::QuickAdd, 2_000),
-            entry("e2", EntrySource::Manual, 1_000),
-            entry("e1", EntrySource::QuickAdd, 0),
-        ];
+        let snap = Snapshot {
+            // Newest first, as the service sends them.
+            entries: vec![
+                entry("e3", EntrySource::QuickAdd, 2_000),
+                entry("e2", EntrySource::Manual, 1_000),
+                entry("e1", EntrySource::QuickAdd, 0),
+            ],
+            ..Default::default()
+        };
         assert_eq!(newest_quick_add(&snap).as_deref(), Some("e3"));
     }
 
     #[test]
     fn there_is_nothing_to_undo_without_a_quick_add() {
-        let mut snap = Snapshot::default();
-        snap.entries = vec![entry("e1", EntrySource::Manual, 0)];
+        let snap = Snapshot {
+            entries: vec![entry("e1", EntrySource::Manual, 0)],
+            ..Default::default()
+        };
         assert_eq!(newest_quick_add(&snap), None);
     }
 
@@ -2828,6 +2968,53 @@ mod tests {
     fn merge_offer_is_none_without_targets() {
         let snap = merge_snapshot();
         assert!(merge_offer(&snap, 2).is_none());
+    }
+
+    // --- delete confirmation ---
+
+    #[test]
+    fn delete_offer_names_the_entry_project_and_duration() {
+        let snap = Snapshot {
+            entries: vec![EntryView {
+                description: "review".into(),
+                ..entry_on("e1", "p1", 0, 3_600_000)
+            }],
+            projects: vec![project("p1", "Work")],
+            ..Default::default()
+        };
+        let offer = delete_offer(&snap, 0).expect("e1 is selected");
+        assert_eq!(offer.id, "e1");
+        assert!(
+            offer.summary.contains("DELETE e1"),
+            "must name the entry: {}",
+            offer.summary
+        );
+        assert!(
+            offer.summary.contains("Work"),
+            "must name the project: {}",
+            offer.summary
+        );
+        assert!(
+            offer.summary.contains("01:00:00"),
+            "must state the duration: {}",
+            offer.summary
+        );
+        assert!(
+            offer.summary.contains("d to confirm"),
+            "must state the confirm key: {}",
+            offer.summary
+        );
+    }
+
+    #[test]
+    fn delete_offer_is_none_without_a_selection() {
+        assert!(delete_offer(&Snapshot::default(), 0).is_none());
+        let snap = Snapshot {
+            entries: vec![entry_on("e1", "p1", 0, 3_600_000)],
+            projects: vec![project("p1", "Work")],
+            ..Default::default()
+        };
+        assert!(delete_offer(&snap, 99).is_none());
     }
 
     // --- project prompt ---

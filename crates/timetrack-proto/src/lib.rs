@@ -628,10 +628,12 @@ mod tests {
 
     #[test]
     fn totals_view_round_trips() {
-        let mut t = TotalsView::default();
-        t.total_ms = 100;
+        let mut t = TotalsView {
+            total_ms: 100,
+            entry_count: 1,
+            ..Default::default()
+        };
         t.per_project.insert("p1".into(), 100);
-        t.entry_count = 1;
         let text = serde_json::to_string(&t).unwrap();
         assert_eq!(serde_json::from_str::<TotalsView>(&text).unwrap(), t);
     }
