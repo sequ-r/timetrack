@@ -77,6 +77,29 @@ struct ExportRequest {
     suggested_name: String,
 }
 
+/// Build the request for one export button, from one anchor and one zone.
+///
+/// Everything the request names -- the period, the file name, the fallback
+/// path -- is derived together, so the file cannot be called `...-W41.csv`
+/// while holding a different week. The destination used to be computed at
+/// render time and captured in the click closure, so a zone that changed
+/// between the last paint and the click put the file in a directory named
+/// for a different week.
+fn export_request(
+    scope: timetrack_core::ExportScope,
+    anchor_ms: i64,
+    now: i64,
+    tz: &timetrack_core::Tz,
+) -> ExportRequest {
+    ExportRequest {
+        scope,
+        path: default_export_path(scope, anchor_ms, tz),
+        anchor_ms: export_anchor_for_save(scope, anchor_ms, now, tz),
+        period_id: export_period_label(scope, anchor_ms, tz),
+        suggested_name: export_suggested_name(scope, anchor_ms, tz),
+    }
+}
+
 /// A command the UI wants performed. The service thread owns the bus
 /// connection, so the UI cannot issue D-Bus calls itself.
 #[derive(Debug, Clone)]
@@ -3337,9 +3360,6 @@ impl TimetrackView {
             {
                 let entity = self.entity.clone();
                 let button_scope = *button_scope;
-                let path = default_export_path(button_scope, self.export_picker.anchor_ms, &tz);
-                let suggested_name =
-                    export_suggested_name(button_scope, self.export_picker.anchor_ms, &tz);
                 let label = format!("Export {}", button_scope.as_str());
                 row = row.child(
                     div()
@@ -3353,28 +3373,22 @@ impl TimetrackView {
                         .child(label)
                         .when_some(entity, move |el, entity| {
                             el.on_click(move |_ev, _window, cx| {
-                                let path = path.clone();
-                                let suggested_name = suggested_name.clone();
                                 entity.update(cx, |view, cx| {
+                                    // Everything about the request is computed
+                                    // here, from one snapshot and one zone:
+                                    // the destination used to be computed at
+                                    // render time and captured, so a zone
+                                    // that changed between the last paint and
+                                    // the click would have put the file in a
+                                    // directory named for a different week.
                                     let tz = snapshot_tz(&view.snapshot);
-                                    let anchor_ms = export_anchor_for_save(
+                                    let request = export_request(
                                         button_scope,
                                         view.export_picker.anchor_ms,
                                         now_ms(),
                                         &tz,
                                     );
-                                    let period_id = export_period_label(
-                                        button_scope,
-                                        view.export_picker.anchor_ms,
-                                        &tz,
-                                    );
-                                    view.send(Action::ExportCsv(ExportRequest {
-                                        scope: button_scope,
-                                        path,
-                                        anchor_ms,
-                                        period_id,
-                                        suggested_name,
-                                    }));
+                                    view.send(Action::ExportCsv(request));
                                     cx.notify();
                                 });
                             })
@@ -4496,6 +4510,40 @@ mod tests {
                 "all time ignores the anchor: {all}"
             );
         }
+    }
+
+    #[test]
+    fn an_export_request_names_one_period_everywhere() {
+        // The destination used to be computed at render time and captured in
+        // the click closure, so it could come from a different snapshot than
+        // the period the request names. Everything is derived together now.
+        let scope = timetrack_core::ExportScope::Week;
+        let anchor = day_anchor("2026-10-08");
+        // `now` in a different week, so the request names a *chosen* period
+        // and takes the anchored call rather than the current-period one.
+        let now = day_anchor("2026-11-05");
+        let request = export_request(scope, anchor, now, &utc_tz());
+        assert_eq!(request.period_id, "2026-W41");
+        assert_eq!(request.suggested_name, "timetrack-export-week-2026-W41.csv");
+        assert!(
+            request.path.ends_with("timetrack-export-week-2026-W41.csv"),
+            "the fallback path names the same week: {}",
+            request.path
+        );
+        assert_eq!(
+            request.anchor_ms,
+            Some(anchor),
+            "a chosen period uses the anchored call"
+        );
+    }
+
+    #[test]
+    fn an_export_request_for_all_time_ignores_the_anchor() {
+        let anchor = day_anchor("2026-10-08");
+        let request = export_request(timetrack_core::ExportScope::All, anchor, anchor, &utc_tz());
+        assert_eq!(request.period_id, "all time");
+        assert_eq!(request.suggested_name, "timetrack-export-all.csv");
+        assert_eq!(request.anchor_ms, None, "all time uses the old call");
     }
 
     #[test]
