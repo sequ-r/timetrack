@@ -31,12 +31,14 @@ pub(crate) enum ProjectSave {
     Update { id: String, name: String },
 }
 
-/// Resolve a project prompt. Empty stays open with an error rather than
-/// storing a label no picker could show; duplicates travel to the service,
-/// which owns name uniqueness and reports them typed.
-pub(crate) fn resolve_project_prompt(prompt: &ProjectPrompt) -> Result<ProjectSave, String> {
+/// Resolve a project prompt. Empty stays open with the core's typed rule
+/// error rather than storing a label no picker could show; duplicates travel
+/// to the service, which owns name uniqueness and reports them typed.
+pub(crate) fn resolve_project_prompt(
+    prompt: &ProjectPrompt,
+) -> Result<ProjectSave, timetrack_core::RuleError> {
     if prompt.name.trim().is_empty() {
-        return Err("enter a project name".to_string());
+        return Err(timetrack_core::RuleError::BlankProjectName);
     }
     let name = prompt.name.trim().to_string();
     match &prompt.edit_id {
@@ -78,7 +80,13 @@ mod tests {
                 name: "Work".into()
             })
         );
-        assert!(resolve_project_prompt(&project_prompt(None, "")).is_err());
-        assert!(resolve_project_prompt(&project_prompt(Some("p1"), "   ")).is_err());
+        assert_eq!(
+            resolve_project_prompt(&project_prompt(None, "  \t ")),
+            Err(timetrack_core::RuleError::BlankProjectName)
+        );
+        assert_eq!(
+            resolve_project_prompt(&project_prompt(Some("p1"), "   ")),
+            Err(timetrack_core::RuleError::BlankProjectName)
+        );
     }
 }

@@ -687,9 +687,9 @@ impl TimetrackView {
             return;
         };
         match resolve_project_prompt(&prompt) {
-            Err(msg) => {
+            Err(error) => {
                 if let Some(open) = self.project_prompt.as_mut() {
-                    open.error = Some(msg);
+                    open.error = Some(error.to_string());
                 }
             }
             Ok(ProjectSave::Create { name }) => {

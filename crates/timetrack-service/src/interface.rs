@@ -819,6 +819,19 @@ mod tests {
     }
 
     #[test]
+    fn blank_project_names_keep_the_core_rule_error() {
+        use timetrack_core::RuleError;
+
+        let (svc, _) = service("blank-project");
+        let before = svc.snapshot().projects;
+        assert_eq!(
+            svc.add_project(" \t ").unwrap_err(),
+            ServiceError::Rule(RuleError::BlankProjectName)
+        );
+        assert_eq!(svc.snapshot().projects, before);
+    }
+
+    #[test]
     fn the_last_project_cannot_be_deleted() {
         // A fresh store is seeded with "General", so archiving it leaves
         // exactly one project and that one is undeletable.
