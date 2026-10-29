@@ -43,7 +43,7 @@ pub mod tz;
 
 pub use aggregate::{
     IsoWeek, Totals, all_totals, days_in_month, is_leap_year, iso_week_of, month_of, month_totals,
-    totals_in_day_range, week_totals,
+    totals_in_day_range, week_totals, ymd_of,
 };
 pub use export::{
     CSV_HEADER, ExportScope, anchor_day_string, default_export_filename, entries_in_scope,
@@ -51,19 +51,37 @@ pub use export::{
     format_export_status, format_local_iso8601, month_id, week_id,
 };
 pub use model::{
-    Entry, EntrySource, MS_PER_DAY, Project, STORE_VERSION, Store, local_day_of, local_day_start,
+    Entry, EntrySource, MAX_DAY, MAX_INSTANT_MS, MIN_DAY, MIN_INSTANT_MS, MS_PER_DAY, Project,
+    STORE_VERSION, Store, instant_in_range, local_day_of, local_day_start,
 };
 pub use parse::{
-    ParseError, ParseResult, format_local_hm, parse_anchor_day, parse_duration, parse_moment,
+    ParseError, ParseResult, format_local_hm, parse_anchor_day, parse_colour, parse_duration,
+    parse_moment,
 };
 pub use rules::{
-    Counter, Ids, QUICK_ADD_MS, RuleError, RuleResult, create_duration, create_entry,
-    create_project, days_exceeding_24h, delete_entry, delete_project, format_merge_delta,
-    merge_entries, merge_shrink_ms, next_project_id, quick_add, set_archived, set_project,
-    set_text, set_times, split_entry, update_project,
+    Counter, Ids, MAX_DESCRIPTION_CHARS, MAX_NOTE_CHARS, MAX_PROJECT_NAME_CHARS, QUICK_ADD_MS,
+    RuleError, RuleResult, create_duration, create_duration_ending, create_entry, create_project,
+    days_exceeding_24h, delete_entry, delete_project, format_merge_delta, merge_entries,
+    merge_shrink_ms, next_project_id, quick_add, set_archived, set_project, set_text, set_times,
+    split_entry, update_project,
 };
 pub use storage::{JsonStore, StorageError, StorageResult};
 pub use tz::Tz;
+
+/// A single-line display copy of stored free text (#101).
+///
+/// Project names and descriptions are user text that renderers show in
+/// terminals, menus, and tooltips. The rules refuse control characters in
+/// new text, but a store written before that check (or edited by hand) can
+/// still hold newlines and escape sequences that would break terminal
+/// columns or drive the terminal itself. Every renderer therefore displays
+/// this copy — control characters replaced by spaces — and never the raw
+/// stored bytes. The stored value is untouched; this is presentation only.
+pub fn sanitize_display(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
 
 /// Format a duration in milliseconds as `HH:MM:SS`.
 ///
@@ -110,6 +128,23 @@ mod tests {
         // A day may legitimately sum past 24h (§4); wrapping would hide the
         // very thing the 24h warning exists to surface.
         assert_eq!(format_duration(30 * 3_600_000), "30:00:00");
+    }
+
+    #[test]
+    fn display_copies_carry_no_control_characters() {
+        // #101: newlines, ANSI escapes, and other C0/C1 controls become
+        // spaces; ordinary text (including non-ASCII) passes through.
+        assert_eq!(sanitize_display("Work"), "Work");
+        assert_eq!(sanitize_display("a\nb\rc\td"), "a b c d");
+        assert_eq!(sanitize_display("\u{1b}[31mred\u{1b}[0m"), " [31mred [0m");
+        assert_eq!(sanitize_display("café ☕"), "café ☕");
+        assert_eq!(sanitize_display(""), "");
+        assert!(
+            !sanitize_display("x\u{7}y\u{85}z")
+                .chars()
+                .any(|c| c.is_control()),
+            "no control character survives"
+        );
     }
 
     #[test]

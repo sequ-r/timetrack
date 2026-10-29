@@ -55,7 +55,9 @@ impl Entry {
     /// interpolate. Clamped at zero so a bad interval cannot produce a
     /// negative total.
     pub fn duration_ms(&self) -> i64 {
-        (self.ended_at - self.started_at).max(0)
+        // Saturating: a hand-edited store can hold endpoints the rules would
+        // never accept, and a display total must not panic or wrap on them.
+        self.ended_at.saturating_sub(self.started_at).max(0)
     }
 
     /// This entry's local-time day, using the offset in force at its start.
@@ -115,7 +117,11 @@ impl Store {
 
     /// Total of every entry, in milliseconds (sum of durations, §4).
     pub fn total_ms(&self) -> i64 {
-        self.entries.iter().map(|e| e.duration_ms()).sum()
+        // Saturating, like `Entry::duration_ms`: summed display totals over a
+        // hand-edited store saturate instead of wrapping.
+        self.entries
+            .iter()
+            .fold(0i64, |acc, e| acc.saturating_add(e.duration_ms()))
     }
 
     /// Sum of durations for one project.
@@ -123,8 +129,7 @@ impl Store {
         self.entries
             .iter()
             .filter(|e| e.project_id == project_id)
-            .map(|e| e.duration_ms())
-            .sum()
+            .fold(0i64, |acc, e| acc.saturating_add(e.duration_ms()))
     }
 
     /// Entries most recent first, which is the order both UIs show.
@@ -154,6 +159,29 @@ impl Store {
 /// the sign conventions down.
 pub const MS_PER_DAY: i64 = 86_400_000;
 
+/// The supported instant range: years 0001–9999 (#97).
+///
+/// Every instant the app stores, buckets, or exports must lie in
+/// `[MIN_INSTANT_MS, MAX_INSTANT_MS]`. The rules refuse entry endpoints
+/// outside it with a typed error, and the calendar conversions clamp day
+/// indices to `[MIN_DAY, MAX_DAY]`, so a raw `i64` from the wire can neither
+/// spin the calendar math nor produce an invalid month. The bounds are the
+/// four-digit years the rest of the app already assumes (anchor days spell
+/// `YYYY-MM-DD`, period ids format `{:04}`), and they leave roughly eight
+/// thousand years of headroom either side of any real timesheet.
+pub const MIN_INSTANT_MS: i64 = -62_135_596_800_000; // 0001-01-01T00:00:00Z
+/// End of the supported range: 9999-12-31T23:59:59.999Z.
+pub const MAX_INSTANT_MS: i64 = 253_402_300_799_999;
+/// Local day index of 0001-01-01: `MIN_DAY * MS_PER_DAY == MIN_INSTANT_MS`.
+pub const MIN_DAY: i64 = -719_162;
+/// Local day index of 9999-12-31: the last day ending at `MAX_INSTANT_MS`.
+pub const MAX_DAY: i64 = 2_932_896;
+
+/// Whether `ms` lies in the supported instant range.
+pub fn instant_in_range(ms: i64) -> bool {
+    (MIN_INSTANT_MS..=MAX_INSTANT_MS).contains(&ms)
+}
+
 /// The local-time day index of a UTC instant, given the zone's offset there.
 ///
 /// Floor-divides, so instants before the epoch bucket correctly instead of
@@ -162,14 +190,19 @@ pub fn local_day_of(utc_ms: i64, local_offset_ms: i64) -> i64 {
     // The offset is ADDED: a UTC+1 zone's local clock is ahead of UTC, so a
     // given instant has a later local time and can already be on the next
     // local day. Subtracting here pushed late-evening instants back a day.
-    (utc_ms + local_offset_ms).div_euclid(MS_PER_DAY)
+    // Saturating so an extreme wire value buckets at the range edge (the
+    // calendar conversions clamp there) instead of wrapping (#98).
+    utc_ms
+        .saturating_add(local_offset_ms)
+        .div_euclid(MS_PER_DAY)
 }
 
 /// Milliseconds since the Unix epoch of local midnight opening `day`.
 pub fn local_day_start(day: i64, local_offset_ms: i64) -> i64 {
     // Inverse of `local_day_of`, so the sign matches: the offset is added in
-    // one and subtracted in the other.
-    day * MS_PER_DAY - local_offset_ms
+    // one and subtracted in the other. Saturating, for the same reason.
+    day.saturating_mul(MS_PER_DAY)
+        .saturating_sub(local_offset_ms)
 }
 
 #[cfg(test)]
@@ -304,6 +337,34 @@ mod tests {
             let start = local_day_start(day, 3_600_000);
             assert_eq!(local_day_of(start, 3_600_000), day);
         }
+    }
+
+    #[test]
+    fn supported_range_bounds_agree_with_each_other() {
+        // The day bounds and the instant bounds name the same range (#97):
+        // MIN_DAY opens at MIN_INSTANT_MS and MAX_DAY ends at MAX_INSTANT_MS.
+        assert_eq!(MIN_DAY * MS_PER_DAY, MIN_INSTANT_MS);
+        assert_eq!((MAX_DAY + 1) * MS_PER_DAY - 1, MAX_INSTANT_MS);
+        assert!(instant_in_range(MIN_INSTANT_MS));
+        assert!(instant_in_range(MAX_INSTANT_MS));
+        assert!(instant_in_range(0));
+        assert!(!instant_in_range(MIN_INSTANT_MS - 1));
+        assert!(!instant_in_range(MAX_INSTANT_MS + 1));
+        assert!(!instant_in_range(i64::MIN));
+        assert!(!instant_in_range(i64::MAX));
+    }
+
+    #[test]
+    fn duration_and_day_math_saturate_on_extreme_stored_values() {
+        // #98: endpoints a hand-edited store could hold must not panic in
+        // debug or wrap in release when a total merely displays them.
+        assert_eq!(entry("a", i64::MIN, i64::MAX).duration_ms(), i64::MAX);
+        assert_eq!(local_day_of(i64::MAX, 3_600_000), i64::MAX / MS_PER_DAY);
+        assert_eq!(local_day_start(i64::MAX, 0), i64::MAX);
+        let mut s = Store::default();
+        s.entries.push(entry("a", 0, i64::MAX));
+        s.entries.push(entry("b", 0, i64::MAX));
+        assert_eq!(s.total_ms(), i64::MAX, "summed totals saturate");
     }
 
     #[test]

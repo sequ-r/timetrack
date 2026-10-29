@@ -11,7 +11,7 @@
 //! explicit timestamp, and never reads a clock itself. That keeps the whole
 //! module deterministic and testable without I/O.
 
-use crate::model::{Entry, EntrySource, MS_PER_DAY, Project, Store};
+use crate::model::{Entry, EntrySource, MS_PER_DAY, Project, Store, instant_in_range};
 use serde::{Deserialize, Serialize};
 
 /// Why an operation was refused.
@@ -31,8 +31,26 @@ pub enum RuleError {
     /// plainly rather than storing an empty label no picker could show.
     #[error("project name cannot be blank")]
     BlankProjectName,
+    /// Free text past its length cap (#101). The payloads name the field in
+    /// the user's words ("project name", "description", "note") and the cap,
+    /// so one variant serves every text field.
+    #[error("{0} is too long (max {1} characters)")]
+    TextTooLong(String, usize),
+    /// Free text containing control characters (#101): newlines, escape
+    /// sequences, and friends have no place in a label that terminals, menus,
+    /// and spreadsheets will render.
+    #[error("{0} must not contain control characters")]
+    TextHasControlCharacters(String),
     #[error("an entry must not end before it starts")]
     NegativeDuration,
+    /// An instant outside the supported range (years 0001–9999, #97).
+    ///
+    /// Its own variant rather than `NegativeDuration`: the interval may be
+    /// perfectly ordered, it is simply at a point in time the calendar math
+    /// does not cover. The payload is the refused endpoint (saturated when
+    /// the true endpoint overflowed `i64` altogether, #98).
+    #[error("instant {0} is outside the supported range")]
+    InstantOutOfRange(i64),
     #[error("cannot delete the last project")]
     LastProject,
     /// A project with entries cannot be deleted outright.
@@ -69,6 +87,34 @@ pub type RuleResult<T> = Result<T, RuleError>;
 
 /// Milliseconds in the quick-add buckets (REQUIREMENTS §6).
 pub const QUICK_ADD_MS: [i64; 4] = [5 * 60_000, 15 * 60_000, 30 * 60_000, 60 * 60_000];
+
+/// Length caps for stored free text, in characters (#101).
+///
+/// Enforced here, at the trust boundary every mutation crosses, so a direct
+/// D-Bus caller is bounded exactly like the GUI and CLI. The values are
+/// generous for their jobs — a menu label, a one-line summary, a short
+/// note — while keeping any one field from becoming an unbounded payload
+/// that every snapshot then carries to every client.
+pub const MAX_PROJECT_NAME_CHARS: usize = 120;
+/// Cap for an entry's description. See [`MAX_PROJECT_NAME_CHARS`].
+pub const MAX_DESCRIPTION_CHARS: usize = 500;
+/// Cap for an entry's note. See [`MAX_PROJECT_NAME_CHARS`].
+pub const MAX_NOTE_CHARS: usize = 2_000;
+
+/// Refuse free text with control characters or past its cap (#101).
+///
+/// `what` names the field in the user's words; it is what the error says.
+/// Length counts characters, not bytes, so the cap means the same thing in
+/// every language.
+fn check_text(what: &str, text: &str, max_chars: usize) -> RuleResult<()> {
+    if text.chars().any(|c| c.is_control()) {
+        return Err(RuleError::TextHasControlCharacters(what.to_string()));
+    }
+    if text.chars().count() > max_chars {
+        return Err(RuleError::TextTooLong(what.to_string(), max_chars));
+    }
+    Ok(())
+}
 
 /// Source of identifiers. Kept abstract so tests can pin them.
 pub trait Ids {
@@ -140,6 +186,7 @@ pub fn create_project(store: &mut Store, counter: &mut Counter, name: &str) -> R
     if name.is_empty() {
         return Err(RuleError::BlankProjectName);
     }
+    check_text("project name", name, MAX_PROJECT_NAME_CHARS)?;
     if store.projects.iter().any(|p| p.name == name) {
         return Err(RuleError::DuplicateProject(name.to_string()));
     }
@@ -170,6 +217,7 @@ pub fn update_project(
         if new_name.is_empty() {
             return Err(RuleError::BlankProjectName);
         }
+        check_text("project name", new_name, MAX_PROJECT_NAME_CHARS)?;
         if store
             .projects
             .iter()
@@ -223,6 +271,30 @@ pub fn delete_project(store: &mut Store, id: &str) -> RuleResult<Project> {
 
 // --- entries ----------------------------------------------------------------
 
+/// Refuse an instant outside the supported range (#97).
+fn check_instant(ms: i64) -> RuleResult<()> {
+    if instant_in_range(ms) {
+        Ok(())
+    } else {
+        Err(RuleError::InstantOutOfRange(ms))
+    }
+}
+
+/// Refuse an interval with either endpoint outside the supported range.
+fn check_interval(started_at: i64, ended_at: i64) -> RuleResult<()> {
+    check_instant(started_at)?;
+    check_instant(ended_at)
+}
+
+/// The start of an entry of `duration_ms` ending at `ended_at`, checked
+/// (#98): on overflow the refused endpoint is reported saturated, so the
+/// error still names the end of time the caller asked for.
+fn checked_start(ended_at: i64, duration_ms: i64) -> RuleResult<i64> {
+    ended_at
+        .checked_sub(duration_ms)
+        .ok_or_else(|| RuleError::InstantOutOfRange(ended_at.saturating_sub(duration_ms)))
+}
+
 /// Validate an interval and build the entry. Overlap is explicitly *not*
 /// checked (REQUIREMENTS §4).
 fn build_entry(
@@ -237,9 +309,15 @@ fn build_entry(
     if store.project(project_id).is_none() {
         return Err(RuleError::UnknownProject(project_id.to_string()));
     }
+    check_interval(started_at, ended_at)?;
     if ended_at < started_at {
         return Err(RuleError::NegativeDuration);
     }
+    // Descriptions are stored trimmed and bounded (#101): every client used
+    // to store them verbatim, padding and all. All validation runs before
+    // `ids.next()`, so a refused entry consumes no id.
+    let description = description.trim();
+    check_text("description", description, MAX_DESCRIPTION_CHARS)?;
     Ok(Entry {
         id: ids.next(),
         project_id: project_id.to_string(),
@@ -306,7 +384,24 @@ pub fn create_duration(
     duration_ms: i64,
     now: i64,
 ) -> RuleResult<Entry> {
-    create_entry(store, ids, project_id, description, now - duration_ms, now)
+    let started_at = checked_start(now, duration_ms)?;
+    create_entry(store, ids, project_id, description, started_at, now)
+}
+
+/// Record `duration_ms` ending at an explicit instant (method 3 with the end
+/// named). The subtraction lives here, checked (#98), rather than in the
+/// service: the service holds no rules, and its unchecked copy of this
+/// arithmetic was one of the overflow sites.
+pub fn create_duration_ending(
+    store: &mut Store,
+    ids: &mut dyn Ids,
+    project_id: &str,
+    description: &str,
+    duration_ms: i64,
+    ended_at: i64,
+) -> RuleResult<Entry> {
+    let started_at = checked_start(ended_at, duration_ms)?;
+    create_entry(store, ids, project_id, description, started_at, ended_at)
 }
 
 /// Add one of the quick-add buckets, ending now (REQUIREMENTS §6).
@@ -325,12 +420,13 @@ pub fn quick_add(
     if !QUICK_ADD_MS.contains(&duration_ms) {
         return Err(RuleError::InvalidQuickAdd(duration_ms));
     }
+    let started_at = checked_start(now, duration_ms)?;
     create_entry_from(
         store,
         ids,
         project_id,
         "",
-        now - duration_ms,
+        started_at,
         now,
         EntrySource::QuickAdd,
     )
@@ -341,6 +437,7 @@ pub fn quick_add(
 /// Shortening only ever moves `ended_at` earlier. It never deletes: the rule
 /// is that no method may lose data as a side effect of reducing time.
 pub fn set_times(store: &mut Store, id: &str, started_at: i64, ended_at: i64) -> RuleResult<Entry> {
+    check_interval(started_at, ended_at)?;
     if ended_at < started_at {
         return Err(RuleError::NegativeDuration);
     }
@@ -365,12 +462,24 @@ pub fn set_project(store: &mut Store, id: &str, project_id: &str) -> RuleResult<
 }
 
 /// Edit an entry's description and note.
+///
+/// Both fields are trimmed and bounded exactly as at creation (#101), and
+/// both are validated before either is stored, so a refused edit changes
+/// nothing.
 pub fn set_text(
     store: &mut Store,
     id: &str,
     description: Option<&str>,
     note: Option<Option<&str>>,
 ) -> RuleResult<Entry> {
+    let description = description.map(str::trim);
+    if let Some(d) = description {
+        check_text("description", d, MAX_DESCRIPTION_CHARS)?;
+    }
+    let note = note.map(|n| n.map(str::trim));
+    if let Some(Some(n)) = note {
+        check_text("note", n, MAX_NOTE_CHARS)?;
+    }
     let entry = store
         .get_mut(id)
         .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
@@ -412,6 +521,9 @@ pub fn split_entry(
         .get(id)
         .cloned()
         .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
+    // The split point becomes an endpoint of both halves, so it is held to
+    // the same range as any other endpoint (#97).
+    check_instant(at_ms)?;
     if at_ms <= original.started_at || at_ms >= original.ended_at {
         return Err(RuleError::NegativeDuration);
     }
@@ -482,6 +594,9 @@ pub fn merge_entries(store: &mut Store, ids: &[String]) -> RuleResult<Entry> {
     let project_id = chosen[0].project_id.clone();
     let started_at = chosen.iter().map(|e| e.started_at).min().unwrap();
     let ended_at = chosen.iter().map(|e| e.ended_at).max().unwrap();
+    // Entries the rules accepted are always in range; this refuses to mint a
+    // fresh out-of-range entry out of a hand-edited store's extremes (#97).
+    check_interval(started_at, ended_at)?;
 
     // Keep the first id as the merged entry's, so a client holding that
     // handle keeps pointing at something valid.
@@ -513,13 +628,15 @@ pub fn merge_shrink_ms(intervals: &[(i64, i64)]) -> i64 {
     if intervals.is_empty() {
         return 0;
     }
-    let sum: i64 = intervals
-        .iter()
-        .map(|&(start, end)| (end - start).max(0))
-        .sum();
+    // Saturating (#98): this only ever feeds a confirmation prompt, so on
+    // absurd stored intervals it saturates instead of wrapping. Intervals
+    // the rules accepted (in range, ordered) never reach saturation.
+    let sum: i64 = intervals.iter().fold(0i64, |acc, &(start, end)| {
+        acc.saturating_add(end.saturating_sub(start).max(0))
+    });
     let start = intervals.iter().map(|&(start, _)| start).min().unwrap_or(0);
     let end = intervals.iter().map(|&(_, end)| end).max().unwrap_or(0);
-    sum - (end - start).max(0)
+    sum.saturating_sub(end.saturating_sub(start).max(0))
 }
 
 /// State what a merge does to the summed total, for confirmations.
@@ -531,7 +648,11 @@ pub fn format_merge_delta(shrink_ms: i64) -> String {
     if shrink_ms > 0 {
         format!("total shrinks by {}", crate::format_duration(shrink_ms))
     } else if shrink_ms < 0 {
-        format!("total grows by {}", crate::format_duration(-shrink_ms))
+        // `saturating_neg`: `i64::MIN` has no positive counterpart (#98).
+        format!(
+            "total grows by {}",
+            crate::format_duration(shrink_ms.saturating_neg())
+        )
     } else {
         "total unchanged".to_string()
     }
@@ -547,7 +668,8 @@ pub fn format_merge_delta(shrink_ms: i64) -> String {
 pub fn days_exceeding_24h(store: &Store, tz: &crate::tz::Tz) -> Vec<i64> {
     let mut per_day = std::collections::BTreeMap::new();
     for e in &store.entries {
-        *per_day.entry(e.local_day(tz)).or_insert(0i64) += e.duration_ms();
+        let slot = per_day.entry(e.local_day(tz)).or_insert(0i64);
+        *slot = slot.saturating_add(e.duration_ms());
     }
     per_day
         .into_iter()
@@ -618,6 +740,75 @@ mod tests {
             assert_eq!(s.projects.len(), 1, "a refused project must not be stored");
             assert_eq!(c.next_project, 1, "a rejected project does not use an id");
         }
+    }
+
+    #[test]
+    fn project_names_with_controls_or_past_the_cap_are_refused() {
+        // #101: the cap and the control check live in the core, so no client
+        // (or direct D-Bus caller) can store a label that breaks a renderer.
+        let mut s = store_with_project();
+        let mut c = ids();
+        for bad in ["Wo\nrk", "Wo\trk", "\u{1b}[31mWork", "Work\u{7}"] {
+            assert_eq!(
+                create_project(&mut s, &mut c, bad).unwrap_err(),
+                RuleError::TextHasControlCharacters("project name".into()),
+                "{bad:?}"
+            );
+        }
+        let too_long = "x".repeat(MAX_PROJECT_NAME_CHARS + 1);
+        assert_eq!(
+            create_project(&mut s, &mut c, &too_long).unwrap_err(),
+            RuleError::TextTooLong("project name".into(), MAX_PROJECT_NAME_CHARS)
+        );
+        assert_eq!(s.projects.len(), 1, "nothing refused may be stored");
+        // Exactly at the cap is fine, and rename holds the same line.
+        let at_cap = "y".repeat(MAX_PROJECT_NAME_CHARS);
+        let mut c = Counter::continuing(&s);
+        let p = create_project(&mut s, &mut c, &at_cap).unwrap();
+        assert_eq!(
+            update_project(&mut s, &p.id, Some("a\nb"), None).unwrap_err(),
+            RuleError::TextHasControlCharacters("project name".into())
+        );
+        assert_eq!(s.project(&p.id).unwrap().name, at_cap);
+    }
+
+    #[test]
+    fn descriptions_and_notes_are_trimmed_and_bounded() {
+        // #101: stored trimmed (the GUI used to store padding verbatim),
+        // control characters and over-length refused, ids unconsumed.
+        let mut s = store_with_project();
+        let mut c = ids();
+        let e = create_entry(&mut s, &mut c, "p1", "  review  ", 0, 1_000).unwrap();
+        assert_eq!(e.description, "review");
+        assert_eq!(
+            create_entry(&mut s, &mut c, "p1", "a\nb", 0, 1_000).unwrap_err(),
+            RuleError::TextHasControlCharacters("description".into())
+        );
+        let too_long = "d".repeat(MAX_DESCRIPTION_CHARS + 1);
+        assert_eq!(
+            create_entry(&mut s, &mut c, "p1", &too_long, 0, 1_000).unwrap_err(),
+            RuleError::TextTooLong("description".into(), MAX_DESCRIPTION_CHARS)
+        );
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(c.next_entry, 2, "refused entries consume no id");
+        // set_text trims, bounds, and is all-or-nothing.
+        let e = set_text(&mut s, &e.id, Some("  notes  "), Some(Some("  n  "))).unwrap();
+        assert_eq!(e.description, "notes");
+        assert_eq!(e.note.as_deref(), Some("n"));
+        let note_too_long = "n".repeat(MAX_NOTE_CHARS + 1);
+        assert_eq!(
+            set_text(&mut s, &e.id, Some("changed"), Some(Some(&note_too_long))).unwrap_err(),
+            RuleError::TextTooLong("note".into(), MAX_NOTE_CHARS)
+        );
+        assert_eq!(
+            s.get(&e.id).unwrap().description,
+            "notes",
+            "a refused note must not half-apply the description"
+        );
+        assert_eq!(
+            set_text(&mut s, &e.id, None, Some(Some("a\u{1b}b"))).unwrap_err(),
+            RuleError::TextHasControlCharacters("note".into())
+        );
     }
 
     #[test]
@@ -746,6 +937,70 @@ mod tests {
             RuleError::NegativeDuration
         );
         assert!(s.entries.is_empty(), "a refused entry must not be stored");
+    }
+
+    #[test]
+    fn entry_endpoints_outside_the_supported_range_are_refused() {
+        use crate::model::{MAX_INSTANT_MS, MIN_INSTANT_MS};
+        // #97: every path that can mint or move an endpoint refuses cleanly
+        // and stores nothing. The error names the refused endpoint.
+        for (start, end, bad) in [
+            (i64::MIN, 0, i64::MIN),
+            (0, i64::MAX, i64::MAX),
+            (MIN_INSTANT_MS - 1, MIN_INSTANT_MS - 1, MIN_INSTANT_MS - 1),
+            (MAX_INSTANT_MS + 1, MAX_INSTANT_MS + 1, MAX_INSTANT_MS + 1),
+        ] {
+            let mut s = store_with_project();
+            let mut c = ids();
+            assert_eq!(
+                create_entry(&mut s, &mut c, "p1", "", start, end).unwrap_err(),
+                RuleError::InstantOutOfRange(bad),
+                "({start}, {end})"
+            );
+            assert!(s.entries.is_empty(), "a refused entry must not be stored");
+        }
+        // The boundary instants themselves are supported.
+        let mut s = store_with_project();
+        let mut c = ids();
+        create_entry(&mut s, &mut c, "p1", "", MIN_INSTANT_MS, MIN_INSTANT_MS).unwrap();
+        let e = create_entry(&mut s, &mut c, "p1", "", MIN_INSTANT_MS, MAX_INSTANT_MS).unwrap();
+        // set_times holds the same line and leaves the entry untouched.
+        assert_eq!(
+            set_times(&mut s, &e.id, 0, i64::MAX).unwrap_err(),
+            RuleError::InstantOutOfRange(i64::MAX)
+        );
+        assert_eq!(s.get(&e.id).unwrap().ended_at, MAX_INSTANT_MS);
+    }
+
+    #[test]
+    fn overflowing_duration_arithmetic_is_refused_not_wrapped() {
+        // #98: `ended_at - duration_ms` near the i64 edges used to panic in
+        // debug and wrap in release. Every flavour now refuses typed.
+        let mut s = store_with_project();
+        let mut c = ids();
+        assert_eq!(
+            create_duration(&mut s, &mut c, "p1", "", i64::MIN, 0).unwrap_err(),
+            RuleError::InstantOutOfRange(i64::MAX),
+            "0 - i64::MIN saturates to the far future it asked for"
+        );
+        assert_eq!(
+            create_duration_ending(&mut s, &mut c, "p1", "", i64::MAX, i64::MIN).unwrap_err(),
+            RuleError::InstantOutOfRange(i64::MIN)
+        );
+        // A merely out-of-range (but representable) start reports itself.
+        assert_eq!(
+            create_duration_ending(&mut s, &mut c, "p1", "", 1_000, i64::MAX).unwrap_err(),
+            RuleError::InstantOutOfRange(i64::MAX - 1_000)
+        );
+        // A negative duration is still just a backwards interval.
+        assert_eq!(
+            create_duration(&mut s, &mut c, "p1", "", -1_000, 0).unwrap_err(),
+            RuleError::NegativeDuration
+        );
+        assert!(s.entries.is_empty(), "nothing refused may be stored");
+        // In-range durations ending at an explicit instant still work.
+        let e = create_duration_ending(&mut s, &mut c, "p1", "", 3_600_000, 10 * D).unwrap();
+        assert_eq!((e.started_at, e.ended_at), (10 * D - 3_600_000, 10 * D));
     }
 
     #[test]

@@ -82,7 +82,9 @@ impl EntryView {
     /// How long this entry ran. No `now` parameter, because nothing is
     /// running.
     pub fn duration_ms(&self) -> i64 {
-        (self.ended_at - self.started_at).max(0)
+        // Saturating, mirroring the core (#98): a view of a hand-edited or
+        // hostile store must not panic a client that merely displays it.
+        self.ended_at.saturating_sub(self.started_at).max(0)
     }
 
     /// Description, or a placeholder when the user left it empty.
@@ -527,8 +529,9 @@ impl Client {
     }
 
     /// Rename and/or recolour a project. Empty `name` keeps the current
-    /// name; negative `colour` keeps the current colour, otherwise the low
-    /// 24 bits become the new `0xRRGGBB` (mirrors the service's sentinels).
+    /// name; `colour` -1 keeps the current colour, -2 clears it, otherwise
+    /// the low 24 bits become the new `0xRRGGBB` (mirrors the service's
+    /// sentinels; an old service reads -2 as "keep").
     pub async fn update_project(
         &self,
         id: &str,

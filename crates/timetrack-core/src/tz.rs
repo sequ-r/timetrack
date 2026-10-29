@@ -154,7 +154,11 @@ impl Tz {
     ///
     /// Floor-divides, so pre-epoch instants bucket correctly.
     pub fn day_of(&self, utc_ms: i64) -> i64 {
-        (utc_ms + self.offset_at_ms(utc_ms)).div_euclid(MS_PER_DAY)
+        // Saturating (#98): an extreme wire instant buckets at the range
+        // edge (where the calendar conversions clamp) instead of wrapping.
+        utc_ms
+            .saturating_add(self.offset_at_ms(utc_ms))
+            .div_euclid(MS_PER_DAY)
     }
 
     /// Milliseconds since the epoch of local midnight opening `day`.
@@ -166,13 +170,16 @@ impl Tz {
     /// instant. Converges in at most two steps — offsets only change at
     /// transitions, which are hours away from most midnights.
     pub fn day_start(&self, day: i64) -> i64 {
+        // Saturating throughout (#98): an out-of-range day saturates to the
+        // nearest representable midnight instead of wrapping.
+        let day_ms = day.saturating_mul(MS_PER_DAY);
         match self {
-            Tz::Utc => day * MS_PER_DAY,
-            Tz::Fixed { offset_ms, .. } => day * MS_PER_DAY - *offset_ms,
+            Tz::Utc => day_ms,
+            Tz::Fixed { offset_ms, .. } => day_ms.saturating_sub(*offset_ms),
             Tz::Named { .. } => {
-                let mut utc = day * MS_PER_DAY - self.offset_at_ms(day * MS_PER_DAY);
+                let mut utc = day_ms.saturating_sub(self.offset_at_ms(day_ms));
                 for _ in 0..4 {
-                    let next = day * MS_PER_DAY - self.offset_at_ms(utc);
+                    let next = day_ms.saturating_sub(self.offset_at_ms(utc));
                     if next == utc {
                         break;
                     }
@@ -190,7 +197,9 @@ fn format_fixed_label(offset_ms: i64) -> String {
         return "UTC".to_string();
     }
     let sign = if offset_ms < 0 { '-' } else { '+' };
-    let abs = offset_ms.abs();
+    // `saturating_abs`: a rogue snapshot offset of `i64::MIN` must not panic
+    // the label formatter (#98). Real offsets are within a day.
+    let abs = offset_ms.saturating_abs();
     let h = abs / 3_600_000;
     let m = (abs % 3_600_000) / 60_000;
     if m == 0 {

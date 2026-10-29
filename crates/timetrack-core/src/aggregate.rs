@@ -13,7 +13,7 @@
 //! Totals are **sums of durations**, never wall-clock unions (§4), so
 //! overlapping entries are counted separately.
 
-use crate::model::Store;
+use crate::model::{MAX_DAY, MIN_DAY, Store};
 use crate::tz::Tz;
 use std::collections::BTreeMap;
 
@@ -55,6 +55,9 @@ impl Totals {
 /// rule is why this is not just "Monday of this week" — it is what makes the
 /// week-number stable across the new year.
 pub fn iso_week_of(day: i64) -> IsoWeek {
+    // Out-of-range days clamp to the supported range (#97): the answer is
+    // the nearest supported week, computed in constant time, never a spin.
+    let day = clamp_day(day);
     // ISO weekday: Monday = 1 .. Sunday = 7.
     // 1970-01-01 was a Thursday, which is ISO day 4.
     let iso_weekday = (day + 3).rem_euclid(7) + 1;
@@ -62,22 +65,10 @@ pub fn iso_week_of(day: i64) -> IsoWeek {
 
     // The Thursday of this week decides the ISO year.
     let thursday = monday + 3;
-
-    // Bounded upward walk: `days_to_year` is monotonic, so this converges, and
-    // the clamp keeps it finite for pre-epoch days.
-    let mut year = 1970;
-    while days_to_year(year + 1) <= thursday && year < 10_000 {
-        year += 1;
-    }
-    // ... and a matching downward walk: without it every pre-1970 Thursday
-    // stayed in "1970", and the week number below could go negative and
-    // wrap around the `as u64` cast.
-    while days_to_year(year) > thursday && year > -10_000 {
-        year -= 1;
-    }
+    let (year, _, _) = civil_from_days(thursday);
     // ISO week 1 is the week containing the first Thursday, so the Thursday
     // of week 1 falls between Jan 1 and Jan 7.
-    let jan1 = days_to_year(year);
+    let jan1 = days_from_civil(year, 1, 1);
     let week = (thursday - jan1).div_euclid(7) + 1;
     IsoWeek {
         year,
@@ -86,48 +77,54 @@ pub fn iso_week_of(day: i64) -> IsoWeek {
     }
 }
 
-/// Days from the epoch to 1 January `year`. Walks year by year so leap days
-/// are counted exactly, in both directions: the `year..1970` range for
-/// pre-epoch years would otherwise be empty and every date before 1970 would
-/// land in January 1970.
-fn days_to_year(year: i64) -> i64 {
-    let mut days = 0;
-    if year >= 1970 {
-        for y in 1970..year {
-            days += if is_leap(y) { 366 } else { 365 };
-        }
-    } else {
-        for y in year..1970 {
-            days -= if is_leap(y) { 366 } else { 365 };
-        }
-    }
-    days
-}
-
 /// The calendar month containing local day `day`, as `(year, month)`.
+///
+/// Days outside the supported range clamp to its nearest edge (#97), so the
+/// month is always a real month (1..=12) and the call always returns fast.
 pub fn month_of(day: i64) -> (i64, u32) {
-    let mut year = 1970;
-    while days_to_year(year + 1) <= day && year < 10_000 {
-        year += 1;
-    }
-    while days_to_year(year) > day && year > -10_000 {
-        year -= 1;
-    }
-    let mut doy = day - days_to_year(year);
-    let mut month = 1;
-    loop {
-        let len = days_in_month(year, month);
-        if doy < len {
-            break;
-        }
-        doy -= len;
-        month += 1;
-    }
+    let (year, month, _) = ymd_of(day);
     (year, month)
 }
 
-fn is_leap(y: i64) -> bool {
-    is_leap_year(y)
+/// The calendar date of local day `day`, as `(year, month, day-of-month)`.
+///
+/// Clamps like [`month_of`]. This is the one day-to-date conversion: the
+/// export formatter uses it too, so the two cannot disagree.
+pub fn ymd_of(day: i64) -> (i64, u32, u32) {
+    civil_from_days(clamp_day(day))
+}
+
+fn clamp_day(day: i64) -> i64 {
+    day.clamp(MIN_DAY, MAX_DAY)
+}
+
+/// Days since the epoch for a Gregorian calendar date.
+///
+/// Howard Hinnant's `days_from_civil`: constant time and exact for every
+/// year the supported range can name (and far beyond), replacing the old
+/// year-by-year walk whose cost grew with the distance from 1970 (#97).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // Mar=0 .. Feb=11
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of [`days_from_civil`] (Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153; // Mar=0 .. Feb=11
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
 /// Whether `year` is a leap year (Gregorian rule).
@@ -173,9 +170,12 @@ pub fn totals_in_day_range(store: &Store, from: i64, to: i64, tz: &Tz) -> Totals
     for e in &store.entries {
         let d = tz.day_of(e.started_at);
         if d >= from && d < to {
-            t.total_ms += e.duration_ms();
+            // Saturating: display sums over a hand-edited store must not
+            // wrap (#98); entries the rules accepted cannot reach this.
+            t.total_ms = t.total_ms.saturating_add(e.duration_ms());
             t.entry_count += 1;
-            *t.per_project.entry(e.project_id.clone()).or_insert(0) += e.duration_ms();
+            let slot = t.per_project.entry(e.project_id.clone()).or_insert(0);
+            *slot = slot.saturating_add(e.duration_ms());
         }
     }
     t
@@ -190,20 +190,17 @@ pub fn totals_in_day_range(store: &Store, from: i64, to: i64, tz: &Tz) -> Totals
 pub fn all_totals(store: &Store) -> Totals {
     let mut t = Totals::default();
     for e in &store.entries {
-        t.total_ms += e.duration_ms();
+        t.total_ms = t.total_ms.saturating_add(e.duration_ms());
         t.entry_count += 1;
-        *t.per_project.entry(e.project_id.clone()).or_insert(0) += e.duration_ms();
+        let slot = t.per_project.entry(e.project_id.clone()).or_insert(0);
+        *slot = slot.saturating_add(e.duration_ms());
     }
     t
 }
 
 /// The local day index of the 1st of `month` in `year`.
 fn day_of_month(year: i64, month: u32, day: i64) -> i64 {
-    let mut d = days_to_year(year);
-    for m in 1..month {
-        d += days_in_month(year, m);
-    }
-    d + day - 1
+    days_from_civil(year, month as i64, day)
 }
 
 #[cfg(test)]
@@ -554,5 +551,45 @@ mod tests {
         assert_eq!(t.entry_count, 3);
         assert_eq!(t.per_project.get("p1"), Some(&7_200_000));
         assert_eq!(t.per_project.get("p2"), Some(&1_800_000));
+    }
+
+    #[test]
+    fn ymd_of_agrees_with_chrono_across_the_supported_range() {
+        // Independent oracle for the civil-date conversion (#97): chrono's
+        // own calendar, sampled across the whole range plus both edges.
+        use crate::model::{MAX_DAY, MIN_DAY};
+        use chrono::Datelike as _;
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let mut days: Vec<i64> = (MIN_DAY..=MAX_DAY).step_by(997).collect();
+        days.extend([MIN_DAY, MIN_DAY + 1, -1, 0, 1, MAX_DAY - 1, MAX_DAY]);
+        for day in days {
+            let date = epoch
+                .checked_add_signed(chrono::TimeDelta::days(day))
+                .expect("supported range is inside chrono's");
+            assert_eq!(
+                ymd_of(day),
+                (date.year() as i64, date.month(), date.day()),
+                "day {day}"
+            );
+            assert_eq!(
+                days_from_civil(date.year() as i64, date.month() as i64, date.day() as i64),
+                day,
+                "day {day} round-trips"
+            );
+        }
+        // The edges are the named bounds.
+        assert_eq!(ymd_of(MIN_DAY), (1, 1, 1));
+        assert_eq!(ymd_of(MAX_DAY), (9999, 12, 31));
+    }
+
+    #[test]
+    fn extreme_days_answer_instead_of_hanging() {
+        // #97: a raw i64 day from the wire must not spin the calendar walks.
+        assert_eq!(month_of(i64::MAX), (9999, 12));
+        assert_eq!(month_of(i64::MIN), (1, 1));
+        for day in [i64::MIN, i64::MAX] {
+            let w = iso_week_of(day);
+            assert!((1..=53).contains(&w.week), "day {day} gave week {}", w.week);
+        }
     }
 }

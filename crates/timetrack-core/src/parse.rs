@@ -49,6 +49,15 @@ pub enum ParseError {
     NoUnit(String),
     #[error("'{0}' must be a positive duration")]
     NonPositive(String),
+    /// A typed value whose millisecond result does not fit an `i64` (#98).
+    /// Its own variant so debug and release agree: unchecked, debug builds
+    /// panicked here while release builds wrapped to the wrong end of time.
+    #[error("{what}: '{text}' is too large")]
+    Overflow { what: String, text: String },
+    /// A colour that is not six hex digits. The wording is the CLI's
+    /// established one; both front ends now share this parse (#104).
+    #[error("'{0}' is not RRGGBB hex (e.g. 2ea043)")]
+    BadColour(String),
 }
 
 pub type ParseResult<T> = Result<T, ParseError>;
@@ -83,16 +92,41 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult
         return Ok(now_ms);
     }
 
+    // Relative minutes, checked end to end (#98): a value that overflows
+    // `i64` milliseconds — or lands the result outside it — is an error,
+    // identically in debug and release.
+    let overflow = || ParseError::Overflow {
+        what: what.to_string(),
+        text: text.to_string(),
+    };
     if let Some(rest) = text.strip_prefix('-') {
-        let mins: i64 = rest.parse().map_err(|_| ParseError::BadRelative {
-            what: what.to_string(),
-            text: text.to_string(),
+        let mins: i64 = rest.parse().map_err(|e| {
+            if is_int_overflow(&e) {
+                overflow()
+            } else {
+                ParseError::BadRelative {
+                    what: what.to_string(),
+                    text: text.to_string(),
+                }
+            }
         })?;
-        return Ok(now_ms - mins * 60_000);
+        return mins
+            .checked_mul(60_000)
+            .and_then(|ms| now_ms.checked_sub(ms))
+            .ok_or_else(overflow);
     }
     if let Ok(mins) = text.parse::<i64>() {
         // A bare positive number reads as "minutes from now".
-        return Ok(now_ms + mins * 60_000);
+        return mins
+            .checked_mul(60_000)
+            .and_then(|ms| now_ms.checked_add(ms))
+            .ok_or_else(overflow);
+    }
+    // A bare number too big for `i64` is "too large", not a bad shape.
+    if let Err(e) = text.parse::<i64>() {
+        if is_int_overflow(&e) {
+            return Err(overflow());
+        }
     }
 
     let (h, m) = text.split_once(':').ok_or_else(|| ParseError::BadShape {
@@ -115,7 +149,21 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult
     }
 
     let local_midnight = tz.day_start(tz.day_of(now_ms));
-    Ok(local_midnight + (h * 3_600_000 + m * 60_000))
+    // `h`/`m` are bounded above, so only the final add can overflow, and
+    // only for a caller-supplied `now_ms` near the `i64` edges (#98).
+    local_midnight
+        .checked_add(h * 3_600_000 + m * 60_000)
+        .ok_or_else(overflow)
+}
+
+/// Whether an `i64` parse failed because the value does not fit, as opposed
+/// to not being a number at all.
+fn is_int_overflow(e: &std::num::ParseIntError) -> bool {
+    use std::num::IntErrorKind;
+    matches!(
+        e.kind(),
+        IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
+    )
 }
 
 /// Parse an export anchor day (`YYYY-MM-DD`) to local midday that day.
@@ -152,6 +200,11 @@ pub fn parse_anchor_day(text: &str, what: &str, tz: &Tz) -> ParseResult<i64> {
     let m: u32 = parts[1].parse().map_err(|_| bad())?;
     let d: u32 = parts[2].parse().map_err(|_| bad())?;
     let date = chrono::NaiveDate::from_ymd_opt(y, m, d).ok_or_else(bad)?;
+    // The supported range starts at year 0001 (#97): `0000-…` parses as a
+    // real chrono date but names an instant the rest of the app refuses.
+    if y < 1 {
+        return Err(bad());
+    }
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch exists");
     let day = date.signed_duration_since(epoch).num_days();
     // Local noon that day: find the UTC instant whose wall clock is 12:00.
@@ -182,30 +235,51 @@ pub fn parse_duration(text: &str) -> ParseResult<i64> {
     let mut total: i64 = 0;
     let mut number = String::new();
     let mut saw_unit = false;
+    // Checked throughout (#98): each term and the running total must fit
+    // `i64` milliseconds, in debug and release alike.
+    let overflow = || ParseError::Overflow {
+        what: "duration".to_string(),
+        text: text.clone(),
+    };
 
     for ch in text.chars() {
         if ch.is_ascii_digit() {
             number.push(ch);
             continue;
         }
-        let n: i64 = number
-            .parse()
-            .map_err(|_| ParseError::ExpectedNumber(text.clone(), ch))?;
+        let n: i64 = number.parse().map_err(|e| {
+            if is_int_overflow(&e) {
+                overflow()
+            } else {
+                ParseError::ExpectedNumber(text.clone(), ch)
+            }
+        })?;
         number.clear();
-        total += match ch {
-            'h' => n * 3_600_000,
-            'm' => n * 60_000,
-            's' => n * 1_000,
+        let factor = match ch {
+            'h' => 3_600_000,
+            'm' => 60_000,
+            's' => 1_000,
             _ => return Err(ParseError::UnknownUnit(text.clone(), ch)),
         };
+        total = n
+            .checked_mul(factor)
+            .and_then(|term| total.checked_add(term))
+            .ok_or_else(overflow)?;
         saw_unit = true;
     }
 
     if !number.is_empty() {
-        let n: i64 = number
-            .parse()
-            .map_err(|_| ParseError::BadTrailingNumber(text.clone()))?;
-        total += n * 60_000;
+        let n: i64 = number.parse().map_err(|e| {
+            if is_int_overflow(&e) {
+                overflow()
+            } else {
+                ParseError::BadTrailingNumber(text.clone())
+            }
+        })?;
+        total = n
+            .checked_mul(60_000)
+            .and_then(|term| total.checked_add(term))
+            .ok_or_else(overflow)?;
         saw_unit = true;
     }
 
@@ -218,6 +292,20 @@ pub fn parse_duration(text: &str) -> ParseResult<i64> {
     Ok(total)
 }
 
+/// Parse an `RRGGBB` colour like `2ea043` (leading `#` allowed), as stored
+/// on a project (`0xRRGGBB`).
+///
+/// One spelling for both front ends (#104): the CLI's `recolour` and the
+/// GUI's recolour prompt accept exactly the same text, trimmed, `#`
+/// optional, six hex digits.
+pub fn parse_colour(text: &str) -> ParseResult<u32> {
+    let hex = text.trim().strip_prefix('#').unwrap_or(text.trim());
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ParseError::BadColour(text.to_string()));
+    }
+    Ok(u32::from_str_radix(hex, 16).expect("six hex digits always fit"))
+}
+
 /// This entry's local wall-clock time as `HH:MM`, for prefilling an edit form.
 ///
 /// The value parses back through [`parse_moment`] on the same local day, so a
@@ -225,7 +313,9 @@ pub fn parse_duration(text: &str) -> ParseResult<i64> {
 /// today. Callers must only use this for entries whose local day is today;
 /// otherwise `HH:MM` would silently move the endpoint to today.
 pub fn format_local_hm(utc_ms: i64, tz: &Tz) -> String {
-    let rem = (utc_ms + tz.offset_at_ms(utc_ms)).rem_euclid(MS_PER_DAY);
+    let rem = utc_ms
+        .saturating_add(tz.offset_at_ms(utc_ms))
+        .rem_euclid(MS_PER_DAY);
     format!("{:02}:{:02}", rem / 3_600_000, (rem % 3_600_000) / 60_000)
 }
 
@@ -452,5 +542,59 @@ mod tests {
             parse_moment(&format_local_hm(t, &utc()), "start", t, &utc()).unwrap(),
             t
         );
+    }
+
+    #[test]
+    fn overflowing_typed_values_error_instead_of_wrapping() {
+        // #98: debug builds panicked and release builds wrapped on these.
+        assert!(parse_moment("-99999999999999999", "start", 0, &utc()).is_err());
+        assert!(parse_moment("99999999999999999", "start", 0, &utc()).is_err());
+        assert!(parse_duration("9999999999999999999h").is_err());
+        assert!(parse_duration("3000000000000h3000000000000h").is_err());
+        // The refusal is the typed overflow error, naming field and value.
+        assert_eq!(
+            parse_duration("9999999999999999999h").unwrap_err(),
+            ParseError::Overflow {
+                what: "duration".into(),
+                text: "9999999999999999999h".into()
+            }
+        );
+        assert_eq!(
+            parse_moment("99999999999999999", "start", 0, &utc()).unwrap_err(),
+            ParseError::Overflow {
+                what: "start".into(),
+                text: "99999999999999999".into()
+            }
+        );
+        // Near-boundary values that do fit still parse.
+        assert!(parse_duration("1000000h").is_ok());
+        assert!(parse_moment("-1000000", "start", 0, &utc()).is_ok());
+    }
+
+    #[test]
+    fn colours_parse_as_rrggbb_hex() {
+        assert_eq!(parse_colour("2ea043").unwrap(), 0x2ea043);
+        assert_eq!(parse_colour("#2EA043").unwrap(), 0x2ea043);
+        assert_eq!(parse_colour("  ff0000  ").unwrap(), 0xff0000);
+        for bad in ["", "red", "12345", "1234567", "zzzzzz", "#12 34"] {
+            assert_eq!(
+                parse_colour(bad).unwrap_err(),
+                ParseError::BadColour(bad.to_string()),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_days_stay_inside_the_supported_range() {
+        // #97: year 0000 is a real chrono date but outside years 0001-9999.
+        assert!(parse_anchor_day("0000-01-01", "anchor", &utc()).is_err());
+        assert!(parse_anchor_day("0000-12-31", "anchor", &utc()).is_err());
+        // Both range edges resolve to local midday on the named day.
+        let first = parse_anchor_day("0001-01-01", "anchor", &utc()).unwrap();
+        assert_eq!(first, crate::model::MIN_INSTANT_MS + 12 * 3_600_000);
+        let last = parse_anchor_day("9999-12-31", "anchor", &utc()).unwrap();
+        assert_eq!(utc().day_of(last), crate::model::MAX_DAY);
+        assert_eq!(format_local_hm(last, &utc()), "12:00");
     }
 }
