@@ -222,6 +222,10 @@ impl EntryService {
     }
 
     /// Method 3: a duration ending at a given instant.
+    ///
+    /// The start is computed in the core, checked (#98): this method used to
+    /// subtract here, unchecked, so an extreme wire pair wrapped (release)
+    /// or panicked (debug) before any rule saw it.
     pub fn add_duration_ending(
         &self,
         project_id: &str,
@@ -229,7 +233,10 @@ impl EntryService {
         duration_ms: i64,
         ended_at: i64,
     ) -> Result<EntryView, ServiceError> {
-        self.add(project_id, description, ended_at - duration_ms, ended_at)
+        let e = self.mutate(|s, ids, _| {
+            core::create_duration_ending(s, ids, project_id, description, duration_ms, ended_at)
+        })?;
+        Ok(protocol::entry_to_view(&e))
     }
 
     /// Method 4: one of the quick-add buckets, ending now.
@@ -304,10 +311,14 @@ impl EntryService {
 
     /// Rename a project, recolour it, or both.
     ///
-    /// An empty `name` keeps the current name; a negative `colour` keeps the
-    /// current colour, otherwise the low 24 bits become the new `0xRRGGBB`.
-    /// (D-Bus has no `Option` on the wire, so "leave it alone" needs these
-    /// sentinels; the core function underneath still takes real options.)
+    /// An empty `name` keeps the current name; `colour` -1 keeps the current
+    /// colour, -2 clears it, otherwise the low 24 bits become the new
+    /// `0xRRGGBB`. (D-Bus has no `Option` on the wire, so "leave it alone"
+    /// and "clear it" need these sentinels; the core function underneath
+    /// still takes real options.) Clearing arrived with the GUI recolour
+    /// prompt (#104): an old service reads -2 as "keep", so a new client
+    /// degrades to a no-op there rather than corrupting anything; other
+    /// negatives keep, as every negative used to.
     pub fn update_project(
         &self,
         id: &str,
@@ -315,10 +326,10 @@ impl EntryService {
         colour: i64,
     ) -> Result<ProjectView, ServiceError> {
         let name = if name.is_empty() { None } else { Some(name) };
-        let colour = if colour < 0 {
-            None
-        } else {
-            Some(Some((colour as u32) & 0x00FF_FFFF))
+        let colour = match colour {
+            -2 => Some(None),
+            c if c < 0 => None,
+            c => Some(Some((c as u32) & 0x00FF_FFFF)),
         };
         let p = self.mutate(|s, _ids, _| core::update_project(s, id, name, colour))?;
         Ok(protocol::project_to_view(&p))
@@ -343,6 +354,13 @@ impl EntryService {
     pub fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, ServiceError> {
         let scope = core::ExportScope::parse(scope)
             .ok_or_else(|| ServiceError::UnknownExportScope(scope.to_string()))?;
+        // The service edge of the supported range (#97): a week/month anchor
+        // outside years 0001-9999 is refused typed instead of bucketing at a
+        // clamped edge the caller never asked about. All time ignores the
+        // anchor entirely, so it stays unexamined there.
+        if scope != core::ExportScope::All && !core::instant_in_range(anchor_ms) {
+            return Err(ServiceError::from(RuleError::InstantOutOfRange(anchor_ms)));
+        }
         let g = lock(&self.inner);
         Ok(core::export_csv_at(&g.data, scope, anchor_ms, &g.tz))
     }
@@ -852,6 +870,13 @@ mod tests {
         let recoloured = svc.update_project(&id, "", 0x2ea043).unwrap();
         assert_eq!(recoloured.name, "Deep Work", "empty keeps the name");
         assert_eq!(recoloured.colour, Some(0x2ea043));
+        // -2 clears, and only -2 does: another negative still keeps (#104).
+        assert_eq!(
+            svc.update_project(&id, "", -7).unwrap().colour,
+            Some(0x2ea043)
+        );
+        assert_eq!(svc.update_project(&id, "", -2).unwrap().colour, None);
+        assert_eq!(svc.update_project(&id, "", -1).unwrap().colour, None);
         // Entries stay attributed across the rename.
         let snap = svc.snapshot();
         assert_eq!(snap.projects[0].name, "Deep Work");
@@ -1084,6 +1109,48 @@ mod tests {
             svc.export_csv("everything").unwrap_err().to_string(),
             "unknown export scope 'everything' (use week, month or all)"
         );
+    }
+
+    #[test]
+    fn extreme_instants_are_refused_at_the_service_edge() {
+        // #97/#98: raw i64s over the wire get the typed core refusal, fast,
+        // and nothing is stored. All-time export keeps ignoring its anchor.
+        let (svc, _) = service("extreme-instants");
+        let p = project(&svc);
+        assert_eq!(
+            svc.add(&p.id, "x", 0, i64::MAX).unwrap_err(),
+            ServiceError::Rule(RuleError::InstantOutOfRange(i64::MAX))
+        );
+        assert_eq!(
+            svc.add_duration_ending(&p.id, "x", i64::MAX, i64::MIN)
+                .unwrap_err(),
+            ServiceError::Rule(RuleError::InstantOutOfRange(i64::MIN)),
+            "the start subtraction is checked, not wrapped"
+        );
+        assert_eq!(
+            svc.add_duration(&p.id, "x", i64::MIN).unwrap_err(),
+            ServiceError::Rule(RuleError::InstantOutOfRange(i64::MAX))
+        );
+        for scope in ["week", "month"] {
+            for anchor in [i64::MIN, i64::MAX] {
+                assert_eq!(
+                    svc.export_csv_at(scope, anchor).unwrap_err(),
+                    ServiceError::Rule(RuleError::InstantOutOfRange(anchor)),
+                    "{scope} anchor {anchor}"
+                );
+            }
+        }
+        assert!(
+            svc.export_csv_at("all", i64::MAX).is_ok(),
+            "all time ignores the anchor, extremes included"
+        );
+        assert!(svc.snapshot().entries.is_empty());
+        // Boundary instants are accepted end to end.
+        svc.add(&p.id, "edge", core::MIN_INSTANT_MS, core::MIN_INSTANT_MS)
+            .unwrap();
+        svc.add(&p.id, "edge", core::MAX_INSTANT_MS, core::MAX_INSTANT_MS)
+            .unwrap();
+        assert_eq!(svc.snapshot().entries.len(), 2);
     }
 
     // --- description editing ---

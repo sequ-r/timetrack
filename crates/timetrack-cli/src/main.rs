@@ -274,7 +274,25 @@ fn explain(err: anyhow::Error) -> anyhow::Error {
     ) {
         return anyhow::anyhow!(no_service_hint());
     }
-    err
+    // A refusal can embed stored text (a duplicate project name, say), and
+    // `main`'s `Error: …` line would print it raw to the terminal (#101).
+    // Clean messages keep their typed error; only a message that actually
+    // carries control characters is rebuilt from its sanitized wording.
+    let text = err.to_string();
+    let clean = disp(&text);
+    if clean == text {
+        err
+    } else {
+        anyhow::anyhow!(clean)
+    }
+}
+
+/// A display copy of stored text for the terminal (#101): control
+/// characters from a legacy or hand-edited store become spaces, so a stored
+/// name can neither break the columns nor drive the terminal. Every line
+/// that prints stored text goes through here.
+fn disp(text: &str) -> String {
+    timetrack_core::sanitize_display(text)
 }
 
 /// Refuse names the service would reject, preserving the core rule for both
@@ -286,6 +304,18 @@ fn validate_project_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The quick-add bucket for `minutes`, in milliseconds.
+///
+/// Checked (#98): the multiplication used to run before the bucket
+/// whitelist, so a huge typed value overflowed — a panic in debug, a wrap
+/// that could land on a real bucket in release. Split out so the refusal is
+/// testable without a service.
+fn quick_add_ms(minutes: i64) -> Option<i64> {
+    minutes
+        .checked_mul(60_000)
+        .filter(|ms| timetrack_core::QUICK_ADD_MS.contains(ms))
 }
 
 async fn dispatch(client: Client, command: Command) -> Result<()> {
@@ -344,7 +374,9 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             println!(
                 "added {} ending {}ms before now ({})",
                 timetrack_core::format_duration(e.duration_ms()),
-                now_ms() - end_ms,
+                // Display only; saturating so an extreme typed end cannot
+                // panic the confirmation line (#98).
+                now_ms().saturating_sub(end_ms),
                 e.id
             );
         }
@@ -352,15 +384,15 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         Command::Quick { project, minutes } => {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
-            let ms = minutes * 60_000;
-            anyhow::ensure!(
-                timetrack_core::QUICK_ADD_MS.contains(&ms),
-                "quick add takes one of {:?} minutes",
-                timetrack_core::QUICK_ADD_MS
-                    .iter()
-                    .map(|m| m / 60_000)
-                    .collect::<Vec<_>>()
-            );
+            let ms = quick_add_ms(minutes).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "quick add takes one of {:?} minutes",
+                    timetrack_core::QUICK_ADD_MS
+                        .iter()
+                        .map(|m| m / 60_000)
+                        .collect::<Vec<_>>()
+                )
+            })?;
             let e = client.quick_add(&project, ms).await?;
             println!(
                 "added {} ({}) -- undo with: timetrack undo {}",
@@ -413,7 +445,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
             let e = client.set_text(&id, &text).await?;
-            println!("set text on {} to \"{}\"", e.id, e.description);
+            println!("set text on {} to \"{}\"", e.id, disp(&e.description));
         }
 
         Command::SetProject { id, project } => {
@@ -424,7 +456,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
             let target = find_project(&snap, &project)?;
             let e = client.set_project(&id, &target.id).await?;
-            println!("moved {} to {} ({})", e.id, target.name, target.id);
+            println!("moved {} to {} ({})", e.id, disp(&target.name), target.id);
         }
 
         Command::Split { id, at } => {
@@ -470,7 +502,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .projects
                 .iter()
                 .find(|p| p.id == found[0].project_id)
-                .map(|p| p.name.clone())
+                .map(|p| disp(&p.name))
                 .unwrap_or_else(|| found[0].project_id.clone());
             if !yes {
                 if std::io::stdin().is_terminal() {
@@ -502,7 +534,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         Command::Project { name } => {
             validate_project_name(&name)?;
             let p = client.add_project(&name).await?;
-            println!("created project {} ({})", p.name, p.id);
+            println!("created project {} ({})", disp(&p.name), p.id);
         }
 
         Command::Rename { id, name } => {
@@ -513,7 +545,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let existing = find_project(&snap, &id)?;
             let old = existing.name.clone();
             let p = client.update_project(&existing.id, &name, -1).await?;
-            println!("renamed {old} to {} ({})", p.name, p.id);
+            println!("renamed {} to {} ({})", disp(&old), disp(&p.name), p.id);
         }
 
         Command::Recolour { id, colour } => {
@@ -523,20 +555,21 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let p = client
                 .update_project(&existing.id, "", value as i64)
                 .await?;
-            println!("recoloured {} ({}) to #{value:06x}", p.name, p.id);
+            println!("recoloured {} ({}) to #{value:06x}", disp(&p.name), p.id);
         }
 
         Command::Archive { id } => {
             let p = client.set_archived(&id, true).await?;
             println!(
                 "archived {} ({}) -- its entries stay in historical totals",
-                p.name, p.id
+                disp(&p.name),
+                p.id
             );
         }
 
         Command::Unarchive { id } => {
             let p = client.set_archived(&id, false).await?;
-            println!("unarchived {} ({})", p.name, p.id);
+            println!("unarchived {} ({})", disp(&p.name), p.id);
         }
 
         Command::DeleteProject { id } => {
@@ -548,7 +581,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             // cannot be deleted, and neither can the last project. Its
             // refusals reach the CLI in the core's own words.
             client.delete_project(&existing.id).await?;
-            println!("deleted project {} ({})", existing.name, existing.id);
+            println!("deleted project {} ({})", disp(&existing.name), existing.id);
         }
 
         Command::Status => print_status(&client.snapshot().await?),
@@ -644,7 +677,7 @@ fn print_list(s: &Snapshot, limit: usize) {
             "{marker} {:>10}  {:<6}  {}",
             timetrack_core::format_duration(e.duration_ms()),
             e.id,
-            e.label()
+            disp(e.label())
         );
     }
 }
@@ -667,12 +700,12 @@ fn find_project<'a>(snap: &'a Snapshot, wanted: &str) -> Result<&'a ProjectView>
 }
 
 /// Parse an `RRGGBB` colour like `2ea043` (leading `#` allowed).
+///
+/// The spelling lives in the core, shared with the GUI's recolour prompt
+/// (#104); this wrapper only re-types the error for anyhow. The wording is
+/// unchanged from when the parse lived here.
 fn parse_colour(text: &str) -> Result<u32> {
-    let hex = text.trim().strip_prefix('#').unwrap_or(text.trim());
-    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        anyhow::bail!("'{text}' is not RRGGBB hex (e.g. 2ea043)");
-    }
-    Ok(u32::from_str_radix(hex, 16).expect("six hex digits always fit"))
+    timetrack_core::parse_colour(text).map_err(anyhow::Error::new)
 }
 
 /// Resolve a project argument to an id, defaulting to the first active one.
@@ -828,6 +861,20 @@ mod tests {
             explain(err).to_string(),
             "unknown export scope 'bogus' (use week, month or all)"
         );
+    }
+
+    #[test]
+    fn stored_text_reaches_the_terminal_sanitized() {
+        // #101: a legacy store can hold names the current rules refuse.
+        // What the CLI prints — list labels via `disp`, and refusals via
+        // `explain` — must carry no raw newline or escape sequence.
+        assert_eq!(disp("Wo\nrk\u{1b}[31m"), "Wo rk [31m");
+        let err = anyhow::Error::new(ClientError::Service(timetrack_proto::ServiceError::Rule(
+            timetrack_core::RuleError::DuplicateProject("Evil\n\u{1b}[2J".into()),
+        )));
+        let text = explain(err).to_string();
+        assert_eq!(text, "a project named 'Evil  [2J' already exists");
+        assert!(!text.chars().any(|c| c.is_control()));
     }
 
     #[test]
@@ -1010,6 +1057,19 @@ mod tests {
         // And it needs a project: clap refuses the missing argument, not the
         // service.
         assert!(Cli::try_parse_from(["timetrack", "delete-project"]).is_err());
+    }
+
+    #[test]
+    fn quick_minutes_are_checked_before_the_bucket_whitelist() {
+        // #98: the buckets still map, everything else refuses — including
+        // values whose `minutes * 60_000` overflows i64 outright.
+        assert_eq!(quick_add_ms(5), Some(300_000));
+        assert_eq!(quick_add_ms(60), Some(3_600_000));
+        assert_eq!(quick_add_ms(7), None);
+        assert_eq!(quick_add_ms(0), None);
+        assert_eq!(quick_add_ms(-5), None);
+        assert_eq!(quick_add_ms(i64::MAX), None);
+        assert_eq!(quick_add_ms(i64::MIN), None);
     }
 
     #[test]

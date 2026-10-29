@@ -72,12 +72,16 @@ impl From<&ClientError> for StatusMsg {
                 text: version_mismatch_hint("GUI"),
                 kind: StatusKind::VersionMismatch,
             },
+            // Service- and bus-origin text is sanitized (#101): a refusal
+            // can embed stored text, and the footer is a single line. The
+            // shared hints above are ours (the version hint's newlines are
+            // deliberate) and pass through untouched.
             ClientError::Service(service) => StatusMsg {
-                text: service.to_string(),
+                text: timetrack_core::sanitize_display(&service.to_string()),
                 kind: StatusKind::Service,
             },
             ClientError::Transport(detail) => StatusMsg {
-                text: detail.clone(),
+                text: timetrack_core::sanitize_display(detail),
                 kind: StatusKind::Local,
             },
         }
@@ -151,6 +155,26 @@ mod tests {
                 note.text
             );
         }
+    }
+
+    #[test]
+    fn service_text_is_sanitized_for_the_footer() {
+        // #101: a refusal embedding a hostile stored name must not carry raw
+        // controls into the status line; the wording otherwise survives.
+        let note = status_for(&ClientError::Service(ServiceError::Rule(
+            timetrack_core::RuleError::DuplicateProject("Evil\n\u{1b}[2J".into()),
+        )));
+        assert_eq!(note.kind, StatusKind::Service);
+        assert_eq!(note.text, "a project named 'Evil  [2J' already exists");
+        // Our own multi-line hint keeps its line breaks.
+        let note = status_for(&ClientError::VersionMismatch {
+            name: "org.freedesktop.DBus.Error.UnknownInterface".into(),
+        });
+        assert!(
+            note.text.contains('\n'),
+            "hint lines survive: {}",
+            note.text
+        );
     }
 
     #[test]

@@ -28,9 +28,11 @@
 //! tab's primary control is the 5/15/30/60 quick-add row.
 
 use self::dialogs::delete::{DeleteConfirm, delete_offer};
+use self::dialogs::delete_project::{DeleteProjectConfirm, delete_project_offer};
 use self::dialogs::entry::{EntryDialog, SaveOutcome, resolve_save};
 use self::dialogs::merge::{MergeConfirm, merge_offer};
 use self::dialogs::project::{ProjectPrompt, ProjectSave, resolve_project_prompt};
+use self::dialogs::recolour::{RecolourPrompt, RecolourSave, resolve_recolour};
 use self::dialogs::split::{SplitPrompt, resolve_split};
 use self::export::picker::ExportPicker;
 use self::keys::printable_char;
@@ -78,6 +80,8 @@ enum OpenPrompt {
     Split,
     Merge,
     Delete,
+    Recolour,
+    DeleteProject,
 }
 
 /// Which prompt is open, if one is.
@@ -94,13 +98,16 @@ enum OpenPrompt {
 /// At most one prompt is open at a time (each one swallows the keys that
 /// would open another), so the order below is the priority the key handler
 /// already used: the entry dialog first, then the project prompt, the split
-/// prompt, the merge confirmation and the delete confirmation.
+/// prompt, the merge confirmation, the delete confirmation, and the two
+/// project-housekeeping prompts (#104) last.
 fn which_prompt(
     entry: bool,
     project: bool,
     split: bool,
     merge: bool,
     delete: bool,
+    recolour: bool,
+    delete_project: bool,
 ) -> Option<OpenPrompt> {
     if entry {
         Some(OpenPrompt::Entry)
@@ -112,6 +119,10 @@ fn which_prompt(
         Some(OpenPrompt::Merge)
     } else if delete {
         Some(OpenPrompt::Delete)
+    } else if recolour {
+        Some(OpenPrompt::Recolour)
+    } else if delete_project {
+        Some(OpenPrompt::DeleteProject)
     } else {
         None
     }
@@ -158,6 +169,12 @@ pub struct TimetrackView {
     /// A pending delete confirmation. Only `d` (confirm), escape (cancel)
     /// and `q` (quit) do anything while this is `Some`.
     delete_confirm: Option<DeleteConfirm>,
+    /// The recolour prompt, when open (#104). Modal like the project
+    /// prompt: one typed field.
+    recolour_prompt: Option<RecolourPrompt>,
+    /// A pending delete-project confirmation (#104). Only `D` (confirm),
+    /// escape (cancel) and `q` (quit) do anything while this is `Some`.
+    delete_project_confirm: Option<DeleteProjectConfirm>,
     /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
     /// defaults to now at view creation; all time ignores it.
     export_picker: ExportPicker,
@@ -191,6 +208,8 @@ impl TimetrackView {
             split_prompt: None,
             merge_confirm: None,
             delete_confirm: None,
+            recolour_prompt: None,
+            delete_project_confirm: None,
             export_picker: ExportPicker::new(now_ms()),
             export_last_dest: None,
             export_last_via_portal: false,
@@ -434,6 +453,8 @@ impl TimetrackView {
             self.split_prompt.is_some(),
             self.merge_confirm.is_some(),
             self.delete_confirm.is_some(),
+            self.recolour_prompt.is_some(),
+            self.delete_project_confirm.is_some(),
         )
     }
 
@@ -447,6 +468,7 @@ impl TimetrackView {
             Some(OpenPrompt::Entry) => return self.on_dialog_key(ev),
             Some(OpenPrompt::Project) => return self.on_project_key(ev),
             Some(OpenPrompt::Split) => return self.on_split_key(ev),
+            Some(OpenPrompt::Recolour) => return self.on_recolour_key(ev),
             // A merge or a delete waits its turn: the anchor field is typed
             // into first, and each is answered by its own key handler below.
             _ => {}
@@ -460,6 +482,7 @@ impl TimetrackView {
         match self.open_prompt() {
             Some(OpenPrompt::Merge) => return self.on_merge_key(ev),
             Some(OpenPrompt::Delete) => return self.on_delete_key(ev),
+            Some(OpenPrompt::DeleteProject) => return self.on_delete_project_key(ev),
             _ => {}
         }
         // Tab cycles the three tabs (§11); shift goes backward. The Tab key
@@ -490,6 +513,12 @@ impl TimetrackView {
             // one. No numbered placeholders anywhere: every name is typed.
             "n" => self.open_project_prompt(),
             "r" => self.open_rename_prompt(),
+
+            // Project housekeeping (#104): `c` recolours the current
+            // project, `D` offers to delete it (the second `D` executes,
+            // like `d` twice for an entry).
+            "c" => self.open_recolour_prompt_for_current(),
+            "D" => self.open_delete_project_confirm_for_current(),
 
             // Undo removes only the quick-added entry; delete is explicit.
             "u" => match newest_quick_add(&self.snapshot) {
@@ -554,9 +583,9 @@ impl TimetrackView {
             "tab" => {
                 if let Some(dlg) = self.dialog.as_mut() {
                     if ev.keystroke.modifiers.shift {
-                        dlg.field = dlg.field.prev();
+                        dlg.prev_field();
                     } else {
-                        dlg.field = dlg.field.next();
+                        dlg.next_field();
                     }
                 }
             }
@@ -571,7 +600,17 @@ impl TimetrackView {
                 // input, and key_char of a special key must not leak in.
                 if let Some(ch) = printable_char(ev) {
                     if let Some(dlg) = self.dialog.as_mut() {
-                        dlg.type_text(ch);
+                        // The project field cycles instead of taking text:
+                        // `h`/`l`, the project keys everywhere else (#104).
+                        if dlg.field == self::dialogs::entry::DialogField::Project {
+                            match ch {
+                                "h" => dlg.cycle_project(-1),
+                                "l" => dlg.cycle_project(1),
+                                _ => {}
+                            }
+                        } else {
+                            dlg.type_text(ch);
+                        }
                     }
                 }
             }
@@ -598,27 +637,38 @@ impl TimetrackView {
     }
 
     /// Open an edit dialog for the selected entry: new endpoints, or new
-    /// text, or both. Empty times keep the current endpoints.
+    /// text, or a new project, or any of them. Empty times keep the
+    /// current endpoints.
     fn open_edit_dialog(&mut self) {
         match self.snapshot.entries.get(self.selected).cloned() {
             Some(e) => {
-                let project = self
-                    .snapshot
-                    .projects
+                // The move targets are the active projects; the dialog
+                // itself keeps the entry's current project representable
+                // when it is archived (#104).
+                let choices: Vec<(String, String)> = self
+                    .active_projects()
                     .iter()
-                    .find(|p| p.id == e.project_id)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| e.project_id.clone());
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect();
                 self.status = None;
                 self.dialog = Some(EntryDialog::edit(
                     e.id,
-                    project,
+                    e.project_id,
+                    choices,
                     e.description,
                     e.started_at,
                     e.ended_at,
                 ));
             }
             None => self.status = Some(StatusMsg::local("nothing to edit")),
+        }
+    }
+
+    /// Cycle the edit dialog's project choice from a mouse click (#104):
+    /// the keyboard path is `h`/`l` in the field, the click steps forward.
+    pub(crate) fn cycle_dialog_project(&mut self, delta: i32) {
+        if let Some(dlg) = self.dialog.as_mut() {
+            dlg.cycle_project(delta);
         }
     }
 
@@ -700,6 +750,128 @@ impl TimetrackView {
                 self.send(Action::UpdateProject { id, name });
                 self.project_prompt = None;
             }
+        }
+    }
+
+    /// Open the recolour prompt for the current project (`c`).
+    fn open_recolour_prompt_for_current(&mut self) {
+        match self.current_project() {
+            Some(p) => {
+                let id = p.id.clone();
+                self.open_recolour_prompt(&id);
+            }
+            None => self.status = Some(StatusMsg::local("nothing to recolour")),
+        }
+    }
+
+    /// Open the recolour prompt for a project, prefilled with its current
+    /// colour. Shared by the `c` key and the Projects rows' buttons, so
+    /// both land on the same prompt (#104).
+    pub(crate) fn open_recolour_prompt(&mut self, project_id: &str) {
+        if let Some(p) = self
+            .snapshot
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .cloned()
+        {
+            self.status = None;
+            self.recolour_prompt = Some(RecolourPrompt::new(p.id, p.name, p.colour));
+        }
+    }
+
+    /// Handle a key press while the recolour prompt is open. Always returns
+    /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_recolour_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.recolour_prompt = None;
+            }
+            "enter" => self.recolour_save(),
+            "backspace" => {
+                if let Some(prompt) = self.recolour_prompt.as_mut() {
+                    prompt.text.pop();
+                    prompt.error = None;
+                }
+            }
+            _ => {
+                if let Some(ch) = printable_char(ev) {
+                    if let Some(prompt) = self.recolour_prompt.as_mut() {
+                        prompt.text.push_str(ch);
+                        prompt.error = None;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Validate the recolour prompt and send it. Stays open with an error
+    /// on bad hex; closes on success or when nothing changed.
+    fn recolour_save(&mut self) {
+        let Some(prompt) = self.recolour_prompt.clone() else {
+            return;
+        };
+        match resolve_recolour(&prompt) {
+            Err(error) => {
+                if let Some(open) = self.recolour_prompt.as_mut() {
+                    open.error = Some(error.to_string());
+                }
+            }
+            Ok(RecolourSave::NoChange) => {
+                self.recolour_prompt = None;
+            }
+            Ok(RecolourSave::Apply(colour)) => {
+                self.send(Action::RecolourProject {
+                    id: prompt.project_id,
+                    colour,
+                });
+                self.recolour_prompt = None;
+            }
+        }
+    }
+
+    /// Offer the delete-project confirmation for the current project (`D`).
+    fn open_delete_project_confirm_for_current(&mut self) {
+        match self.current_project() {
+            Some(p) => {
+                let id = p.id.clone();
+                self.open_delete_project_confirm(&id);
+            }
+            None => self.status = Some(StatusMsg::local("nothing to delete")),
+        }
+    }
+
+    /// Offer the delete-project confirmation for a project, or say in the
+    /// footer why it cannot go (last project, still has entries) — the
+    /// core's own wording via the offer, and the service re-validates.
+    /// Shared by the `D` key and the Projects rows' buttons (#104).
+    pub(crate) fn open_delete_project_confirm(&mut self, project_id: &str) {
+        match delete_project_offer(&self.snapshot, project_id) {
+            Ok(confirm) => {
+                self.status = None;
+                self.delete_project_confirm = Some(confirm);
+            }
+            Err(msg) => self.status = Some(StatusMsg::local(msg)),
+        }
+    }
+
+    /// Handle a key press while a delete-project confirmation is pending.
+    /// Only the confirmation's own answers do anything.
+    fn on_delete_project_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if ev.keystroke.key.as_str() == "escape" {
+            self.delete_project_confirm = None;
+            return true;
+        }
+        match ev.keystroke.key_char.as_deref() {
+            Some("D") => {
+                if let Some(confirm) = self.delete_project_confirm.take() {
+                    self.send(Action::DeleteProject(confirm.id));
+                }
+                true
+            }
+            Some("q") => false,
+            _ => true,
         }
     }
 
@@ -875,6 +1047,7 @@ impl TimetrackView {
                 started_at,
                 ended_at,
                 description,
+                project_id,
             } => {
                 // Only call for what actually changed: an identical SetTimes
                 // would persist and acknowledge a no-op write.
@@ -886,7 +1059,13 @@ impl TimetrackView {
                     });
                 }
                 if let Some(description) = description {
-                    self.send(Action::SetText { id, description });
+                    self.send(Action::SetText {
+                        id: id.clone(),
+                        description,
+                    });
+                }
+                if let Some(project) = project_id {
+                    self.send(Action::SetProject { id, project });
                 }
                 self.dialog = None;
             }
@@ -1154,30 +1333,41 @@ mod tests {
 
     #[test]
     fn no_open_prompt_means_no_prompt() {
-        assert_eq!(which_prompt(false, false, false, false, false), None);
+        assert_eq!(
+            which_prompt(false, false, false, false, false, false, false),
+            None
+        );
     }
 
     #[test]
     fn each_open_prompt_is_the_one_that_owns_the_keyboard() {
         assert_eq!(
-            which_prompt(true, false, false, false, false),
+            which_prompt(true, false, false, false, false, false, false),
             Some(OpenPrompt::Entry)
         );
         assert_eq!(
-            which_prompt(false, true, false, false, false),
+            which_prompt(false, true, false, false, false, false, false),
             Some(OpenPrompt::Project)
         );
         assert_eq!(
-            which_prompt(false, false, true, false, false),
+            which_prompt(false, false, true, false, false, false, false),
             Some(OpenPrompt::Split)
         );
         assert_eq!(
-            which_prompt(false, false, false, true, false),
+            which_prompt(false, false, false, true, false, false, false),
             Some(OpenPrompt::Merge)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, true),
+            which_prompt(false, false, false, false, true, false, false),
             Some(OpenPrompt::Delete)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, false, false, true, false),
+            Some(OpenPrompt::Recolour)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, false, false, false, true),
+            Some(OpenPrompt::DeleteProject)
         );
     }
 
@@ -1186,19 +1376,19 @@ mod tests {
         // The key handler used to check the prompts one by one, in this
         // order; the shared question has to keep it.
         assert_eq!(
-            which_prompt(true, true, true, true, true),
+            which_prompt(true, true, true, true, true, true, true),
             Some(OpenPrompt::Entry)
         );
         assert_eq!(
-            which_prompt(false, true, true, true, true),
+            which_prompt(false, true, true, true, true, true, true),
             Some(OpenPrompt::Project)
         );
         assert_eq!(
-            which_prompt(false, false, true, true, true),
+            which_prompt(false, false, true, true, true, true, true),
             Some(OpenPrompt::Split)
         );
         assert_eq!(
-            which_prompt(false, false, false, true, true),
+            which_prompt(false, false, false, true, true, true, true),
             Some(OpenPrompt::Merge)
         );
     }

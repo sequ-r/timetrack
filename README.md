@@ -53,7 +53,7 @@ about where a week starts.
 | Split and merge | in the GUI (`s` split prompt, `m` merge confirm stating the shrink), the CLI, the core and the service |
 | Totals | this ISO week, this month, all time, per project; the service aggregates so both UIs agree |
 | Overlap | counted twice, by design; a day over 24h is flagged, never rejected |
-| Projects | create, rename, archive and unarchive; archiving keeps the history in totals |
+| Projects | create, rename, archive, unarchive, recolour and delete (GUI `c`/`D` or the Projects rows' buttons; entries move projects from the edit dialog); archiving keeps the history in totals |
 | Persistence | atomic writes; survives restart; corrupt or newer stores are refused, never silently reset |
 | CSV export | current or chosen week/month (`--at YYYY-MM-DD`, default now) or all time; the CLI prints or writes a file, the GUI Export tab saves through the system dialog with period-stamped names |
 | System tray | week-total tooltip with over-24h attention state, per-project quick-add / undo / delete-confirm, Open TimeTrack, Quit (host only) |
@@ -79,6 +79,24 @@ cargo test --workspace --features timetrack-gui/portal-stub   # unit tests (GUI 
 bash scripts/e2e.sh           # end-to-end checks against a real service
 bash scripts/gui-smoke.sh     # headless GUI checks: paint, quick-add click, keyboard, confirm dialogs, tabs, export picker/preview/save
 ```
+
+Coverage is informational, never a gate (#111). One-time setup
+(`rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --locked`),
+then:
+
+```sh
+# Pre-build the binaries the tray round-trip test spawns into llvm-cov's
+# target dir (it cleans that dir before building, hence --no-clean):
+cargo build --package timetrack-service --package timetrack-tray --target-dir target/llvm-cov-target
+cargo llvm-cov --no-clean --workspace --features timetrack-gui/portal-stub --summary-only
+cargo llvm-cov report --html --output-dir coverage-html   # browsable per-line report
+```
+
+CI runs the same commands in the non-blocking `coverage` job and uploads the
+HTML report as a run artifact. Baseline (2026-10-28): 68.6% lines overall —
+core 96.3%, service 84.5%, update 90.5%, tray 76.6%, proto 68.0%, cli 51.2%,
+gui 46.1% (the gpui render modules are exercised by the smoke check, not by
+unit tests, so they read 0% here).
 
 The `portal-stub` feature compiles in the save-dialog stub the GUI smoke
 check drives: there is no live portal on a headless X server. A released
@@ -334,11 +352,6 @@ file written by a newer TimeTrack is refused the same way, and says so.
 **A store from the stopwatch era cannot be migrated.** That format has no
 projects, so there is nothing to migrate it onto. The service says so
 plainly and refuses it; move the file aside to start fresh.
-
-**A project cannot be deleted from the GUI.** The GUI can archive and
-unarchive, which keeps the history in the totals, but not delete. The
-terminal can: `timetrack delete-project <name>`. A project that still has
-entries is refused — move or delete the entries first.
 
 **The TUI cannot create a project.** It has no text field for one; create
 it from the command line (`timetrack project "Work"`) and it appears in

@@ -14,6 +14,35 @@ use super::super::{service::Action, theme};
 use gpui::prelude::*;
 use gpui::{ElementId, IntoElement, div, px, rgb, rgba};
 
+/// One small row action button (Recolour/Delete), in the archive pair's
+/// shape. `on_click` receives the view, already entity-updated.
+fn row_button(
+    id: ElementId,
+    label: &'static str,
+    bg: gpui::Rgba,
+    fg: gpui::Rgba,
+    entity: Option<gpui::Entity<TimetrackView>>,
+    act: impl Fn(&mut TimetrackView) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .bg(bg)
+        .text_color(fg)
+        .child(label)
+        .when_some(entity, move |this, entity| {
+            this.on_click(move |_ev, _window, cx| {
+                entity.update(cx, |view, cx| {
+                    act(view);
+                    cx.notify();
+                });
+            })
+        })
+}
+
 /// The element id of one of a project's row buttons.
 ///
 /// Built from the project id itself rather than from a number parsed out of
@@ -77,9 +106,8 @@ impl TimetrackView {
             // a large store's all-time column next to a correct week column.
             let (week, all) = self.snapshot.project_totals(&p.id);
             let id = p.id.clone();
-            let name = p.name.clone();
-            // The project's colour, if it has one, else the neutral row grey:
-            // recolours set from the CLI show up here without another action.
+            let name = timetrack_core::sanitize_display(&p.name);
+            // The project's colour, if it has one, else the neutral row grey.
             let dot = theme::project_colour(p.colour);
             div()
                 .flex()
@@ -114,6 +142,31 @@ impl TimetrackView {
                         .text_color(rgba(theme::MUTED_TEXT))
                         .child(timetrack_core::format_duration(all)),
                 )
+                // Housekeeping (#104): the mouse routes to the same
+                // prompts the `c`/`D` keys open for the current project —
+                // Delete only opens the confirmation, like the first `D`.
+                .child(row_button(
+                    project_button_id("recolour-project", &p.id),
+                    "Recolour",
+                    rgba(0x3a3a4aff),
+                    rgb(0xffffff),
+                    self.entity.clone(),
+                    {
+                        let id = id.clone();
+                        move |view: &mut TimetrackView| view.open_recolour_prompt(&id)
+                    },
+                ))
+                .child(row_button(
+                    project_button_id("delete-project", &p.id),
+                    "Delete",
+                    rgba(0x3a3a4aff),
+                    rgba(theme::DANGER),
+                    self.entity.clone(),
+                    {
+                        let id = id.clone();
+                        move |view: &mut TimetrackView| view.open_delete_project_confirm(&id)
+                    },
+                ))
                 // Archiving is offered only for live projects; an archived one
                 // offers the reverse instead, so archiving is reversible
                 // without the CLI.
@@ -210,6 +263,21 @@ mod tests {
             project_button_id("archive", "imported"),
             project_button_id("unarchive", "imported"),
             "the two buttons of one project must differ too"
+        );
+        // The housekeeping buttons (#104) share each row with those two.
+        for kind in ["recolour-project", "delete-project"] {
+            assert_ne!(
+                project_button_id(kind, "p1"),
+                project_button_id("archive", "p1")
+            );
+            assert_ne!(
+                project_button_id(kind, "p1"),
+                project_button_id("archive", "p2")
+            );
+        }
+        assert_ne!(
+            project_button_id("recolour-project", "p1"),
+            project_button_id("delete-project", "p1")
         );
     }
 

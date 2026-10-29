@@ -28,16 +28,21 @@ pub(crate) struct DeleteConfirm {
 /// banner states exactly what would be lost.
 pub(crate) fn delete_offer(snapshot: &Snapshot, selected: usize) -> Option<DeleteConfirm> {
     let picked = snapshot.entries.get(selected)?.clone();
+    // Sanitized (#101): the summary is a one-line banner built from stored
+    // text, which a legacy store can fill with controls.
     let project = snapshot
         .projects
         .iter()
         .find(|p| p.id == picked.project_id)
-        .map(|p| p.name.clone())
+        .map(|p| timetrack_core::sanitize_display(&p.name))
         .unwrap_or_else(|| picked.project_id.clone());
     let what = if picked.description.is_empty() {
         "no note".to_string()
     } else {
-        format!("'{}'", picked.description)
+        format!(
+            "'{}'",
+            timetrack_core::sanitize_display(&picked.description)
+        )
     };
     Some(DeleteConfirm {
         summary: format!(
@@ -89,6 +94,28 @@ mod tests {
             "must state the confirm key: {}",
             offer.summary
         );
+    }
+
+    #[test]
+    fn delete_offer_sanitizes_stored_text() {
+        // #101: the banner is built from stored name/description, which a
+        // legacy store can fill with controls the current rules refuse.
+        let snap = Snapshot {
+            entries: vec![EntryView {
+                description: "rev\niew\u{1b}[31m".into(),
+                ..entry_on("e1", "p1", 0, 3_600_000)
+            }],
+            projects: vec![project("p1", "Wo\nrk")],
+            ..Default::default()
+        };
+        let offer = delete_offer(&snap, 0).unwrap();
+        assert!(
+            !offer.summary.chars().any(|c| c.is_control()),
+            "{}",
+            offer.summary
+        );
+        assert!(offer.summary.contains("Wo rk"), "{}", offer.summary);
+        assert!(offer.summary.contains("rev iew [31m"), "{}", offer.summary);
     }
 
     #[test]

@@ -75,7 +75,14 @@ impl ExportScope {
         match self {
             ExportScope::All => anchor_ms,
             ExportScope::Week => {
-                let shifted = anchor_ms + delta as i64 * 7 * MS_PER_DAY;
+                // Checked (#98): a hostile anchor/delta pair leaves the
+                // anchor where it is instead of wrapping it across the epoch.
+                let Some(shifted) = (delta as i64)
+                    .checked_mul(7 * MS_PER_DAY)
+                    .and_then(|d| anchor_ms.checked_add(d))
+                else {
+                    return anchor_ms;
+                };
                 let spelled = anchor_day_string(shifted, tz);
                 crate::parse_anchor_day(&spelled, "anchor", tz).unwrap_or(shifted)
             }
@@ -127,7 +134,12 @@ fn shift_anchor_month(anchor_ms: i64, delta: i32, tz: &Tz) -> i64 {
     let (Ok(y), Ok(m), Ok(d)) = (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) else {
         return anchor_ms;
     };
-    let total = y * 12 + (m - 1) + delta as i64;
+    // `y`/`m` come from the clamped day spelling, so this cannot overflow
+    // in practice; saturating keeps it that way by construction (#98).
+    let total = y
+        .saturating_mul(12)
+        .saturating_add(m - 1)
+        .saturating_add(delta as i64);
     let new_y = total.div_euclid(12);
     let new_m = total.rem_euclid(12) + 1;
     let new_d = d.min(crate::days_in_month(new_y, new_m as u32));
@@ -235,7 +247,9 @@ pub fn format_export_status(
 /// Uses the offset in force at that instant, so entries on either side of a
 /// DST transition render with their own wall-clock time.
 pub fn format_local_iso8601(utc_ms: i64, tz: &Tz) -> String {
-    let local_ms = utc_ms + tz.offset_at_ms(utc_ms);
+    // Saturating (#98): formatting an extreme stored instant renders the
+    // range edge instead of wrapping to the opposite end of time.
+    let local_ms = utc_ms.saturating_add(tz.offset_at_ms(utc_ms));
     let day = local_ms.div_euclid(MS_PER_DAY);
     let rem = local_ms.rem_euclid(MS_PER_DAY);
     let (y, m, d) = day_to_ymd(day);
@@ -248,50 +262,39 @@ pub fn format_local_iso8601(utc_ms: i64, tz: &Tz) -> String {
 }
 
 /// Day index -> (year, month, day-of-month).
+///
+/// Delegates to the aggregate conversion ([`crate::ymd_of`]): there used to
+/// be a second copy of the calendar walk here, with the same unbounded
+/// month loop (#97). One conversion, clamped and constant-time.
 fn day_to_ymd(day: i64) -> (i64, u32, u32) {
-    // Same walk as aggregate.rs (the inverse of its day_of_month), using the
-    // shared month lengths so the two cannot disagree.
-    let mut year = 1970;
-    while days_to_year(year + 1) <= day && year < 10_000 {
-        year += 1;
-    }
-    while days_to_year(year) > day && year > -10_000 {
-        year -= 1;
-    }
-    let mut doy = day - days_to_year(year);
-    let mut month = 1;
-    loop {
-        let len = crate::days_in_month(year, month);
-        if doy < len {
-            break;
-        }
-        doy -= len;
-        month += 1;
-    }
-    (year, month, (doy + 1) as u32)
+    crate::ymd_of(day)
 }
 
-fn days_to_year(year: i64) -> i64 {
-    let mut days = 0;
-    if year >= 1970 {
-        for y in 1970..year {
-            days += if crate::is_leap_year(y) { 366 } else { 365 };
-        }
-    } else {
-        for y in year..1970 {
-            days -= if crate::is_leap_year(y) { 366 } else { 365 };
-        }
+/// Neutralize a spreadsheet formula hiding in a text cell (#101).
+///
+/// Excel, Sheets, and LibreOffice execute a cell whose first non-whitespace
+/// character is `=`, `+`, `-`, or `@` as a formula — so a project named
+/// `=2+2` (or worse, a DDE payload) would run in the stakeholder's
+/// spreadsheet. Prefixing a single quote makes every major spreadsheet
+/// treat the cell as text. RFC 4180 quoting alone does not stop this: the
+/// quotes are CSV syntax, gone by the time the formula engine sees the cell.
+fn neutralize_formula(s: &str) -> String {
+    let first = s.trim_start_matches([' ', '\t', '\r']).chars().next();
+    match first {
+        Some('=' | '+' | '-' | '@') => format!("'{s}"),
+        _ => s.to_string(),
     }
-    days
 }
 
 /// Escape one CSV field (RFC 4180 minimal): quote when it contains
-/// `,`, `"`, or a line break, doubling inner quotes.
+/// `,`, `"`, or a line break, doubling inner quotes. Formula-looking text
+/// is neutralized first (#101), quoting or not.
 pub fn escape_field(s: &str) -> String {
+    let s = neutralize_formula(s);
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_string()
+        s
     }
 }
 
@@ -445,6 +448,35 @@ mod tests {
         assert_eq!(escape_field("a,b"), "\"a,b\"");
         assert_eq!(escape_field("a\"b"), "\"a\"\"b\"");
         assert_eq!(escape_field("plain"), "plain");
+    }
+
+    #[test]
+    fn spreadsheet_formulas_are_neutralized() {
+        // #101: a stakeholder opens this file in a spreadsheet; a cell
+        // starting with =, +, -, @ (after whitespace) must arrive as text.
+        assert_eq!(escape_field("=2+2"), "'=2+2");
+        assert_eq!(escape_field("+2+2"), "'+2+2");
+        assert_eq!(escape_field("-2+2"), "'-2+2");
+        assert_eq!(escape_field("@SUM(1+1)"), "'@SUM(1+1)");
+        assert_eq!(escape_field("  =2+2"), "'  =2+2");
+        assert_eq!(
+            escape_field("\t=HYPERLINK(\"x\")"),
+            "\"'\t=HYPERLINK(\"\"x\"\")\""
+        );
+        // Ordinary text that merely contains the characters is untouched,
+        // as are the generated (non-free-text) columns' shapes.
+        assert_eq!(escape_field("a=b"), "a=b");
+        assert_eq!(escape_field("C++"), "C++");
+        assert_eq!(escape_field(""), "");
+        assert_eq!(escape_field("2026-09-29T14:00:00"), "2026-09-29T14:00:00");
+        // And it holds through a full export row, project and description.
+        let mut s = store();
+        s.projects[0].name = "=cmd|' /C calc'!A0".into();
+        s.entries[0].description = "@2+2".into();
+        let csv = export_csv(&s, ExportScope::All, 0, &utc());
+        assert!(csv.contains("'=cmd|' /C calc'!A0"), "{csv}");
+        assert!(csv.contains("'@2+2"), "{csv}");
+        assert!(!csv.contains(",=cmd"), "no live formula cell: {csv}");
     }
 
     #[test]

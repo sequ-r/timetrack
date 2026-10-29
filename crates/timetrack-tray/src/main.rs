@@ -18,6 +18,13 @@
 //! `ksni` is used with its `async-io` feature only (never the default `tokio`
 //! feature -- see the workspace manifest and issue #4). The binary is driven
 //! with `async_io::block_on`, the same pattern as the service.
+//!
+//! # Layout (#108)
+//!
+//! This file keeps only the poll loop and `main`. The seams live beside
+//! it: `item` (the ksni item and its rendering), `menu` (the snapshot →
+//! menu model), `state` (tooltip/connection classification), `ipc` (the
+//! shared service connection), and `actions` (quick-add bookkeeping).
 
 use ksni::TrayMethods as _;
 use std::collections::HashMap;
@@ -26,252 +33,34 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use timetrack_core::{QUICK_ADD_MS, RuleError};
-use timetrack_proto::{Client, ClientError, ServiceError, Snapshot};
+use timetrack_proto::{Client, ClientError};
 
-/// The desktop entry whose `Exec` line the Open row runs
-/// (`data/org.sequ.timetrack.desktop:5`). Baked at compile time so the tray
-/// and the installed launcher always agree on how the app starts.
-const DESKTOP_ENTRY: &str = include_str!("../../../data/org.sequ.timetrack.desktop");
+mod actions;
+mod ipc;
+mod item;
+mod menu;
+mod state;
 
-/// Command the Open row runs: the desktop entry's `Exec` line, first word
-/// as argv[0]. Field codes (`%U`, `%F`, ...) are desktop-file placeholders
-/// for the launcher, not arguments, and are dropped. Pure over the file
-/// text so tests pin it without spawning anything.
-fn gui_argv(desktop: &str) -> Vec<String> {
-    desktop
-        .lines()
-        .find_map(|line| line.strip_prefix("Exec="))
-        .map(|exec| {
-            exec.split_whitespace()
-                .filter(|arg| !arg.starts_with('%'))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
+use ipc::{SharedClient, set_shared_client, shared_client};
+use item::TimetrackTray;
+use menu::{MenuModel, build_menu_model};
+use state::{ConnState, TooltipState, Unwell, conn_state, unwell_of};
+// Named only by the tests (production code reaches them through the item
+// and the model), so the non-test build does not import them.
+#[cfg(test)]
+use actions::{
+    forget_quick_add_if, quick_add_label, record_quick_add, report_action, undo_record_stale,
+};
+#[cfg(test)]
+use item::{DESKTOP_ENTRY, gui_argv};
+#[cfg(test)]
+use menu::{LastEntry, MAX_PROJECTS, ProjectItem};
+#[cfg(test)]
+use state::tooltip_text;
 
 /// How often the service is polled for a new snapshot. Slower than the
 /// GUI's 1s tick: the tray only needs fresh menu data, not animation.
 const POLL: Duration = Duration::from_secs(5);
-
-/// How many projects sit at the menu's top level before the rest move under
-/// "More projects". Tray menus must stay short; the aggregates behind them
-/// still cover every project -- here it is the menu, not the data, that is
-/// capped.
-const MAX_PROJECTS: usize = 8;
-
-/// The tray's one bus connection, shared by the poll loop and the menu
-/// workers (#50).
-///
-/// The poll loop publishes the live client here; a menu click clones it
-/// and makes its call on the clone, so a burst of clicks multiplies
-/// threads but never bus connections.
-type SharedClient = Arc<Mutex<Option<Client>>>;
-
-/// The tray's live connection, cloned for one call.
-///
-/// `None` means the tray holds no connection -- the service is not
-/// running -- so a caller must not open one of its own.
-fn shared_client(slot: &SharedClient) -> Option<Client> {
-    slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// Publish the tray's live connection, or clear it once that connection
-/// dies, so the menu workers always find the current one.
-fn set_shared_client(slot: &SharedClient, client: Option<Client>) {
-    *slot.lock().unwrap_or_else(|e| e.into_inner()) = client;
-}
-
-/// One unarchived project as the menu sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProjectItem {
-    id: String,
-    name: String,
-    /// This ISO week's total, from the service aggregate -- never re-summed
-    /// from entries, which may carry only recent ones.
-    week_ms: i64,
-    /// The entry the delete row would remove: the most recent one for this
-    /// project in the snapshot (tray-7, #11).
-    last_entry: Option<LastEntry>,
-}
-
-/// The most recent entry for a project: its id plus its duration for the
-/// confirm row. The snapshot arrives newest-first, so the first match per
-/// project is the target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LastEntry {
-    id: String,
-    duration_ms: i64,
-}
-
-/// What the menu shows. Compared by value each tick so the item only
-/// rebuilds (and the host only re-renders) when something actually changed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct MenuModel {
-    visible: Vec<ProjectItem>,
-    overflow: Vec<ProjectItem>,
-}
-
-/// Build the menu model from a snapshot. Archived projects are filtered out
-/// of the menu but stay in the totals (REQUIREMENTS §14); beyond
-/// `MAX_PROJECTS` the remainder moves under an overflow submenu.
-fn build_menu_model(snapshot: &Snapshot) -> MenuModel {
-    let mut active: Vec<ProjectItem> = snapshot
-        .projects
-        .iter()
-        .filter(|p| !p.archived)
-        .map(|p| ProjectItem {
-            id: p.id.clone(),
-            name: p.name.clone(),
-            week_ms: snapshot.week.per_project.get(&p.id).copied().unwrap_or(0),
-            last_entry: snapshot
-                .entries
-                .iter()
-                .find(|e| e.project_id == p.id)
-                .map(|e| LastEntry {
-                    id: e.id.clone(),
-                    duration_ms: e.duration_ms(),
-                }),
-        })
-        .collect();
-    let overflow = if active.len() > MAX_PROJECTS {
-        active.split_off(MAX_PROJECTS)
-    } else {
-        Vec::new()
-    };
-    MenuModel {
-        visible: active,
-        overflow,
-    }
-}
-
-/// What the tooltip and icon state show. Replaced wholesale from the poll
-/// loop via `Handle::update`, like the menu -- and part of the same rebuild
-/// gate, so the host re-renders on any real change, not every 5s tick.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TooltipState {
-    /// This ISO week's total, from the service aggregate.
-    total_ms: i64,
-    /// How many projects share that total (nonzero week total each).
-    projects: usize,
-    /// A day's summed time exceeds 24h (REQUIREMENTS §4): the icon asks for
-    /// attention instead of sitting idle.
-    attention: bool,
-}
-
-impl TooltipState {
-    /// Derive the tooltip state from a snapshot: the week total, the
-    /// contributor count through `Snapshot::project_totals`, and the
-    /// over-24h flag. Entries are never re-summed -- they may carry only
-    /// recent ones while the aggregates cover the whole store.
-    fn from_snapshot(snapshot: &Snapshot) -> Self {
-        Self {
-            total_ms: snapshot.week.total_ms,
-            projects: snapshot
-                .projects
-                .iter()
-                .filter(|p| snapshot.project_totals(&p.id).0 > 0)
-                .count(),
-            attention: !snapshot.over_24h_days.is_empty(),
-        }
-    }
-}
-
-/// The tooltip body: the week total plus how many projects share it.
-///
-/// The total is formatted like the menu rows beside it -- the core's
-/// compact `1h 15m`. The tooltip used to have a formatter of its own
-/// (`1:15`), so the tray's two surfaces spelled the same duration two
-/// ways, and the one that was not in the core was the one that was not
-/// shared.
-fn tooltip_text(state: &TooltipState) -> String {
-    let projects = if state.projects == 1 {
-        "project"
-    } else {
-        "projects"
-    };
-    format!(
-        "Week total {} · {} {projects}",
-        timetrack_core::format_compact(state.total_ms),
-        state.projects
-    )
-}
-
-/// Why the icon is not showing live totals: the last poll outcome when it
-/// was not a good snapshot. `None` means the tooltip shows the week summary
-/// above. Sorted by `ClientError` variant (see `unwell_of`), never by
-/// message text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Unwell {
-    /// The service is unreachable (absent, or the bus broke mid-run): the
-    /// icon goes flat and the tooltip carries the start-service hint.
-    Down,
-    /// Client and service speak different interfaces: a distinct message
-    /// naming the reinstall fix.
-    Skewed,
-    /// The service refused the snapshot: its own wording, like the GUI's
-    /// `StatusKind::Service`.
-    Refused(String),
-}
-
-/// Map a poll outcome to the icon's unwell state, if any. Pure over the
-/// result so both down states are drivable without a bus (tray-9, #13).
-fn unwell_of(result: &Result<Snapshot, ClientError>) -> Option<Unwell> {
-    match result {
-        Ok(_) => None,
-        Err(ClientError::NoService) | Err(ClientError::Transport(_)) => Some(Unwell::Down),
-        Err(ClientError::VersionMismatch { .. }) => Some(Unwell::Skewed),
-        Err(ClientError::Service(e)) => Some(Unwell::Refused(e.to_string())),
-    }
-}
-
-/// The tray item. State is replaced wholesale from the poll loop via
-/// `Handle::update`; `menu()` renders whatever is current.
-struct TimetrackTray {
-    menu: Mutex<MenuModel>,
-    /// The live tooltip and icon state (tray-8, #12). Written by the poll
-    /// loop alongside the menu; `status()` and `tool_tip()` render it.
-    summary: Mutex<TooltipState>,
-    /// Why the icon is not showing live totals, if anything is wrong
-    /// (tray-9, #13). Written by the poll loop on every tick; cleared on
-    /// the next good snapshot.
-    unwell: Mutex<Option<Unwell>>,
-    /// The entry each project's last quick-add created, this session only.
-    /// Written by the quick-add worker thread after the service answers;
-    /// the undo row in tray-6 (#10) reads it. Shared with the workers via
-    /// `Arc` so the sync `activate` handler stays non-blocking (cf. ksni's
-    /// `StandardItem::activate` docs); the map itself is never replaced,
-    /// only its entries, so a menu built earlier still records into this one.
-    last_quick_add: Arc<Mutex<HashMap<String, String>>>,
-    /// Set by the Quit row; the poll loop exits on the next beat (tray-10,
-    /// #14). Shared so the sync `activate` handler only flips the flag --
-    /// quitting never blocks, never calls the service, and leaves through
-    /// `main`, unregistering the item cleanly.
-    shutdown: Arc<AtomicBool>,
-    /// The tray's one bus connection, shared with the poll loop (#50). The
-    /// menu workers take the client out of it instead of opening a
-    /// connection of their own.
-    client: SharedClient,
-    /// The last action that failed, and why.
-    ///
-    /// The menu workers write it; the icon and the tooltip read it. Without
-    /// it a failed quick-add looked exactly like a successful one: the menu
-    /// did not change and the icon stayed healthy, so the only trace was a
-    /// line in a terminal that may not be open.
-    ///
-    /// Sticky until the next action succeeds -- unlike the connection
-    /// state, which the poll loop clears on the next good snapshot, and
-    /// rightly so: a failure is about one action, and a snapshot says
-    /// nothing about whether that action worked.
-    action_error: Arc<Mutex<Option<String>>>,
-}
-
-/// Label for a quick-add bucket row, in minutes like the GUI and CLI buckets
-/// (`+60m`, not the compact `1h`, so the four rows read uniformly).
-fn quick_add_label(duration_ms: i64) -> String {
-    format!("+{}m", duration_ms / 60_000)
-}
 
 /// Take a lock without unwrapping it (#51).
 ///
@@ -282,427 +71,6 @@ fn quick_add_label(duration_ms: i64) -> String {
 /// caller goes on.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Record the outcome of a menu action, so the icon and the tooltip can say
-/// what happened.
-///
-/// A failure used to reach the user only as a line on stderr, in a terminal
-/// that may not be open: the menu did not change and the icon stayed
-/// healthy, so a quick-add that failed looked exactly like one that worked.
-///
-/// The message is sticky until the next action succeeds -- unlike the
-/// connection state, which the poll loop clears on the next good snapshot.
-fn report_action(error: &Arc<Mutex<Option<String>>>, outcome: Option<&ClientError>) {
-    *lock(error) = outcome.map(|e| e.to_string());
-}
-
-/// Remember the entry a quick-add created, so undo (#10) targets exactly the
-/// id the service handed back rather than re-deriving it from the list.
-fn record_quick_add(undo: &Arc<Mutex<HashMap<String, String>>>, project_id: &str, entry_id: &str) {
-    lock(undo).insert(project_id.to_string(), entry_id.to_string());
-}
-
-/// Drop the undo record for `project_id`, but only if it still points at
-/// `entry_id`: a newer quick-add may have moved the target while the undo
-/// call was in flight, and finishing an undo must never clear a newer record.
-fn forget_quick_add_if(
-    undo: &Arc<Mutex<HashMap<String, String>>>,
-    project_id: &str,
-    entry_id: &str,
-) {
-    let mut guard = lock(undo);
-    if guard.get(project_id).map(String::as_str) == Some(entry_id) {
-        guard.remove(project_id);
-    }
-}
-/// Whether a failed undo means the record is stale and must be dropped so
-/// the row disables instead of failing forever.
-///
-/// A refusal naming the entry (`NotQuickAdd`, `UnknownEntry`) says the entry
-/// is gone or was never a quick-add -- it was removed or edited elsewhere,
-/// so no retry can succeed. Anything else (no service, transport) is
-/// transient: the record stays and the next click retries.
-fn undo_record_stale(result: &Result<(), ClientError>) -> bool {
-    matches!(
-        result,
-        Err(ClientError::Service(ServiceError::Rule(
-            RuleError::NotQuickAdd(_) | RuleError::UnknownEntry(_)
-        )))
-    )
-}
-
-impl TimetrackTray {
-    fn new(
-        last_quick_add: Arc<Mutex<HashMap<String, String>>>,
-        shutdown: Arc<AtomicBool>,
-        client: SharedClient,
-    ) -> Self {
-        Self {
-            menu: Mutex::new(MenuModel::default()),
-            summary: Mutex::new(TooltipState::default()),
-            unwell: Mutex::new(None),
-            last_quick_add,
-            shutdown,
-            client,
-            action_error: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn set_menu(&mut self, menu: MenuModel) {
-        *lock(&self.menu) = menu;
-    }
-
-    fn set_summary(&mut self, summary: TooltipState) {
-        *lock(&self.summary) = summary;
-    }
-
-    fn set_unwell(&mut self, unwell: Option<Unwell>) {
-        *lock(&self.unwell) = unwell;
-    }
-
-    /// Ask the poll loop to exit. Touches nothing on the bus: quitting stops
-    /// the tray only, never the service (tray-10, #14).
-    fn request_quit(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-    }
-
-    /// Whether quit was requested. Test-only: the poll loop reads the
-    /// shared flag directly, since the item itself lives inside ksni.
-    #[cfg(test)]
-    fn quit_requested(&self) -> bool {
-        self.shutdown.load(Ordering::Relaxed)
-    }
-
-    /// The entry undo should remove for `project_id`, if this session
-    /// quick-added to it. `None` disables the undo row.
-    fn last_quick_add_for(&self, project_id: &str) -> Option<String> {
-        lock(&self.last_quick_add).get(project_id).cloned()
-    }
-
-    /// One submenu per project: a disabled week-total row, then one row per
-    /// quick-add bucket (tray-5, #9), the undo row (tray-6, #10), and the
-    /// delete row with its confirm submenu (tray-7, #11).
-    fn project_submenu(project: &ProjectItem, can_undo: bool) -> ksni::MenuItem<Self> {
-        let mut submenu = vec![ksni::MenuItem::Standard(ksni::menu::StandardItem {
-            label: format!(
-                "This week: {}",
-                timetrack_core::format_compact(project.week_ms)
-            ),
-            enabled: false,
-            ..Default::default()
-        })];
-        for ms in QUICK_ADD_MS {
-            let project_id = project.id.clone();
-            submenu.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                label: quick_add_label(ms),
-                activate: Box::new(move |tray: &mut Self| {
-                    // `activate` runs on the D-Bus thread and must not block:
-                    // hand the call to a worker thread and return. The worker
-                    // records the created id for undo below when it lands.
-                    let project_id = project_id.clone();
-                    let undo = tray.last_quick_add.clone();
-                    let slot = tray.client.clone();
-                    let failed = tray.action_error.clone();
-                    std::thread::spawn(move || {
-                        let result: Result<timetrack_proto::EntryView, ClientError> =
-                            async_io::block_on(async {
-                                // The tray's own connection (#50): the click
-                                // reuses it instead of opening a new one.
-                                let client = shared_client(&slot).ok_or(ClientError::NoService)?;
-                                client.quick_add(&project_id, ms).await
-                            });
-                        match result {
-                            Ok(entry) => {
-                                record_quick_add(&undo, &project_id, &entry.id);
-                                report_action(&failed, None);
-                                println!(
-                                    "timetrack-tray: quick-added {} to {project_id} ({})",
-                                    entry.id,
-                                    quick_add_label(ms)
-                                );
-                            }
-                            Err(e) => {
-                                report_action(&failed, Some(&e));
-                                eprintln!("timetrack-tray: quick add to {project_id} failed: {e}");
-                            }
-                        }
-                    });
-                }),
-                ..Default::default()
-            }));
-        }
-        // Undo (tray-6, #10): enabled only when this session quick-added to
-        // this project. The click reads the current id at click time rather
-        // than the one present at menu build, so a quick-add that lands
-        // between build and click still undoes the latest entry.
-        let undo_project = project.id.clone();
-        submenu.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-            label: "Undo quick-add".into(),
-            enabled: can_undo,
-            activate: Box::new(move |tray: &mut Self| {
-                let Some(entry_id) = tray.last_quick_add_for(&undo_project) else {
-                    eprintln!("timetrack-tray: nothing to undo for {undo_project}");
-                    return;
-                };
-                let project_id = undo_project.clone();
-                let undo = tray.last_quick_add.clone();
-                let slot = tray.client.clone();
-                let failed = tray.action_error.clone();
-                std::thread::spawn(move || {
-                    let result: Result<(), ClientError> = async_io::block_on(async {
-                        // The tray's own connection (#50): the click reuses
-                        // it instead of opening a new one.
-                        let client = shared_client(&slot).ok_or(ClientError::NoService)?;
-                        client.undo_quick_add(&entry_id).await
-                    });
-                    match &result {
-                        Ok(()) => {
-                            forget_quick_add_if(&undo, &project_id, &entry_id);
-                            report_action(&failed, None);
-                            println!("timetrack-tray: undid quick add {entry_id} in {project_id}");
-                        }
-                        Err(e) if undo_record_stale(&result) => {
-                            // The entry is gone or was never a quick-add
-                            // (removed or edited elsewhere): drop the record
-                            // so the row disables instead of failing forever.
-                            forget_quick_add_if(&undo, &project_id, &entry_id);
-                            report_action(&failed, Some(e));
-                            eprintln!(
-                                "timetrack-tray: undo of {entry_id} refused ({e}); forgetting"
-                            );
-                        }
-                        Err(e) => {
-                            // Transient (no service, transport): keep the
-                            // record so the next click retries.
-                            report_action(&failed, Some(e));
-                            eprintln!("timetrack-tray: undo of {entry_id} failed: {e}");
-                        }
-                    }
-                });
-            }),
-            ..Default::default()
-        }));
-        // Delete (tray-7, #11): the most recent entry for this project,
-        // behind a confirm submenu stating exactly what would go -- the
-        // tray's version of the GUI's `d`-then-`d` delete confirmation.
-        // Explicit `delete_entry` only, never `set_times`: delete
-        // is not a side effect of shortening.
-        match &project.last_entry {
-            Some(target) => {
-                let when = timetrack_core::format_compact(target.duration_ms);
-                let entry_id = target.id.clone();
-                let cancel_id = entry_id.clone();
-                let confirm_label = format!("Delete {} from {}", when, project.name);
-                submenu.push(ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
-                    label: format!("Delete last entry ({when})"),
-                    submenu: vec![
-                        ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                            label: confirm_label.clone(),
-                            activate: Box::new(move |tray: &mut Self| {
-                                // Clone for the worker: `activate` must stay
-                                // callable, so nothing moves out of it.
-                                let entry_id = entry_id.clone();
-                                let confirm_label = confirm_label.clone();
-                                let slot = tray.client.clone();
-                                let failed = tray.action_error.clone();
-                                std::thread::spawn(move || {
-                                    let result: Result<(), ClientError> =
-                                        async_io::block_on(async {
-                                            // The tray's own connection
-                                            // (#50): the click reuses it
-                                            // instead of opening a new one.
-                                            let client = shared_client(&slot)
-                                                .ok_or(ClientError::NoService)?;
-                                            client.delete_entry(&entry_id).await
-                                        });
-                                    match result {
-                                        Ok(()) => {
-                                            report_action(&failed, None);
-                                            println!(
-                                                "timetrack-tray: deleted {entry_id} ({confirm_label})"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            report_action(&failed, Some(&e));
-                                            eprintln!(
-                                                "timetrack-tray: delete of {entry_id} failed: {e}"
-                                            );
-                                        }
-                                    }
-                                });
-                            }),
-                            ..Default::default()
-                        }),
-                        ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                            label: "Keep it".into(),
-                            activate: Box::new(move |_: &mut Self| {
-                                let cancel_id = cancel_id.clone();
-                                println!("timetrack-tray: delete of {cancel_id} cancelled");
-                            }),
-                            ..Default::default()
-                        }),
-                    ],
-                    ..Default::default()
-                }));
-            }
-            None => {
-                submenu.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-                    label: "Nothing to delete".into(),
-                    enabled: false,
-                    ..Default::default()
-                }));
-            }
-        }
-        ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
-            label: project.name.clone(),
-            submenu,
-            ..Default::default()
-        })
-    }
-}
-
-impl ksni::Tray for TimetrackTray {
-    fn id(&self) -> String {
-        "org.sequ.timetrack.tray".into()
-    }
-
-    fn title(&self) -> String {
-        "TimeTrack".into()
-    }
-
-    fn category(&self) -> ksni::Category {
-        ksni::Category::ApplicationStatus
-    }
-
-    fn status(&self) -> ksni::Status {
-        // Attention travels via status, not a second icon: only one icon
-        // asset is installed, so a second icon name would render nothing.
-        // A missing service flattens the icon; a skew, a refused snapshot,
-        // a failed action or an over-24h day asks for attention; otherwise
-        // the icon sits idle-active.
-        let unwell = lock(&self.unwell).clone();
-        let attention = lock(&self.summary).attention;
-        let failed = lock(&self.action_error).is_some();
-        match unwell {
-            Some(Unwell::Down) => ksni::Status::Passive,
-            Some(Unwell::Skewed) => ksni::Status::NeedsAttention,
-            Some(Unwell::Refused(_)) | None => {
-                if attention || failed {
-                    ksni::Status::NeedsAttention
-                } else {
-                    ksni::Status::Active
-                }
-            }
-        }
-    }
-
-    fn icon_name(&self) -> String {
-        "org.sequ.timetrack-symbolic".into()
-    }
-
-    /// The tooltip: live week totals when the service answers, otherwise
-    /// the shared client guidance for the failure (tray-9, #13) -- the same
-    /// wording as the GUI footer (`timetrack-proto::{no_service_hint,
-    /// version_mismatch_hint}`). A refusal shows the service's own wording,
-    /// like the GUI's `StatusKind::Service`.
-    fn tool_tip(&self) -> ksni::ToolTip {
-        let summary = lock(&self.summary).clone();
-        let unwell = lock(&self.unwell).clone();
-        // A connection problem outranks a failed action: "the service is
-        // not running" explains more than the refusal that failure caused.
-        // An action failure outranks the week summary, which is the point:
-        // the action is what the user just did.
-        let failed = lock(&self.action_error).clone();
-        let description = match unwell {
-            Some(Unwell::Down) => timetrack_proto::no_service_hint(),
-            Some(Unwell::Skewed) => timetrack_proto::version_mismatch_hint("tray"),
-            Some(Unwell::Refused(text)) => text,
-            None => match failed {
-                Some(text) => text,
-                None => tooltip_text(&summary),
-            },
-        };
-        ksni::ToolTip {
-            icon_name: "org.sequ.timetrack-symbolic".into(),
-            title: "TimeTrack".into(),
-            description,
-            ..Default::default()
-        }
-    }
-
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        // Copy the state out and drop the guards before building anything
-        // (#51): the closures built below must not be built with a lock
-        // held, and a panic while they are built must not poison the locks
-        // the next render needs.
-        let menu = lock(&self.menu).clone();
-        let undo = lock(&self.last_quick_add).clone();
-        let mut items: Vec<ksni::MenuItem<Self>> = menu
-            .visible
-            .iter()
-            .map(|p| Self::project_submenu(p, undo.contains_key(&p.id)))
-            .collect();
-        if !menu.overflow.is_empty() {
-            items.push(ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
-                label: "More projects".into(),
-                submenu: menu
-                    .overflow
-                    .iter()
-                    .map(|p| Self::project_submenu(p, undo.contains_key(&p.id)))
-                    .collect(),
-                ..Default::default()
-            }));
-        }
-        // App actions (tray-10, #14): opening the GUI runs the desktop
-        // entry's `Exec`, so the tray and the launcher agree; quitting only
-        // flips the shutdown flag -- it never touches the service.
-        items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-            label: "Open TimeTrack".into(),
-            activate: Box::new(move |_: &mut Self| {
-                let argv = gui_argv(DESKTOP_ENTRY);
-                let Some(program) = argv.first() else {
-                    eprintln!("timetrack-tray: desktop entry has no Exec line");
-                    return;
-                };
-                match std::process::Command::new(program).args(&argv[1..]).spawn() {
-                    Ok(_) => println!("timetrack-tray: opened {program}"),
-                    Err(e) => eprintln!("timetrack-tray: could not open {program}: {e}"),
-                }
-            }),
-            ..Default::default()
-        }));
-        items.push(ksni::MenuItem::Standard(ksni::menu::StandardItem {
-            label: "Quit".into(),
-            activate: Box::new(move |tray: &mut Self| {
-                tray.request_quit();
-            }),
-            ..Default::default()
-        }));
-        items
-    }
-}
-
-/// Where the poll loop stands. Sorts by `ClientError` variant, reusing the
-/// triage in `timetrack-proto` -- never by message text, so a refusal that
-/// merely mentions the bus can never read as a missing service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnState {
-    Ready,
-    NoService,
-    VersionMismatch,
-    Refused,
-    Transport,
-}
-
-fn conn_state(result: &Result<Snapshot, ClientError>) -> ConnState {
-    match result {
-        Ok(_) => ConnState::Ready,
-        Err(ClientError::NoService) => ConnState::NoService,
-        Err(ClientError::VersionMismatch { .. }) => ConnState::VersionMismatch,
-        Err(ClientError::Service(_)) => ConnState::Refused,
-        Err(ClientError::Transport(_)) => ConnState::Transport,
-    }
 }
 
 /// zbus uses the async-io backend (see the workspace Cargo.toml), so the
@@ -894,6 +262,18 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(None)),
         )
+    }
+
+    #[test]
+    fn menu_model_names_are_sanitized_for_menu_labels() {
+        // #101: the model name becomes submenu/confirm labels verbatim, so
+        // a legacy store's control characters are cleaned at build time.
+        let model = build_menu_model(&snapshot_with(
+            vec![project("p1", "Wo\nrk\u{1b}[31m", false)],
+            &[("p1", 60_000)],
+        ));
+        assert_eq!(model.visible[0].name, "Wo rk [31m");
+        assert!(!model.visible[0].name.chars().any(|c| c.is_control()));
     }
 
     #[test]

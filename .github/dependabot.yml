@@ -1,0 +1,28 @@
+# Dependency updates (#111): Cargo crates and GitHub Actions, weekly.
+#
+# The workspace builds --locked everywhere, so an update only ever lands as
+# one of these PRs -- never silently under an unrelated change. Minor and
+# patch bumps are grouped into one PR per ecosystem to keep the queue
+# reviewable; majors arrive singly, since each one wants its own reading.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch

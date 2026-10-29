@@ -478,11 +478,14 @@ fn current_project(snap: &Snapshot, cursor: usize) -> Option<&ProjectView> {
 }
 
 /// The name of a project, or its id when the snapshot does not have it.
+///
+/// Sanitized for display (#101): this one resolver feeds the entry rows and
+/// the action messages, so stored control characters never reach a cell.
 fn project_name(snap: &Snapshot, id: &str) -> String {
     snap.projects
         .iter()
         .find(|p| p.id == id)
-        .map(|p| p.name.clone())
+        .map(|p| timetrack_core::sanitize_display(&p.name))
         .unwrap_or_else(|| id.to_string())
 }
 
@@ -510,7 +513,7 @@ fn delete_offer(snap: &Snapshot, selected: usize) -> Option<DeleteConfirm> {
         .projects
         .iter()
         .find(|p| p.id == picked.project_id)
-        .map(|p| p.name.clone())
+        .map(|p| timetrack_core::sanitize_display(&p.name))
         .unwrap_or_else(|| picked.project_id.clone());
     Some(DeleteConfirm {
         id: picked.id.clone(),
@@ -653,7 +656,7 @@ fn draw_quick_add(f: &mut ratatui::Frame, area: Rect, app: &App) {
     }
     let project = app
         .current_project()
-        .map(|p| p.name.clone())
+        .map(|p| timetrack_core::sanitize_display(&p.name))
         .unwrap_or_else(|| "no project".into());
     spans.push(Span::raw("  →  "));
     spans.push(Span::styled(project, Style::default().fg(Color::Yellow)));
@@ -675,11 +678,14 @@ fn draw_projects(f: &mut ratatui::Frame, area: Rect, app: &App) {
     } else {
         // Rank by this week's time so the bar order is meaningful; fall back
         // to the project list order for projects with no time yet.
-        let mut rows: Vec<(&str, i64)> = active
+        // Display names are sanitized copies (#101), so rows carry the id
+        // for identity: the selected check compares ids, never display text.
+        let mut rows: Vec<(&str, String, i64)> = active
             .iter()
             .map(|p| {
                 (
-                    p.name.as_str(),
+                    p.id.as_str(),
+                    timetrack_core::sanitize_display(&p.name),
                     app.snapshot
                         .week
                         .per_project
@@ -689,13 +695,10 @@ fn draw_projects(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 )
             })
             .collect();
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
         rows.into_iter()
-            .map(|(name, ms)| {
-                let selected = app
-                    .current_project()
-                    .map(|p| p.name == name)
-                    .unwrap_or(false);
+            .map(|(id, name, ms)| {
+                let selected = app.current_project().map(|p| p.id == id).unwrap_or(false);
                 ListItem::new(Line::from(vec![
                     Span::raw(if selected { "▶ " } else { "  " }),
                     Span::raw(format!("{name:<28}")),
@@ -766,7 +769,7 @@ fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
                         "  {:<22}",
                         truncate(&project_name(&e.project_id), 22)
                     )),
-                    Span::raw(e.label().to_string()),
+                    Span::raw(timetrack_core::sanitize_display(e.label())),
                 ]))
                 .style(style)
             })
@@ -799,6 +802,8 @@ fn footer_hint() -> &'static str {
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    // Sanitized (#101): the status can carry a service refusal embedding
+    // stored text, and the footer is one line of terminal cells.
     let (footer, style) = match &app.delete_confirm {
         Some(confirm) => (
             confirm.summary.clone(),
@@ -812,7 +817,10 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
         },
     };
-    f.render_widget(Paragraph::new(footer).style(style), area);
+    f.render_widget(
+        Paragraph::new(timetrack_core::sanitize_display(&footer)).style(style),
+        area,
+    );
 }
 
 /// Shorten to `max` characters, so a long project name cannot push the rest
@@ -1005,6 +1013,26 @@ mod tests {
             offer.summary,
             "Delete 30m from Work? d to confirm, esc to cancel"
         );
+    }
+
+    #[test]
+    fn stored_names_are_sanitized_before_they_reach_a_cell() {
+        // #101: a legacy store's project name can hold controls the current
+        // rules refuse. The resolver every row uses, and the confirmation
+        // built on a raw lookup, both hand the terminal a clean copy.
+        let snap = Snapshot {
+            projects: vec![project("p1", "Wo\nrk\u{1b}[31m", false)],
+            entries: vec![entry_minutes("e1", EntrySource::Manual, 0, 30)],
+            ..Default::default()
+        };
+        assert_eq!(project_name(&snap, "p1"), "Wo rk [31m");
+        let offer = delete_offer(&snap, 0).unwrap();
+        assert!(
+            !offer.summary.chars().any(|c| c.is_control()),
+            "{}",
+            offer.summary
+        );
+        assert!(offer.summary.contains("Wo rk [31m"), "{}", offer.summary);
     }
 
     #[test]

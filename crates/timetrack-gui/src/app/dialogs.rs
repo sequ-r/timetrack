@@ -14,7 +14,9 @@
 //! that is on screen.
 
 pub mod delete;
+pub mod delete_project;
 pub mod entry;
 pub mod merge;
 pub mod project;
+pub mod recolour;
 pub mod split;

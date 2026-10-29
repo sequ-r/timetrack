@@ -122,9 +122,19 @@ pub(super) enum Action {
     UnarchiveProject(String),
     /// Create a project.
     AddProject(String),
-    /// Rename a project. Colour is untouched: the GUI names projects, the
-    /// CLI recolours them (§11).
+    /// Rename a project. Colour is untouched (-1 keep); recolouring has
+    /// its own action below (#104).
     UpdateProject { id: String, name: String },
+    /// Recolour a project (#104): `Some` sets `0xRRGGBB`, `None` clears
+    /// (the service's -2 sentinel). Name is untouched (empty keep).
+    RecolourProject { id: String, colour: Option<u32> },
+    /// Delete a project (#104). The view confirmed first; the service
+    /// still owns the guards (last project, has entries) and reports them
+    /// typed.
+    DeleteProject(String),
+    /// Move an entry to another project (#104), from the edit dialog's
+    /// project field.
+    SetProject { id: String, project: String },
     /// Method 1: an explicit start and end (the manual-entry dialog).
     AddEntry {
         project: String,
@@ -309,6 +319,18 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                             // Colour keeps its value: -1 is the service's
                             // keep sentinel.
                             report(&tx, client.update_project(&id, &name, -1).await.map(|_| ()));
+                        }
+                        Ok(Action::RecolourProject { id, colour }) => {
+                            // Name keeps its value (empty); -2 clears the
+                            // colour, a value sets its low 24 bits.
+                            let wire = colour.map(i64::from).unwrap_or(-2);
+                            report(&tx, client.update_project(&id, "", wire).await.map(|_| ()));
+                        }
+                        Ok(Action::DeleteProject(id)) => {
+                            report(&tx, client.delete_project(&id).await.map(|_| ()));
+                        }
+                        Ok(Action::SetProject { id, project }) => {
+                            report(&tx, client.set_project(&id, &project).await.map(|_| ()));
                         }
                         Ok(Action::AddEntry {
                             project,

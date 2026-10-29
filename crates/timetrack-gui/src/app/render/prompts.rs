@@ -17,9 +17,11 @@
 
 use super::super::TimetrackView;
 use super::super::dialogs::delete::DeleteConfirm;
+use super::super::dialogs::delete_project::DeleteProjectConfirm;
 use super::super::dialogs::entry::{DialogField, EntryDialog};
 use super::super::dialogs::merge::MergeConfirm;
 use super::super::dialogs::project::ProjectPrompt;
+use super::super::dialogs::recolour::RecolourPrompt;
 use super::super::dialogs::split::SplitPrompt;
 use super::super::{snapshot_tz, theme};
 use gpui::prelude::*;
@@ -68,6 +70,12 @@ impl TimetrackView {
             })
             .when_some(self.delete_confirm.as_ref(), |el, confirm| {
                 el.child(self.render_delete_confirm(confirm))
+            })
+            .when_some(self.recolour_prompt.as_ref(), |el, prompt| {
+                el.child(self.render_recolour_prompt(prompt))
+            })
+            .when_some(self.delete_project_confirm.as_ref(), |el, confirm| {
+                el.child(self.render_delete_project_confirm(confirm))
             })
     }
 
@@ -128,7 +136,63 @@ impl TimetrackView {
                 &dlg.description,
                 "optional note",
                 dlg.field == DialogField::Description,
-            ))
+            ));
+        // The project field exists only in edit mode (#104): it cycles
+        // (h/l, or a click) instead of taking text, so it is built apart
+        // from the shared text-row shape above.
+        if dlg.edit_id.is_some() {
+            let focused = dlg.field == DialogField::Project;
+            let (_, chosen) = dlg.chosen_project();
+            let entity = self.entity.clone();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .text_color(if focused {
+                                rgb(0xffffff)
+                            } else {
+                                rgba(theme::MUTED_TEXT)
+                            })
+                            .child(format!("{} project", if focused { ">" } else { " " })),
+                    )
+                    .child(
+                        div()
+                            .id("dialog-project-cycle")
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if focused {
+                                rgba(theme::RAISED_BG)
+                            } else {
+                                rgba(0x00000000)
+                            })
+                            .text_color(rgba(theme::BODY_TEXT))
+                            .child(format!("‹ {chosen} ›"))
+                            .when_some(entity, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.cycle_dialog_project(1);
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgba(theme::HINT_TEXT))
+                            .child("h/l or click to move"),
+                    ),
+            );
+        }
+        panel = panel
             .child(field_row(
                 "start",
                 &dlg.start,
@@ -281,5 +345,79 @@ impl TimetrackView {
             );
         }
         panel
+    }
+
+    /// The recolour prompt (#104): one hex field with a live preview dot,
+    /// same panel styling as the project prompt. The dot shows the typed
+    /// colour while it parses (and the neutral grey when the field is
+    /// empty, which is what saving then means: no colour).
+    fn render_recolour_prompt(&self, prompt: &RecolourPrompt) -> impl IntoElement {
+        let preview = if prompt.text.trim().is_empty() {
+            theme::project_colour(None)
+        } else {
+            theme::project_colour(timetrack_core::parse_colour(&prompt.text).ok())
+        };
+        let mut panel = prompt_panel()
+            .child(
+                div()
+                    .text_color(rgba(theme::ACCENT))
+                    .child(format!("RECOLOUR {}", prompt.project_name)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .text_color(rgb(0xffffff))
+                            .child("> colour"),
+                    )
+                    .child(div().w(px(12.)).h(px(12.)).rounded_md().bg(preview))
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgba(theme::RAISED_BG))
+                            .text_color(rgba(theme::BODY_TEXT))
+                            .child(format!("{}_", prompt.text)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgba(theme::HINT_TEXT))
+                            .child("RRGGBB hex · empty clears"),
+                    ),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(rgba(theme::HINT_TEXT))
+                    .child("type a colour · enter save · esc cancel"),
+            );
+        if let Some(err) = &prompt.error {
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
+        }
+        panel
+    }
+
+    /// The delete-project confirmation banner (#104): which project would
+    /// go, behind the same second-keystroke guard as entry deletion.
+    fn render_delete_project_confirm(&self, confirm: &DeleteProjectConfirm) -> impl IntoElement {
+        prompt_panel().child(
+            div()
+                .text_color(rgba(theme::ACCENT))
+                .child(confirm.summary.clone()),
+        )
     }
 }

@@ -293,7 +293,7 @@ impl TimetrackView {
                 .projects
                 .iter()
                 .find(|p| p.id == e.project_id)
-                .map(|p| p.name.clone())
+                .map(|p| timetrack_core::sanitize_display(&p.name))
                 .unwrap_or_else(|| e.project_id.clone());
             section = section.child(
                 div()
@@ -304,7 +304,7 @@ impl TimetrackView {
                     .child(e.id.clone())
                     .child(project)
                     .child(timetrack_core::format_duration(e.duration_ms()))
-                    .child(e.label().to_string()),
+                    .child(timetrack_core::sanitize_display(e.label())),
             );
         }
         if preview.len() > 20 {
