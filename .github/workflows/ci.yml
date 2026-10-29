@@ -91,6 +91,43 @@ jobs:
       - run: cargo build --locked --package timetrack-service
       - run: cargo test --workspace --locked --features timetrack-gui/portal-stub
 
+  coverage:
+    name: coverage (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Informational only (#111): the number exists so it can be watched, not
+    # so it can gate. `continue-on-error` keeps a coverage-tooling failure
+    # from reddening a change, and this job is deliberately absent from the
+    # branch-protection required checks. The same commands run locally —
+    # see "Coverage" in the README's Building section.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        with:
+          apt-packages: ${{ env.GUI_LIBS }}
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # The tray round-trip test spawns the real binaries from the profile
+      # directory next to its test executable. Under llvm-cov that is
+      # `target/llvm-cov-target/debug/`, and llvm-cov cleans that directory
+      # before building — so pre-build the binaries into it and pass
+      # --no-clean, or the round-trip test fails for a missing binary that
+      # `cargo test` alone never produces there (same trap as `test` above).
+      - run: >-
+          cargo build --locked --package timetrack-service
+          --package timetrack-tray --target-dir target/llvm-cov-target
+      - run: >-
+          cargo llvm-cov --no-clean --workspace --locked
+          --features timetrack-gui/portal-stub --summary-only
+      - run: cargo llvm-cov report --html --output-dir coverage-html
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coverage-html
+          path: coverage-html
+          if-no-files-found: ignore
+
   e2e:
     name: e2e (service on a private bus)
     runs-on: ubuntu-latest
