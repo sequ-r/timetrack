@@ -69,7 +69,7 @@ pub(crate) fn merge_offer(snapshot: &Snapshot, selected: usize) -> Option<MergeC
                 .projects
                 .iter()
                 .find(|p| p.id == e.project_id)
-                .map(|p| p.name.clone())
+                .map(|p| timetrack_core::sanitize_display(&p.name))
         })
         .unwrap_or_default();
     Some(MergeConfirm {

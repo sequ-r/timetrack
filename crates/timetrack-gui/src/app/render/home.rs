@@ -101,7 +101,7 @@ impl TimetrackView {
         let project_id = self.current_project().map(|p| p.id.clone());
         let project_name = self
             .current_project()
-            .map(|p| p.name.clone())
+            .map(|p| timetrack_core::sanitize_display(&p.name))
             .unwrap_or_else(|| "no project".into());
 
         let mut row = div().flex().items_center().gap_2().px_6().py_3();
@@ -151,12 +151,12 @@ impl TimetrackView {
 
     /// This week's time per project, longest first.
     fn render_week_by_project(&self) -> impl IntoElement {
-        let mut rows: Vec<(&str, i64)> = self
+        let mut rows: Vec<(String, i64)> = self
             .active_projects()
             .iter()
             .map(|p| {
                 (
-                    p.name.as_str(),
+                    timetrack_core::sanitize_display(&p.name),
                     self.snapshot
                         .week
                         .per_project
@@ -168,7 +168,7 @@ impl TimetrackView {
             .collect();
         // Longest first, ties by name, so the order never flickers between
         // refreshes.
-        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let max_ms = rows.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
 
         let mut list = div().flex().flex_col();
@@ -241,12 +241,13 @@ impl TimetrackView {
                 .into_any_element();
         }
 
+        // Display copies only (#101): the ids stay the identity.
         let project_name = |id: &str| -> String {
             self.snapshot
                 .projects
                 .iter()
                 .find(|p| p.id == id)
-                .map(|p| p.name.clone())
+                .map(|p| timetrack_core::sanitize_display(&p.name))
                 .unwrap_or_else(|| id.to_string())
         };
 
@@ -288,7 +289,7 @@ impl TimetrackView {
                     div()
                         .flex_1()
                         .text_color(rgba(theme::BODY_TEXT))
-                        .child(e.label().to_string()),
+                        .child(timetrack_core::sanitize_display(e.label())),
                 )
         });
 
