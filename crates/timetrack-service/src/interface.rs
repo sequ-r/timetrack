@@ -122,9 +122,11 @@ impl EntryService {
         let g = lock(&self.inner);
         let now = now_ms();
         let today = g.tz.day_of(now);
-        let week = core::week_totals(&g.data, today, &g.tz);
-        let month = core::month_totals(&g.data, today, &g.tz);
-        let all = core::all_totals(&g.data);
+        // One pass for all four aggregates: clients poll snapshots
+        // continuously, so four full rescans per poll made every client's
+        // idle refresh cost grow with the whole history, under the lock
+        // mutations wait on.
+        let totals = core::snapshot_totals(&g.data, today, &g.tz);
 
         Snapshot {
             projects: g
@@ -139,11 +141,11 @@ impl EntryService {
                 .into_iter()
                 .map(protocol::entry_to_view)
                 .collect(),
-            week: to_totals_view(&week),
-            month: to_totals_view(&month),
-            all: to_totals_view(&all),
-            total_ms: all.total_ms,
-            over_24h_days: core::days_exceeding_24h(&g.data, &g.tz),
+            week: to_totals_view(&totals.week),
+            month: to_totals_view(&totals.month),
+            all: to_totals_view(&totals.all),
+            total_ms: totals.all.total_ms,
+            over_24h_days: totals.over_24h_days,
             local_offset_ms: g.tz.offset_at_ms(now),
             tz: g.tz.name().to_string(),
         }
@@ -169,26 +171,26 @@ impl EntryService {
         let Inner {
             data, ids, store, ..
         } = &mut *g;
-        // Snapshot before mutating so a failed save (or a rule refusal after
-        // a partial mutation) can restore exactly what is on disk.
-        let saved_data = data.clone();
-        let saved_ids = ids.clone();
-        let result = f(data, ids, now);
-        match result {
+        // Mutate a working copy and swap it in only once it is on disk, so
+        // a failed save (or a rule refusal after a partial mutation) leaves
+        // memory holding exactly what the file holds (#100). The copy is
+        // the one full-store clone a mutation pays for: mutating in place
+        // needed the same clone kept aside for the rollback, and then the
+        // save cloned again to stamp its version.
+        let mut next_data = data.clone();
+        let mut next_ids = ids.clone();
+        match f(&mut next_data, &mut next_ids, now) {
             Ok(value) => {
-                // Persist before acknowledging.
-                if let Err(e) = store.save(data) {
-                    *data = saved_data;
-                    *ids = saved_ids;
+                // Persist before acknowledging -- and before the new
+                // state becomes visible to snapshots.
+                if let Err(e) = store.save(&next_data) {
                     return Err(ServiceError::Storage(e.to_string()));
                 }
+                *data = next_data;
+                *ids = next_ids;
                 Ok(value)
             }
-            Err(rule) => {
-                *data = saved_data;
-                *ids = saved_ids;
-                Err(ServiceError::from(rule))
-            }
+            Err(rule) => Err(ServiceError::from(rule)),
         }
     }
 

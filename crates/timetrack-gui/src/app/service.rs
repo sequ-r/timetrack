@@ -20,8 +20,8 @@ use super::export::save::{
     default_export_path, export_anchor_for_save, export_suggested_name, save_export,
 };
 use super::status::{StatusKind, StatusMsg};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::time::{Duration, Instant};
 use timetrack_proto::{ClientError, Snapshot, no_service_hint};
 
 /// A message handed from the service thread to the UI thread.
@@ -189,6 +189,22 @@ pub(super) enum Offered {
     Gone,
 }
 
+/// How long the service thread may block waiting for a command before the
+/// next refresh falls due.
+///
+/// The thread waits on the action channel with this as the timeout, so a
+/// command wakes it at once and only an idle channel waits the tick out --
+/// the same shape as the TUI's service loop. Sleeping the whole tick
+/// unconditionally used to leave every click queueing behind whatever was
+/// left of it, which read as the service itself being slow. No snapshot
+/// yet (`None`) means one is due now.
+pub(super) fn refresh_wait(last_refresh: Option<Instant>) -> Duration {
+    match last_refresh {
+        Some(at) => REFRESH.saturating_sub(at.elapsed()),
+        None => Duration::ZERO,
+    }
+}
+
 /// Offer a snapshot to the view.
 ///
 /// The queue holds one snapshot. A view that stops draining -- a hidden
@@ -292,11 +308,29 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                 async_io::Timer::after(Duration::from_millis(500)).await;
             };
 
+            // When the last snapshot was taken. `None` means "not yet", so
+            // the first one is due at once and the first frame is never
+            // blank for a whole tick.
+            let mut last_refresh: Option<Instant> = None;
             loop {
+                // Wait for a command, but never longer than until the
+                // next refresh is due: a click reaches the service at
+                // once instead of queueing behind the tick's remainder
+                // (the TUI's service loop waits the same way). zbus reads
+                // the socket on its own executor thread, so blocking here
+                // does not stall the bus. A timeout folds into the drain
+                // loop's "nothing waiting" case below, which falls
+                // through to the refresh.
+                let mut pending = match action_rx.recv_timeout(refresh_wait(last_refresh)) {
+                    Ok(action) => Ok(action),
+                    Err(RecvTimeoutError::Timeout) => Err(TryRecvError::Empty),
+                    // The window is gone; nothing left to do.
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
                 // Drain queued commands first, then refresh once. Batching
-                // them means one bus round trip per tick, not per click.
+                // them means one snapshot per burst, not per click.
                 loop {
-                    match action_rx.try_recv() {
+                    match pending {
                         Ok(Action::QuickAdd { project, ms }) => {
                             report(&tx, client.quick_add(&project, ms).await.map(|_| ()));
                         }
@@ -441,6 +475,7 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                         // The window is gone; nothing left to do.
                         Err(TryRecvError::Disconnected) => return,
                     }
+                    pending = action_rx.try_recv();
                 }
                 match client.snapshot().await {
                     Ok(s) => {
@@ -456,7 +491,7 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                         }
                     }
                 }
-                async_io::Timer::after(REFRESH).await;
+                last_refresh = Some(Instant::now());
             }
         });
     });
@@ -510,6 +545,24 @@ mod tests {
             "the one that got there is still there"
         );
         assert!(rx.try_recv().is_err(), "and it is the only one");
+    }
+
+    // --- the refresh wait ---
+
+    #[test]
+    fn the_refresh_wait_is_what_is_left_of_the_tick() {
+        // The service thread blocks on the action channel for this long:
+        // an action arriving wakes it at once, and only an idle channel
+        // waits the tick out. No snapshot yet means one is due now, so
+        // the first frame never waits a whole tick.
+        assert_eq!(refresh_wait(None), Duration::ZERO);
+        let fresh = refresh_wait(Some(std::time::Instant::now()));
+        assert!(
+            fresh <= REFRESH && fresh > REFRESH / 2,
+            "just refreshed, so nearly a whole tick remains: {fresh:?}"
+        );
+        let stale = refresh_wait(Some(std::time::Instant::now() - REFRESH * 2));
+        assert_eq!(stale, Duration::ZERO, "overdue refreshes do not wait");
     }
 
     #[test]
