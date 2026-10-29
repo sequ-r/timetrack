@@ -13,7 +13,7 @@
 //! Totals are **sums of durations**, never wall-clock unions (§4), so
 //! overlapping entries are counted separately.
 
-use crate::model::{MAX_DAY, MIN_DAY, Store};
+use crate::model::{Entry, MAX_DAY, MIN_DAY, MS_PER_DAY, Store};
 use crate::tz::Tz;
 use std::collections::BTreeMap;
 
@@ -143,6 +143,36 @@ pub fn days_in_month(year: i64, month: u32) -> i64 {
     }
 }
 
+/// Add one entry's duration to a running total.
+///
+/// Saturating: display sums over a hand-edited store must not wrap (#98);
+/// entries the rules accepted cannot reach this. The per-project key is
+/// looked up by borrow and cloned only on a project's first contribution,
+/// so a scan allocates once per project rather than once per entry.
+fn accumulate(t: &mut Totals, e: &Entry) {
+    let ms = e.duration_ms();
+    t.total_ms = t.total_ms.saturating_add(ms);
+    t.entry_count += 1;
+    match t.per_project.get_mut(e.project_id.as_str()) {
+        Some(slot) => *slot = slot.saturating_add(ms),
+        None => {
+            t.per_project.insert(e.project_id.clone(), ms);
+        }
+    }
+}
+
+/// The local-day range `[from, to)` of the calendar month containing `day`.
+fn month_range(day: i64) -> (i64, i64) {
+    let (year, month) = month_of(day);
+    let first = day_of_month(year, month, 1);
+    let next = if month == 12 {
+        day_of_month(year + 1, 1, 1)
+    } else {
+        day_of_month(year, month + 1, 1)
+    };
+    (first, next)
+}
+
 /// Totals for the ISO week containing local day `day`.
 pub fn week_totals(store: &Store, day: i64, tz: &Tz) -> Totals {
     let week = iso_week_of(day);
@@ -151,13 +181,7 @@ pub fn week_totals(store: &Store, day: i64, tz: &Tz) -> Totals {
 
 /// Totals for the calendar month containing local day `day`.
 pub fn month_totals(store: &Store, day: i64, tz: &Tz) -> Totals {
-    let (year, month) = month_of(day);
-    let first = day_of_month(year, month, 1);
-    let next = if month == 12 {
-        day_of_month(year + 1, 1, 1)
-    } else {
-        day_of_month(year, month + 1, 1)
-    };
+    let (first, next) = month_range(day);
     totals_in_day_range(store, first, next, tz)
 }
 
@@ -170,12 +194,7 @@ pub fn totals_in_day_range(store: &Store, from: i64, to: i64, tz: &Tz) -> Totals
     for e in &store.entries {
         let d = tz.day_of(e.started_at);
         if d >= from && d < to {
-            // Saturating: display sums over a hand-edited store must not
-            // wrap (#98); entries the rules accepted cannot reach this.
-            t.total_ms = t.total_ms.saturating_add(e.duration_ms());
-            t.entry_count += 1;
-            let slot = t.per_project.entry(e.project_id.clone()).or_insert(0);
-            *slot = slot.saturating_add(e.duration_ms());
+            accumulate(&mut t, e);
         }
     }
     t
@@ -190,12 +209,59 @@ pub fn totals_in_day_range(store: &Store, from: i64, to: i64, tz: &Tz) -> Totals
 pub fn all_totals(store: &Store) -> Totals {
     let mut t = Totals::default();
     for e in &store.entries {
-        t.total_ms = t.total_ms.saturating_add(e.duration_ms());
-        t.entry_count += 1;
-        let slot = t.per_project.entry(e.project_id.clone()).or_insert(0);
-        *slot = slot.saturating_add(e.duration_ms());
+        accumulate(&mut t, e);
     }
     t
+}
+
+/// Everything a snapshot needs from the entries, in one bundle.
+///
+/// Produced by [`snapshot_totals`]; the fields are exactly what
+/// [`week_totals`], [`month_totals`], [`all_totals`] and
+/// `crate::days_exceeding_24h` would each compute for the same store, day
+/// and zone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotTotals {
+    /// Totals for the ISO week containing the snapshot day.
+    pub week: Totals,
+    /// Totals for the calendar month containing the snapshot day.
+    pub month: Totals,
+    /// Totals across all time.
+    pub all: Totals,
+    /// Local days whose summed time exceeds 24h, ascending.
+    pub over_24h_days: Vec<i64>,
+}
+
+/// The snapshot aggregates in a single pass over the entries.
+///
+/// A snapshot needs all four results at once, and clients poll snapshots
+/// continuously, so rescanning the store once per aggregate (re-resolving
+/// every entry's local day each time) made the snapshot's cost a multiple
+/// of the history's length for no new information. One pass resolves each
+/// entry's day once and feeds every aggregate it belongs to.
+pub fn snapshot_totals(store: &Store, day: i64, tz: &Tz) -> SnapshotTotals {
+    let week = iso_week_of(day);
+    let (month_first, month_next) = month_range(day);
+    let mut out = SnapshotTotals::default();
+    let mut per_day: BTreeMap<i64, i64> = BTreeMap::new();
+    for e in &store.entries {
+        let d = tz.day_of(e.started_at);
+        accumulate(&mut out.all, e);
+        if d >= week.start_day && d < week.start_day + 7 {
+            accumulate(&mut out.week, e);
+        }
+        if d >= month_first && d < month_next {
+            accumulate(&mut out.month, e);
+        }
+        let slot = per_day.entry(d).or_insert(0i64);
+        *slot = slot.saturating_add(e.duration_ms());
+    }
+    out.over_24h_days = per_day
+        .into_iter()
+        .filter(|(_, ms)| *ms > MS_PER_DAY)
+        .map(|(day, _)| day)
+        .collect();
+    out
 }
 
 /// The local day index of the 1st of `month` in `year`.
@@ -430,6 +496,45 @@ mod tests {
         let t = week_totals(&s, 0, &utc());
         assert_eq!(t.entry_count, 1);
         assert_eq!(t.total_ms, 3_600_000);
+    }
+
+    #[test]
+    fn snapshot_totals_agree_with_the_individual_scans() {
+        // The service's snapshot needs week, month, all-time and the
+        // over-24h days together, so one pass computes all four. That
+        // fusion must never drift from the individual functions it
+        // replaces at the call site: same store, same day, same zone,
+        // same answers.
+        let s = store_with(&[
+            ("p1", 0, 3_600_000),                   // January, previous ISO week
+            ("p1", 5 * D, 5 * D + 2 * 3_600_000),   // this week and month
+            ("p2", 5 * D, 5 * D + 25 * 3_600_000),  // pushes day 5 over 24h
+            ("p2", 40 * D, 40 * D + 3 * 3_600_000), // February: all-time only
+        ]);
+        for tz in [utc(), Tz::parse("Europe/Rome").unwrap()] {
+            let fused = snapshot_totals(&s, 10, &tz);
+            assert_eq!(fused.week, week_totals(&s, 10, &tz), "week, {}", tz.name());
+            assert_eq!(
+                fused.month,
+                month_totals(&s, 10, &tz),
+                "month, {}",
+                tz.name()
+            );
+            assert_eq!(fused.all, all_totals(&s), "all-time, {}", tz.name());
+            assert_eq!(
+                fused.over_24h_days,
+                crate::days_exceeding_24h(&s, &tz),
+                "over-24h days, {}",
+                tz.name()
+            );
+        }
+        // And the fused answers are the expected ones, not just mutually
+        // consistent: day 10 sits in the week Mon day 4 .. Mon day 11.
+        let fused = snapshot_totals(&s, 10, &utc());
+        assert_eq!(fused.week.total_ms, 27 * 3_600_000);
+        assert_eq!(fused.month.total_ms, 28 * 3_600_000);
+        assert_eq!(fused.all.total_ms, 31 * 3_600_000);
+        assert_eq!(fused.over_24h_days, vec![5]);
     }
 
     #[test]

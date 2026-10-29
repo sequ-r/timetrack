@@ -20,7 +20,7 @@
 //! persists *before* acknowledging a mutation, so an acknowledged entry is
 //! on disk.
 
-use crate::model::{STORE_VERSION, Store};
+use crate::model::{Entry, Project, STORE_VERSION, Store};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -177,12 +177,23 @@ impl JsonStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(write)?;
         }
-        let mut doc = store.clone();
-        doc.version = STORE_VERSION;
-        let text = serde_json::to_string_pretty(&doc).map_err(|e| StorageError::Invalid {
-            path: shown.clone(),
-            reason: e.to_string(),
-        })?;
+        // The document as written: the store's own lists under the current
+        // format version. Borrowing them into this view stamps the version
+        // without cloning the whole store first -- a save happens on every
+        // acknowledged mutation, so a deep copy per save made each tap
+        // cost a full duplicate of the history. Field order matches
+        // `Store`'s, so the bytes on disk are unchanged.
+        #[derive(serde::Serialize)]
+        struct OnDisk<'a> {
+            version: u32,
+            projects: &'a [Project],
+            entries: &'a [Entry],
+        }
+        let doc = OnDisk {
+            version: STORE_VERSION,
+            projects: &store.projects,
+            entries: &store.entries,
+        };
 
         // A sibling temp file, so the rename stays within one filesystem and
         // is therefore atomic. Unique per save (#100): a fixed name lets
@@ -193,11 +204,28 @@ impl JsonStore {
             .path
             .with_extension(format!("json.tmp-{}-{n}", std::process::id()));
         let written = (|| -> StorageResult<()> {
-            let mut f = std::fs::File::create(&tmp).map_err(write)?;
-            f.write_all(text.as_bytes()).map_err(write)?;
+            let f = std::fs::File::create(&tmp).map_err(write)?;
+            // Serialise straight into the file: building the whole
+            // document as one string first held a second full-size copy
+            // of the history next to the store itself. The buffer is
+            // wide because the pretty writer emits many small pieces:
+            // at the default 8 KiB a multi-megabyte store costs hundreds
+            // of write calls where a handful do.
+            let mut w = std::io::BufWriter::with_capacity(128 * 1024, f);
+            serde_json::to_writer_pretty(&mut w, &doc).map_err(|e| {
+                if e.is_io() {
+                    write(e.into())
+                } else {
+                    StorageError::Invalid {
+                        path: shown.clone(),
+                        reason: e.to_string(),
+                    }
+                }
+            })?;
+            w.flush().map_err(write)?;
             // Durability before the rename: without the sync, a crash can
             // leave the renamed file pointing at unwritten blocks.
-            f.sync_all().map_err(write)?;
+            w.get_ref().sync_all().map_err(write)?;
             Ok(())
         })();
         if let Err(e) = written {

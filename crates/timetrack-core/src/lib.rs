@@ -42,8 +42,8 @@ pub mod storage;
 pub mod tz;
 
 pub use aggregate::{
-    IsoWeek, Totals, all_totals, days_in_month, is_leap_year, iso_week_of, month_of, month_totals,
-    totals_in_day_range, week_totals, ymd_of,
+    IsoWeek, SnapshotTotals, Totals, all_totals, days_in_month, is_leap_year, iso_week_of,
+    month_of, month_totals, snapshot_totals, totals_in_day_range, week_totals, ymd_of,
 };
 pub use export::{
     CSV_HEADER, ExportScope, anchor_day_string, default_export_filename, entries_in_scope,
