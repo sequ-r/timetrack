@@ -132,7 +132,7 @@ jobs:
           test -f TimeTrack-x86_64.AppImage.zsync
           strings TimeTrack-x86_64.AppImage \
             | grep -F 'gh-releases-zsync|sequ-r|timetrack|latest|TimeTrack-*x86_64.AppImage.zsync'
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: TimeTrack-x86_64.AppImage
           path: |
@@ -164,7 +164,7 @@ jobs:
       - name: Show what would be published
         working-directory: dist
         run: ls -l
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: ${{ inputs.dry_run }}
         with:
           name: release-assets
