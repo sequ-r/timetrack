@@ -20,9 +20,9 @@ ureq = "3"
 # the running image. 0.10, not the also-locked 0.11: 0.10.9 is already in the
 # tree under two dependents, 0.11.0 under one, and the API used here is the
 # same -- so the older line adds no new package to the lock.
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 # The local-server harness hashes the payloads it serves so it can publish a
 # correct (or deliberately wrong) SHA256SUMS next to them.
-sha2 = "0.10"
+sha2 = "0.11"
