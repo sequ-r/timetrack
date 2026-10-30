@@ -29,6 +29,9 @@ pub(crate) struct ExportPicker {
     pub(crate) anchor_ms: i64,
     /// The typed day as shown in the field; mirrors the anchor's local day.
     pub(crate) anchor_text: String,
+    /// The caret (and any selection) in the typed day (#109), re-seated
+    /// at the end whenever the field is (re)mirrored from the anchor.
+    pub(crate) caret: crate::app::textline::Caret,
     /// Whether keystrokes go to the typed day field.
     pub(crate) editing: bool,
     /// The last bad day, shown inline; the anchor is unchanged.
@@ -42,10 +45,13 @@ impl ExportPicker {
     /// [`ExportPicker::refresh_from_snapshot`].
     pub(crate) fn new(now_ms: i64) -> Self {
         let utc = timetrack_core::Tz::utc();
+        let anchor_text = format_anchor_day(now_ms, &utc);
+        let caret = crate::app::textline::Caret::at_end(&anchor_text);
         ExportPicker {
             scope: timetrack_core::ExportScope::Week,
             anchor_ms: now_ms,
-            anchor_text: format_anchor_day(now_ms, &utc),
+            caret,
+            anchor_text,
             editing: false,
             error: None,
         }
@@ -71,6 +77,7 @@ impl ExportPicker {
         self.editing = false;
         self.error = None;
         self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        self.caret = crate::app::textline::Caret::at_end(&self.anchor_text);
     }
 
     /// One stepper press. Stepping leaves edit mode: the field mirrors the
@@ -81,6 +88,7 @@ impl ExportPicker {
         }
         self.anchor_ms = shift_export_anchor(self.scope, self.anchor_ms, delta, tz);
         self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        self.caret = crate::app::textline::Caret::at_end(&self.anchor_text);
         self.editing = false;
         self.error = None;
     }
@@ -99,24 +107,45 @@ impl ExportPicker {
         self.editing = false;
         self.error = None;
         self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+        self.caret = crate::app::textline::Caret::at_end(&self.anchor_text);
     }
 
-    /// Append typed text to the day field, clearing a stale error.
+    /// Insert typed text at the caret in the day field, clearing a
+    /// stale error.
     pub(crate) fn type_text(&mut self, ch: &str) {
         if !self.editing || !self.is_active() {
             return;
         }
-        self.anchor_text.push_str(ch);
+        crate::app::textline::insert_text(&mut self.anchor_text, &mut self.caret, ch);
         self.error = None;
     }
 
-    /// Delete the last character of the day field.
+    /// Delete backwards in the day field.
     pub(crate) fn backspace(&mut self) {
         if !self.editing || !self.is_active() {
             return;
         }
-        self.anchor_text.pop();
+        crate::app::textline::backspace(&mut self.anchor_text, &mut self.caret);
         self.error = None;
+    }
+
+    /// Apply an editing key (caret movement, selection, deletes) to the
+    /// day field; false when not editable or not an editing key.
+    pub(crate) fn edit_key(&mut self, key: &str, shift: bool, ctrl: bool) -> bool {
+        if !self.editing || !self.is_active() {
+            return false;
+        }
+        let handled = crate::app::textline::handle_edit_key(
+            &mut self.anchor_text,
+            &mut self.caret,
+            key,
+            shift,
+            ctrl,
+        );
+        if handled {
+            self.error = None;
+        }
+        handled
     }
 
     /// Commit the typed day: the terminal spelling parsed with the snapshot
@@ -130,6 +159,7 @@ impl ExportPicker {
             Ok(anchor) => {
                 self.anchor_ms = anchor;
                 self.anchor_text = format_anchor_day(anchor, tz);
+                self.caret = crate::app::textline::Caret::at_end(&self.anchor_text);
                 self.error = None;
                 self.editing = false;
                 true
@@ -147,6 +177,7 @@ impl ExportPicker {
     pub(crate) fn refresh_from_snapshot(&mut self, tz: &timetrack_core::Tz) {
         if !self.editing {
             self.anchor_text = format_anchor_day(self.anchor_ms, tz);
+            self.caret = crate::app::textline::Caret::at_end(&self.anchor_text);
         }
     }
 }

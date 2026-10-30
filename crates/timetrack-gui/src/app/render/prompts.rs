@@ -92,7 +92,11 @@ impl TimetrackView {
             None => format!("NEW ENTRY → {}", dlg.project_name),
             Some(id) => format!("EDIT ENTRY {id} · {}", dlg.project_name),
         };
-        let field_row = |label: &str, value: &str, hint: &str, focused: bool| {
+        let field_row = |label: &str,
+                         value: &str,
+                         hint: &str,
+                         focused: bool,
+                         caret: &super::super::textline::Caret| {
             div()
                 .flex()
                 .items_center()
@@ -120,7 +124,11 @@ impl TimetrackView {
                             rgba(0x00000000)
                         })
                         .text_color(rgba(theme::BODY_TEXT))
-                        .child(format!("{value}{}", if focused { "_" } else { "" })),
+                        .child(if focused {
+                            super::super::textline::render_with_caret(value, caret)
+                        } else {
+                            timetrack_core::sanitize_display(value)
+                        }),
                 )
                 .child(
                     div()
@@ -137,6 +145,7 @@ impl TimetrackView {
                 &dlg.description,
                 "optional note",
                 dlg.field == DialogField::Description,
+                &dlg.caret,
             ));
         // The project field exists only in edit mode (#104): it cycles
         // (h/l, or a click) instead of taking text, so it is built apart
@@ -199,12 +208,14 @@ impl TimetrackView {
                 &dlg.start,
                 &dlg.start_hint(&tz),
                 dlg.field == DialogField::Start,
+                &dlg.caret,
             ))
             .child(field_row(
                 "end",
                 &dlg.end,
                 &dlg.end_hint(&tz),
                 dlg.field == DialogField::End,
+                &dlg.caret,
             ))
             .child(
                 div()
@@ -248,7 +259,10 @@ impl TimetrackView {
                             .rounded_md()
                             .bg(rgba(theme::RAISED_BG))
                             .text_color(rgba(theme::BODY_TEXT))
-                            .child(format!("{}_", prompt.at)),
+                            .child(super::super::textline::render_with_caret(
+                                &prompt.at,
+                                &prompt.caret,
+                            )),
                     )
                     .child(
                         div()
@@ -321,7 +335,10 @@ impl TimetrackView {
                             .rounded_md()
                             .bg(rgba(theme::RAISED_BG))
                             .text_color(rgba(theme::BODY_TEXT))
-                            .child(format!("{}_", prompt.name)),
+                            .child(super::super::textline::render_with_caret(
+                                &prompt.name,
+                                &prompt.caret,
+                            )),
                     )
                     .child(
                         div()

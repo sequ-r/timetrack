@@ -7,13 +7,13 @@
 
 //! The split prompt: one moment field for the selected entry.
 //!
-//! Plain keystroke editing like the entry dialog (type to append, backspace
+//! Keystroke editing like the entry dialog (caret and selection included,
 //! to delete, enter to split, escape to cancel), and likewise pure state
 //! over strings so the whole interaction is unit-testable without a window.
 
 /// The split prompt: one moment field for the selected entry.
 ///
-/// Plain keystroke editing like the entry dialog (type to append, backspace
+/// Keystroke editing like the entry dialog (caret and selection included,
 /// to delete, enter to split, escape to cancel), and likewise pure state
 /// over strings so the whole interaction is unit-testable without a window.
 #[derive(Debug, Clone)]
@@ -25,6 +25,8 @@ pub(crate) struct SplitPrompt {
     pub(crate) ended_at: i64,
     /// The typed split point (`-30`, `09:30`, `now` -- the shared spellings).
     pub(crate) at: String,
+    /// The caret (and any selection) in the moment field (#109).
+    pub(crate) caret: crate::app::textline::Caret,
     pub(crate) error: Option<String>,
 }
 

@@ -139,6 +139,7 @@ pub(super) fn split_prompt(at: &str) -> SplitPrompt {
         entry_id: "e1".into(),
         started_at: 0,
         ended_at: 3_600_000,
+        caret: crate::app::textline::Caret::at_end(at),
         at: at.into(),
         error: None,
     }
@@ -149,6 +150,7 @@ pub(super) fn split_prompt(at: &str) -> SplitPrompt {
 pub(super) fn project_prompt(edit_id: Option<&str>, name: &str) -> ProjectPrompt {
     ProjectPrompt {
         edit_id: edit_id.map(str::to_string),
+        caret: crate::app::textline::Caret::at_end(name),
         name: name.into(),
         error: None,
     }
