@@ -636,6 +636,10 @@ printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
 for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived DeleteProject ExportCsv ExportCsvAt; do
   printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
 done
+# #103: clients refresh on this instead of polling.
+printf '%s' "$INTRO" | grep -q "Changed" && ok "Changed signal is exposed" || bad "Changed signal is exposed" "not found"
+# The journal rode along with every mutation above, beside the checkpoint.
+[ -f "$STORE.journal" ] && ok "the journal sits beside the checkpoint" || bad "the journal sits beside the checkpoint" "no $STORE.journal"
 
 echo
 echo "== old/new export compat =="

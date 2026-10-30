@@ -199,10 +199,33 @@ pub async fn wait_for_row(
     }
 }
 
-/// Click a menu row, as a desktop host would: `Event` with `clicked`.
-pub async fn click_row(menu: &zbus::Proxy<'_>, id: i32) {
-    let data: OwnedValue = Value::new("").try_into().expect("empty data must convert");
-    menu.call_method("Event", &(id, "clicked".to_string(), data, 0u32))
-        .await
-        .expect("the menu must accept the click");
+/// Probe a row and click it, re-probing when the menu rebuilds between
+/// the two — as a real dbusmenu host does on `LayoutUpdated`. A rebuild
+/// renumbers the ids, so the probed id can be stale by the time `Event`
+/// lands (`id not found`); since #103 a `Changed` signal can trigger a
+/// rebuild in exactly that gap, where the old 5s poll almost never did.
+pub async fn click_when_ready(
+    menu: &zbus::Proxy<'_>,
+    want: &str,
+    enabled_only: bool,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let id = wait_for_row(menu, want, enabled_only, remaining).await;
+        let data: OwnedValue = Value::new("").try_into().expect("empty data must convert");
+        match menu
+            .call_method("Event", &(id, "clicked".to_string(), data, 0u32))
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    panic!("the menu kept rebuilding under the click on {want}: {e}");
+                }
+                async_io::Timer::after(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }

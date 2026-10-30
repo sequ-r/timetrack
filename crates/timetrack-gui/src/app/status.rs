@@ -35,7 +35,7 @@ pub(super) enum StatusKind {
 /// connection rather than one action, so the first snapshot that arrives
 /// clears them -- the service is back, or it is speaking this client's
 /// interface now. An ordinary error is about one action and survives until
-/// the next one, because snapshots arrive every second and would otherwise
+/// the next one, because snapshots follow changes and would otherwise
 /// make it unreadable.
 pub(super) fn is_connection_notice(kind: StatusKind) -> bool {
     matches!(kind, StatusKind::NoService | StatusKind::VersionMismatch)

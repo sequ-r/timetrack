@@ -136,8 +136,7 @@ fn tray_round_trips_against_the_real_service() {
         // Quick-add through the real rules; the entry lands tagged quick-add
         // with the week aggregate carrying it.
         let fifteen = 15 * 60_000;
-        let plus_15m = common::wait_for_row(&menu, "+15m", false, Duration::from_secs(20)).await;
-        common::click_row(&menu, plus_15m).await;
+        common::click_when_ready(&menu, "+15m", false, Duration::from_secs(20)).await;
         wait_for_entry(&client, fifteen, Duration::from_secs(15)).await;
         let snap = client.snapshot().await.expect("snapshot must succeed");
         let entry = snap
@@ -157,9 +156,7 @@ fn tray_round_trips_against_the_real_service() {
         common::wait_for_row(&menu, "This week: 15m", false, Duration::from_secs(20)).await;
 
         // Undo removes exactly the created entry; the header drops back.
-        let undo =
-            common::wait_for_row(&menu, "Undo quick-add", true, Duration::from_secs(20)).await;
-        common::click_row(&menu, undo).await;
+        common::click_when_ready(&menu, "Undo quick-add", true, Duration::from_secs(20)).await;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");
@@ -177,18 +174,16 @@ fn tray_round_trips_against_the_real_service() {
         // Delete with confirmation through the real store: +30m, then the
         // confirm row stating duration and project.
         let thirty = 30 * 60_000;
-        let plus_30m = common::wait_for_row(&menu, "+30m", false, Duration::from_secs(20)).await;
-        common::click_row(&menu, plus_30m).await;
+        common::click_when_ready(&menu, "+30m", false, Duration::from_secs(20)).await;
         wait_for_entry(&client, thirty, Duration::from_secs(15)).await;
         common::wait_for_row(&menu, "This week: 30m", false, Duration::from_secs(20)).await;
-        let confirm = common::wait_for_row(
+        common::click_when_ready(
             &menu,
             "Delete 30m from General",
             true,
             Duration::from_secs(20),
         )
         .await;
-        common::click_row(&menu, confirm).await;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");
@@ -201,5 +196,30 @@ fn tray_round_trips_against_the_real_service() {
             }
             async_io::Timer::after(Duration::from_millis(200)).await;
         }
+
+        // #103: a persisted mutation is announced, so an idle client
+        // learns about it from the `Changed` signal instead of its next
+        // poll. Subscribe first, mutate from this same client, and the
+        // announcement must arrive well inside any fallback cadence.
+        let mut changed = client
+            .changed_stream()
+            .await
+            .expect("must subscribe to Changed");
+        // Nothing announces before a mutation: subscribing alone (and
+        // the bus's owner bookkeeping behind it) is not a change.
+        assert_eq!(
+            changed.wait_timeout(Duration::from_millis(300)).await,
+            timetrack_proto::ChangedWait::TimedOut,
+            "no announcement without a mutation"
+        );
+        client
+            .quick_add("p1", 5 * 60_000)
+            .await
+            .expect("quick add must succeed");
+        assert_eq!(
+            changed.wait_timeout(Duration::from_secs(5)).await,
+            timetrack_proto::ChangedWait::Changed,
+            "the persisted quick-add must be announced"
+        );
     });
 }

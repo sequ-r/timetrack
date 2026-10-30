@@ -223,6 +223,13 @@ struct FakeIface(Arc<FakeService>);
 
 #[interface(name = "org.sequ.timetrack.Entries")]
 impl FakeIface {
+    /// Mirrors the real service's announcement (#103): the tray refreshes
+    /// on this signal now, so a fake that never emits it would leave the
+    /// menu stale until the fallback poll — testing a wire the real
+    /// service no longer speaks.
+    #[zbus(signal)]
+    async fn changed(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
+
     #[zbus(name = "Snapshot")]
     fn snapshot(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> String {
         self.0.record_caller("Snapshot", &header);
@@ -230,34 +237,49 @@ impl FakeIface {
     }
 
     #[zbus(name = "QuickAdd")]
-    fn quick_add(
+    async fn quick_add(
         &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
         project_id: &str,
         duration_ms: i64,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<String> {
         self.0.record_caller("QuickAdd", &header);
-        self.0.quick_add_json(project_id, duration_ms)
+        let out = self.0.quick_add_json(project_id, duration_ms);
+        if out.is_ok() {
+            let _ = Self::changed(&emitter).await;
+        }
+        out
     }
 
     #[zbus(name = "UndoQuickAdd")]
-    fn undo_quick_add(
+    async fn undo_quick_add(
         &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
         entry_id: &str,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<()> {
         self.0.record_caller("UndoQuickAdd", &header);
-        self.0.undo_quick_add_unit(entry_id)
+        let out = self.0.undo_quick_add_unit(entry_id);
+        if out.is_ok() {
+            let _ = Self::changed(&emitter).await;
+        }
+        out
     }
 
     #[zbus(name = "DeleteEntry")]
-    fn delete_entry(
+    async fn delete_entry(
         &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
         entry_id: &str,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<()> {
         self.0.record_caller("DeleteEntry", &header);
-        self.0.delete_entry_unit(entry_id)
+        let out = self.0.delete_entry_unit(entry_id);
+        if out.is_ok() {
+            let _ = Self::changed(&emitter).await;
+        }
+        out
     }
 }
 
@@ -297,11 +319,10 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // registers it; wait for the register call to land.
         let service = common::wait_for_registration(&items).await;
 
-        // The tray polls every 5s; wait for its menu to offer the seeded
-        // project with a +15m row, then click it.
+        // Wait for the tray's menu to offer the seeded project with a
+        // +15m row, then click it.
         let menu = common::menu_proxy(&conn, &service).await;
-        let plus_15m = common::wait_for_row(&menu, "+15m", false, Duration::from_secs(20)).await;
-        common::click_row(&menu, plus_15m).await;
+        common::click_when_ready(&menu, "+15m", false, Duration::from_secs(20)).await;
 
         // The tray's worker thread quick-adds over the connection the tray
         // already holds; the entry must land in the store with the
@@ -362,11 +383,9 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         );
 
         // Tray-6 (#10): the submenu now offers an enabled undo row (the
-        // poll loop rebuilds once the worker records the created id); click
+        // refresh loop rebuilds once the worker records the created id); click
         // it, and the entry just created must disappear again.
-        let undo =
-            common::wait_for_row(&menu, "Undo quick-add", true, Duration::from_secs(20)).await;
-        common::click_row(&menu, undo).await;
+        common::click_when_ready(&menu, "Undo quick-add", true, Duration::from_secs(20)).await;
 
         // The undo worker removes exactly the entry the quick-add created.
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -398,8 +417,7 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Tray-7 (#11): quick-add again, then walk the delete confirmation.
         // The menu rebuilt since, so probe the +30m row afresh.
         let thirty = 30 * 60_000;
-        let plus_30m = common::wait_for_row(&menu, "+30m", false, Duration::from_secs(20)).await;
-        common::click_row(&menu, plus_30m).await;
+        common::click_when_ready(&menu, "+30m", false, Duration::from_secs(20)).await;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");
@@ -424,8 +442,7 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Cancel path: the confirm submenu offers "Keep it"; clicking it
         // must delete nothing. The entry is still there afterwards, with
         // its week total intact.
-        let keep_it = common::wait_for_row(&menu, "Keep it", true, Duration::from_secs(20)).await;
-        common::click_row(&menu, keep_it).await;
+        common::click_when_ready(&menu, "Keep it", true, Duration::from_secs(20)).await;
         async_io::Timer::after(Duration::from_secs(2)).await;
         let snap = client.snapshot().await.expect("snapshot must succeed");
         assert!(
@@ -443,14 +460,13 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         // Delete round-trip: the confirm row states duration and project.
         // It was already there for the cancel probe; re-probe it since the
         // menu may have rebuilt under the click.
-        let confirm = common::wait_for_row(
+        common::click_when_ready(
             &menu,
             "Delete 30m from General",
             true,
             Duration::from_secs(20),
         )
         .await;
-        common::click_row(&menu, confirm).await;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");

@@ -19,6 +19,19 @@
 //! previous good file intact rather than a truncated one. The service
 //! persists *before* acknowledging a mutation, so an acknowledged entry is
 //! on disk.
+//!
+//! # Journal and checkpoint (#103, ADR 0010)
+//!
+//! The pretty-JSON document above is now the *checkpoint*. A mutation no
+//! longer rewrites it: the service appends one [`Journal`] line — the diff
+//! of that one mutation — to a sibling journal file and syncs it before
+//! acknowledging, so a tap costs bytes proportional to the change, not to
+//! the whole history. Loading reads the checkpoint and replays the journal
+//! over it; once the journal grows past [`JOURNAL_CHECKPOINT_BYTES`] the
+//! checkpoint is rewritten (the atomic save) and the journal truncated.
+//! Replay is idempotent, so a crash between the checkpoint rename and the
+//! truncation replays to the same store, and a torn final line is by
+//! construction a mutation that was never acknowledged.
 
 use crate::model::{Entry, Project, STORE_VERSION, Store};
 use std::io::Write;
@@ -92,6 +105,115 @@ fn looks_like_legacy_store(text: &str) -> bool {
 /// two-parameter `Result`.
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
 
+/// Journal size past which a mutation also rewrites the checkpoint.
+///
+/// Big enough that ordinary days (a few hundred bytes of journal each)
+/// never trigger a whole-store rewrite, small enough that startup replay
+/// stays a few hundred records beside the checkpoint read.
+pub const JOURNAL_CHECKPOINT_BYTES: u64 = 256 * 1024;
+
+/// One mutation's diff: the entries and projects it created or changed,
+/// and the ids it removed (#103).
+///
+/// The journal stores diffs, not operations, so it needs no encoding per
+/// rule: anything the rules can do to a [`Store`] is expressible as
+/// upserts plus removals. Applying a journal is idempotent — upserting
+/// the same values and removing already-removed ids changes nothing —
+/// which is what makes checkpoint-then-truncate crash-safe without a
+/// two-phase protocol.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Journal {
+    /// Entries created or changed, in store order.
+    #[serde(default)]
+    pub entries: Vec<Entry>,
+    /// Entry ids removed.
+    #[serde(default)]
+    pub removed_entries: Vec<String>,
+    /// Projects created or changed, in store order.
+    #[serde(default)]
+    pub projects: Vec<Project>,
+    /// Project ids removed.
+    #[serde(default)]
+    pub removed_projects: Vec<String>,
+}
+
+impl Journal {
+    /// The diff that turns `before` into `after`.
+    ///
+    /// Indexed by id rather than scanned pairwise: this runs on every
+    /// mutation over the whole history, and a quadratic diff would hand
+    /// back the linear-in-history cost the journal exists to remove.
+    pub fn between(before: &Store, after: &Store) -> Journal {
+        use std::collections::HashMap;
+        let before_entries: HashMap<&str, &Entry> =
+            before.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+        let after_entries: HashMap<&str, &Entry> =
+            after.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+        let before_projects: HashMap<&str, &Project> =
+            before.projects.iter().map(|p| (p.id.as_str(), p)).collect();
+        let after_projects: HashMap<&str, &Project> =
+            after.projects.iter().map(|p| (p.id.as_str(), p)).collect();
+        Journal {
+            entries: after
+                .entries
+                .iter()
+                .filter(|e| before_entries.get(e.id.as_str()) != Some(e))
+                .cloned()
+                .collect(),
+            removed_entries: before
+                .entries
+                .iter()
+                .filter(|e| !after_entries.contains_key(e.id.as_str()))
+                .map(|e| e.id.clone())
+                .collect(),
+            projects: after
+                .projects
+                .iter()
+                .filter(|p| before_projects.get(p.id.as_str()) != Some(p))
+                .cloned()
+                .collect(),
+            removed_projects: before
+                .projects
+                .iter()
+                .filter(|p| !after_projects.contains_key(p.id.as_str()))
+                .map(|p| p.id.clone())
+                .collect(),
+        }
+    }
+
+    /// Whether this diff changes nothing (a mutation the rules allowed
+    /// as a no-op): appending it would only grow the journal.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+            && self.removed_entries.is_empty()
+            && self.projects.is_empty()
+            && self.removed_projects.is_empty()
+    }
+
+    /// Apply this diff to `store`: removals first, then upserts replace
+    /// by id in place or append, preserving the store's order.
+    pub fn apply_to(&self, store: &mut Store) {
+        store
+            .entries
+            .retain(|e| !self.removed_entries.contains(&e.id));
+        for entry in &self.entries {
+            match store.get_mut(&entry.id) {
+                Some(existing) => *existing = entry.clone(),
+                None => store.entries.push(entry.clone()),
+            }
+        }
+        store
+            .projects
+            .retain(|p| !self.removed_projects.contains(&p.id));
+        for project in &self.projects {
+            match store.projects.iter_mut().find(|p| p.id == project.id) {
+                Some(existing) => *existing = project.clone(),
+                None => store.projects.push(project.clone()),
+            }
+        }
+    }
+}
+
 /// A store backed by one JSON file.
 #[derive(Debug, Clone)]
 pub struct JsonStore {
@@ -123,11 +245,62 @@ impl JsonStore {
         &self.path
     }
 
-    /// Read the store, treating a missing file as a fresh one.
+    /// The journal sibling: `store.json` keeps its checkpoint at
+    /// `store.json` and its journal at `store.json.journal` (#103), so
+    /// copying the checkpoint alone still copies a readable (if older)
+    /// store, and the pair is obvious in a directory listing.
+    pub fn journal_path(&self) -> PathBuf {
+        let mut name = self.path.clone().into_os_string();
+        name.push(".journal");
+        PathBuf::from(name)
+    }
+
+    /// Read the store: the checkpoint with the journal replayed over it,
+    /// treating a missing checkpoint as a fresh store (#103).
     ///
     /// A malformed file is an error rather than a silent reset: quietly
     /// discarding a user's tracked time would be the worst possible failure.
+    /// The one exception is a torn final journal line — a mutation that
+    /// crashed before its line (or its newline) landed was never
+    /// acknowledged, so dropping it loses nothing anyone was promised.
     pub fn load(&self) -> StorageResult<Store> {
+        let mut store = self.load_checkpoint()?;
+        let journal = self.journal_path();
+        let shown = journal.display().to_string();
+        let text = match std::fs::read_to_string(&journal) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(store),
+            Err(source) => {
+                return Err(StorageError::Read {
+                    path: shown,
+                    source,
+                });
+            }
+        };
+        let terminated = text.ends_with('\n');
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Journal>(line) {
+                Ok(record) => record.apply_to(&mut store),
+                Err(e) => {
+                    if i + 1 == lines.len() && !terminated {
+                        break;
+                    }
+                    return Err(StorageError::Invalid {
+                        path: shown,
+                        reason: format!("journal line {}: {e}", i + 1),
+                    });
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    /// Read only the checkpoint document.
+    fn load_checkpoint(&self) -> StorageResult<Store> {
         let shown = self.path.display().to_string();
         match std::fs::read_to_string(&self.path) {
             Ok(text) => {
@@ -166,7 +339,67 @@ impl JsonStore {
         }
     }
 
+    /// Append one mutation's journal record and sync it (#103).
+    ///
+    /// This is the persist-before-acknowledge write on the mutation path:
+    /// one JSON line, so the cost tracks the change, not the history. An
+    /// empty diff writes nothing. The directory is synced when the file
+    /// is first created so the new name itself survives a crash.
+    pub fn append(&self, record: &Journal) -> StorageResult<()> {
+        if record.is_empty() {
+            return Ok(());
+        }
+        let journal = self.journal_path();
+        let shown = journal.display().to_string();
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StorageError::Write {
+                path: shown.clone(),
+                source,
+            })?;
+        }
+        let existed = journal.exists();
+        let mut line = serde_json::to_string(record).map_err(|e| StorageError::Invalid {
+            path: shown.clone(),
+            reason: e.to_string(),
+        })?;
+        line.push('\n');
+        let write = |source: std::io::Error| StorageError::Write {
+            path: shown.clone(),
+            source,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&journal)
+            .map_err(write)?;
+        file.write_all(line.as_bytes()).map_err(write)?;
+        file.sync_all().map_err(write)?;
+        drop(file);
+        #[cfg(unix)]
+        if !existed {
+            let parent = match self.path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::from("."),
+            };
+            std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .map_err(write)?;
+        }
+        Ok(())
+    }
+
+    /// How big the journal has grown since the last checkpoint, in bytes.
+    pub fn journal_len(&self) -> u64 {
+        std::fs::metadata(self.journal_path()).map_or(0, |m| m.len())
+    }
+
     /// Write the store atomically, creating parent directories as needed.
+    ///
+    /// This is the *checkpoint* write (#103): rewriting the whole history
+    /// is the cost the journal exists to keep off the mutation path, so
+    /// this runs at seed time and whenever the journal has grown past
+    /// [`JOURNAL_CHECKPOINT_BYTES`]. On success the journal is truncated:
+    /// everything it held is in the checkpoint just renamed into place.
     pub fn save(&self, store: &Store) -> StorageResult<()> {
         let shown = self.path.display().to_string();
         let write = |source: std::io::Error| StorageError::Write {
@@ -179,10 +412,10 @@ impl JsonStore {
         }
         // The document as written: the store's own lists under the current
         // format version. Borrowing them into this view stamps the version
-        // without cloning the whole store first -- a save happens on every
-        // acknowledged mutation, so a deep copy per save made each tap
-        // cost a full duplicate of the history. Field order matches
-        // `Store`'s, so the bytes on disk are unchanged.
+        // without cloning the whole store first -- a checkpoint is already
+        // the one whole-history write left, without paying for a duplicate
+        // of it in memory too. Field order matches `Store`'s, so the bytes
+        // on disk are unchanged.
         #[derive(serde::Serialize)]
         struct OnDisk<'a> {
             version: u32,
@@ -246,6 +479,24 @@ impl JsonStore {
             };
             let dir = std::fs::File::open(parent).map_err(write)?;
             dir.sync_all().map_err(write)?;
+        }
+        // The checkpoint now holds everything the journal held (#103).
+        // Truncate after the rename, never before: a crash in between
+        // replays the journal over the new checkpoint, which is
+        // idempotent, while truncating first could lose the only copy
+        // of a journaled mutation. A missing journal file is fine; any
+        // other failure is reported, with the checkpoint already saved.
+        let journal = self.journal_path();
+        if journal.exists() {
+            let shown_j = journal.display().to_string();
+            let f = std::fs::File::create(&journal).map_err(|source| StorageError::Write {
+                path: shown_j.clone(),
+                source,
+            })?;
+            f.sync_all().map_err(|source| StorageError::Write {
+                path: shown_j,
+                source,
+            })?;
         }
         Ok(())
     }
@@ -467,6 +718,199 @@ mod tests {
         let store = JsonStore::new(dir.join("a").join("b").join("store.json"));
         store.save(&sample()).unwrap();
         assert!(store.path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journal_diff_round_trips_between_stores() {
+        // #103: apply(between(a, b), a) == b, and applying it twice more
+        // changes nothing (the idempotence checkpoint-truncate relies on).
+        let before = sample();
+        let mut after = before.clone();
+        after.entries[0].description = "rewritten".into();
+        after.entries.push(Entry {
+            id: "e2".into(),
+            project_id: "p1".into(),
+            description: "new".into(),
+            started_at: 5_000,
+            ended_at: 6_000,
+            source: EntrySource::QuickAdd,
+            note: None,
+        });
+        after.projects[0].archived = true;
+        let record = Journal::between(&before, &after);
+        assert_eq!(record.entries.len(), 2, "changed + created entries");
+        assert!(record.removed_entries.is_empty());
+        assert_eq!(record.projects.len(), 1);
+        let mut got = before.clone();
+        record.apply_to(&mut got);
+        assert_eq!(got, after);
+        record.apply_to(&mut got);
+        assert_eq!(got, after, "replay is idempotent");
+        let removal = Journal::between(&after, &before);
+        assert_eq!(removal.removed_entries, ["e2".to_string()]);
+        removal.apply_to(&mut got);
+        assert_eq!(got, before);
+        assert!(Journal::between(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn appended_journals_replay_over_the_checkpoint() {
+        // #103: append must not touch the checkpoint, and a fresh load
+        // must rebuild the mutated store from checkpoint + journal.
+        let dir = tmpdir("journal-replay");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        let store = JsonStore::new(path.clone());
+        let before = sample();
+        store.save(&before).unwrap();
+        let checkpoint = std::fs::read(&path).unwrap();
+
+        let mut after = before.clone();
+        after.entries.push(Entry {
+            id: "e2".into(),
+            project_id: "p1".into(),
+            description: "journaled".into(),
+            started_at: 5_000,
+            ended_at: 6_500,
+            source: EntrySource::Manual,
+            note: None,
+        });
+        let record = Journal::between(&before, &after);
+        store.append(&record).unwrap();
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            checkpoint,
+            "append must not rewrite the checkpoint"
+        );
+        let mut expected = after.clone();
+        expected.version = STORE_VERSION;
+        assert_eq!(store.load().unwrap(), expected);
+
+        // A checkpoint folds the journal in and truncates it.
+        store.save(&after).unwrap();
+        assert_eq!(store.journal_len(), 0);
+        assert_eq!(store.load().unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pre_journal_store_loads_identically_and_then_journals() {
+        // #103 migration: an existing store.json with no journal file at
+        // all loads byte-for-byte the same store as before, and later
+        // appends land in a new journal beside it.
+        let dir = tmpdir("pre-journal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&{
+                let mut s = sample();
+                s.version = STORE_VERSION;
+                s
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let store = JsonStore::new(path);
+        assert!(!store.journal_path().exists());
+        let loaded = store.load().unwrap();
+        let mut expected = sample();
+        expected.version = STORE_VERSION;
+        assert_eq!(loaded, expected);
+        store
+            .append(&Journal {
+                removed_entries: vec!["e1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.load().unwrap().entries.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_torn_final_journal_line_is_dropped_but_corruption_is_refused() {
+        // #103: a crash mid-append leaves a partial last line with no
+        // newline — that mutation was never acknowledged, so load drops
+        // it. Corruption anywhere else refuses, like checkpoint damage.
+        let dir = tmpdir("journal-torn");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = JsonStore::new(dir.join("store.json"));
+        store.save(&sample()).unwrap();
+        let jpath = store.journal_path();
+        std::fs::write(&jpath, "{\"entries\":[{\"id\":\"e2\"").unwrap();
+        let mut expected = sample();
+        expected.version = STORE_VERSION;
+        assert_eq!(store.load().unwrap(), expected, "torn tail dropped");
+        std::fs::write(&jpath, "not json\n{\"entries\":[]}\n").unwrap();
+        assert!(store.load().is_err(), "mid-journal corruption refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_mutation_on_a_multi_year_store_writes_one_small_line() {
+        // #103's demonstration, in bytes rather than timing (so it holds
+        // on any CI disk): over a generated 20,000-entry store (~5 years
+        // at 10/day), one appended entry must leave the multi-megabyte
+        // checkpoint byte-identical and add well under a kilobyte of
+        // journal, where the old design rewrote the whole file per tap.
+        let dir = tmpdir("journal-many-years");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        let store = JsonStore::new(path.clone());
+        let mut big = Store::default();
+        big.projects.push(Project {
+            id: "p1".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        for n in 1..=20_000 {
+            let start = 1_700_000_000_000 + n as i64 * 3_600_000;
+            big.entries.push(Entry {
+                id: format!("e{n}"),
+                project_id: "p1".into(),
+                description: format!("task {n}"),
+                started_at: start,
+                ended_at: start + 1_800_000,
+                source: EntrySource::Manual,
+                note: None,
+            });
+        }
+        store.save(&big).unwrap();
+        let checkpoint_bytes = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            checkpoint_bytes > 1_000_000,
+            "the workload is genuinely multi-megabyte: {checkpoint_bytes}"
+        );
+        let checkpoint = std::fs::read(&path).unwrap();
+
+        let mut after = big.clone();
+        after.entries.push(Entry {
+            id: "e20001".into(),
+            project_id: "p1".into(),
+            description: "one more tap".into(),
+            started_at: 1_800_000_000_000,
+            ended_at: 1_800_000_900_000,
+            source: EntrySource::QuickAdd,
+            note: None,
+        });
+        store.append(&Journal::between(&big, &after)).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            checkpoint,
+            "the checkpoint was not rewritten"
+        );
+        assert!(
+            store.journal_len() < 1_024,
+            "one mutation, one small line: {} bytes",
+            store.journal_len()
+        );
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.entries.len(), 20_001);
+        assert_eq!(loaded.entries.last().unwrap().id, "e20001");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

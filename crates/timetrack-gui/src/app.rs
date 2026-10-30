@@ -50,8 +50,13 @@ use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
 use timetrack_proto::{ProjectView, Snapshot};
 
-/// How often the service is polled for a new snapshot.
-const REFRESH: Duration = Duration::from_millis(1000);
+/// The fallback snapshot cadence (#103).
+///
+/// Freshness normally arrives as a `Changed` signal the moment a
+/// mutation persists, so this slow poll only covers what a signal
+/// cannot: a service too old to emit, a missed signal, and the
+/// clock rolling into a new week while nothing was recorded.
+const REFRESH: Duration = Duration::from_secs(30);
 
 /// The service's zone, from the snapshot's name, strictly (#102).
 ///
@@ -297,7 +302,7 @@ impl TimetrackView {
             changed = true;
         }
         // A routine snapshot must not wipe feedback from the last
-        // action: snapshots arrive every second, so clearing here
+        // action: snapshots follow actions, so clearing here
         // made error reports from the service thread unreadable.
         //
         // Two notices are the exception, because a snapshot is
@@ -344,7 +349,7 @@ impl TimetrackView {
     fn drain(&mut self) -> bool {
         let mut changed = false;
         // Set the status only when it differs: the service thread resends
-        // nothing, but snapshots arrive every second and must not count as
+        // nothing, but snapshots arrive routinely and must not count as
         // change on their own.
         let set_status = |status: &mut Option<StatusMsg>, note: StatusMsg, changed: &mut bool| {
             if status.as_ref() != Some(&note) {
@@ -1370,7 +1375,7 @@ mod tests {
     fn only_connection_notices_are_cleared_by_a_snapshot() {
         // A snapshot proves the service is back, and that it is speaking this
         // client's interface -- so those two notices go. An action error
-        // survives, because snapshots arrive every second.
+        // survives, because snapshots follow every change.
         assert!(is_connection_notice(StatusKind::NoService));
         assert!(is_connection_notice(StatusKind::VersionMismatch));
         assert!(!is_connection_notice(StatusKind::Service));

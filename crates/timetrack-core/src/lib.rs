@@ -68,7 +68,7 @@ pub use rules::{
     merge_shrink_ms, next_project_id, quick_add, set_archived, set_project, set_text, set_times,
     split_entry, update_project,
 };
-pub use storage::{JsonStore, StorageError, StorageResult};
+pub use storage::{JOURNAL_CHECKPOINT_BYTES, Journal, JsonStore, StorageError, StorageResult};
 pub use tz::{Tz, TzError};
 
 /// A single-line display copy of stored free text (#101).
