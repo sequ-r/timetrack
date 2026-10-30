@@ -371,6 +371,14 @@ Stating these now, to keep them from arriving later as "small features":
 - Invoicing, rates, currencies.
 - Recurring or scheduled entries.
 - Timezone-aware "work hours" or overtime logic.
+- Importing arbitrary foreign CSV formats through a column-mapping UI
+  (#112): re-importing TimeTrack's own export is in scope (#132); a
+  mapping surface waits for a concrete source format to design against.
+- Drag-to-trim with the mouse (#112): there is no timeline surface for
+  a drag to happen on, and building one for a single gesture inverts
+  the cost. Time editing stays fields and keys until a timeline exists
+  for its own sake; §5's deferral of drag-to-trim is therefore a
+  settled non-goal for v1, not an unbuilt specification item.
 
 ## 13. Architecture consequences
 
@@ -412,10 +420,28 @@ Settled, in the order asked:
 Two things are deliberate gaps rather than open questions, and should be
 treated as follow-ups rather than blockers:
 
-- **Drag-to-trim** for adjusting times (§5, deferred).
 - **A dedicated entry list tab** (§11); editing currently lives behind the
   per-project rows and the undo path. If §5/§8 in practice need more room than
   that, a fourth tab is the likely fix.
+
+Four scope questions raised once histories started growing were settled
+together (#112), by whether the work is client-only over data the clients
+already hold, or reshapes the model/wire:
+
+- **Search/filter by entry text → in scope** (#131). Client-side over the
+  snapshot; totals and exports must stay unfiltered. No tags or query
+  language.
+- **Import/backup → in scope, bounded** (#132). Re-importing TimeTrack's
+  own CSV export, idempotently, with fresh ids and
+  match-by-name projects; a hand-copied `store.json` +
+  `store.json.journal` pair remains the whole-store backup. Generic
+  foreign-format mapping is a non-goal above.
+- **Custom date-range reporting → in scope** (#133). Week/month anchors
+  stay the defaults; a range is an explicit pair of local days under the
+  same started-at-wins rule (ADR 0002), needing one core export, one
+  call per live wire interface, and the three pickers.
+- **Drag-to-trim → non-goal for v1** (above): no timeline exists to drag
+  on, so its real cost is that surface, not the gesture.
 
 The app is ready to build. It has since been built — see §15.
 
