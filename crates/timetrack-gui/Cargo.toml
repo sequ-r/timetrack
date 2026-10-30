@@ -34,4 +34,4 @@ async-io = { workspace = true }
 # System save dialog via the desktop portal. Same
 # backend as gpui itself: `async-std` selects zbus' async-io backend, never
 # tokio (see the workspace manifest for why tokio is load-bearing absent).
-ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
+ashpd = { version = "0.12", default-features = false, features = ["async-std"] }
