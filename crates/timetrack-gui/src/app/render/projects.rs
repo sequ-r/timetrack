@@ -12,7 +12,7 @@
 use super::super::TimetrackView;
 use super::super::{service::Action, theme};
 use gpui::prelude::*;
-use gpui::{ElementId, IntoElement, div, px, rgb, rgba};
+use gpui::{ElementId, IntoElement, div, px, rgba};
 
 /// One small row action button (Recolour/Delete), in the archive pair's
 /// shape. `on_click` receives the view, already entity-updated.
@@ -26,6 +26,7 @@ fn row_button(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .flex_shrink_0()
         .px_2()
         .py_1()
         .rounded_md()
@@ -59,6 +60,9 @@ impl TimetrackView {
     /// archive action. Archived projects stay listed, because their history
     /// still counts (REQUIREMENTS §14).
     pub(crate) fn render_projects(&self) -> impl IntoElement {
+        if self.connecting() {
+            return self.render_connecting().into_any_element();
+        }
         // A "New project" row rather than a dead action: it opens the naming
         // prompt, so every project name is typed -- never invented.
         let new_project = {
@@ -72,7 +76,7 @@ impl TimetrackView {
                 .rounded_md()
                 .cursor_pointer()
                 .bg(rgba(theme::ACTION))
-                .text_color(rgb(0xffffff))
+                .text_color(rgba(theme::SELECTED_TEXT))
                 .child("New project")
                 .when_some(entity, |this, entity| {
                     this.on_click(move |_ev, _window, cx| {
@@ -115,10 +119,18 @@ impl TimetrackView {
                 .gap_3()
                 .px_6()
                 .py_2()
-                .child(div().w(px(12.)).h(px(12.)).rounded_md().bg(dot))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(12.))
+                        .h(px(12.))
+                        .rounded_md()
+                        .bg(dot),
+                )
                 .child(
                     div()
                         .flex_1()
+                        .truncate()
                         .text_color(if p.archived {
                             rgba(theme::HINT_TEXT)
                         } else {
@@ -132,12 +144,14 @@ impl TimetrackView {
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .w(px(110.))
                         .text_color(rgba(theme::ACCENT))
                         .child(timetrack_core::format_duration(week)),
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .w(px(110.))
                         .text_color(rgba(theme::MUTED_TEXT))
                         .child(timetrack_core::format_duration(all)),
@@ -148,8 +162,8 @@ impl TimetrackView {
                 .child(row_button(
                     project_button_id("recolour-project", &p.id),
                     "Recolour",
-                    rgba(0x3a3a4aff),
-                    rgb(0xffffff),
+                    rgba(theme::NEUTRAL_BUTTON_BG),
+                    rgba(theme::SELECTED_TEXT),
                     self.entity.clone(),
                     {
                         let id = id.clone();
@@ -159,7 +173,7 @@ impl TimetrackView {
                 .child(row_button(
                     project_button_id("delete-project", &p.id),
                     "Delete",
-                    rgba(0x3a3a4aff),
+                    rgba(theme::NEUTRAL_BUTTON_BG),
                     rgba(theme::DANGER),
                     self.entity.clone(),
                     {
@@ -177,11 +191,12 @@ impl TimetrackView {
                         el.child(
                             div()
                                 .id(project_button_id("archive", &p.id))
+                                .flex_shrink_0()
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
                                 .cursor_pointer()
-                                .bg(rgba(0x3a3a4aff))
+                                .bg(rgba(theme::NEUTRAL_BUTTON_BG))
                                 .text_color(rgba(theme::STRONG_TEXT))
                                 .child("Archive")
                                 .on_click(move |_ev, _window, cx| {
@@ -202,6 +217,7 @@ impl TimetrackView {
                         el.child(
                             div()
                                 .id(project_button_id("unarchive", &p.id))
+                                .flex_shrink_0()
                                 .px_2()
                                 .py_1()
                                 .rounded_md()

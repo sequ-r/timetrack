@@ -45,6 +45,7 @@ use gpui::{
     AsyncApp, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Render, Styled,
     Window, div, rgba,
 };
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
@@ -150,6 +151,111 @@ fn which_prompt(
     }
 }
 
+/// Whether the tabs should say "Connecting" instead of drawing data.
+///
+/// Before the first snapshot the view holds an empty default, and drawing
+/// it would claim the store is empty ("Nothing tracked yet", "No projects
+/// yet") when nothing has been heard at all. Any status ends it too: word
+/// of a connection problem has arrived, and the footer is already telling
+/// that story (with the start-service offer, when that is the problem).
+fn show_connecting(snapshot_received: bool, status_kind: Option<StatusKind>) -> bool {
+    !snapshot_received && status_kind.is_none()
+}
+
+/// The action a confirmed merge sends. Shared by the second `m` and the
+/// banner's Confirm button, so a click can never send a different
+/// payload than the keystroke the banner was opened for.
+fn merge_action(confirm: &MergeConfirm) -> Action {
+    Action::MergeEntries {
+        ids: confirm.ids.clone(),
+    }
+}
+
+/// The action a confirmed entry delete sends. Shared by the second `d`
+/// and the banner's Confirm button, like `merge_action`.
+fn delete_action(confirm: &DeleteConfirm) -> Action {
+    Action::DeleteEntry(confirm.id.clone())
+}
+
+/// The action a confirmed project delete sends. Shared by the second
+/// `D` and the banner's Confirm button, like `merge_action`.
+fn delete_project_action(confirm: &DeleteProjectConfirm) -> Action {
+    Action::DeleteProject(confirm.id.clone())
+}
+
+/// A project's display name for a sentence: the sanitized name when the
+/// snapshot knows it, the id when it does not (the same fallback the
+/// entry rows use).
+fn project_display(snapshot: &Snapshot, id: &str) -> String {
+    snapshot
+        .projects
+        .iter()
+        .find(|p| p.id == id)
+        .map(|p| timetrack_core::sanitize_display(&p.name))
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// The outcome slot an action takes in the view's pending queue, and the
+/// sentence its success will show in the footer.
+///
+/// `None` (outer) takes no slot: the action reports through its own
+/// message, never `ActionOk`, so a slot would steal the next real
+/// action's label. `Some(None)` takes a slot with no sentence: it does
+/// report through `ActionOk`, but the arriving snapshot is its feedback
+/// already. Everything else names what it did, in the user's words
+/// (project names, never ids), because a bare cleared footer left the
+/// user to spot the change in the list themselves.
+fn pending_outcome(action: &Action, snapshot: &Snapshot) -> Option<Option<String>> {
+    let label = match action {
+        Action::Refresh | Action::ExportCsv(_) | Action::InstallUpdate { .. } => return None,
+        Action::StartService => None,
+        Action::QuickAdd { project, ms } => Some(format!(
+            "added {} to {}",
+            timetrack_core::format_compact(*ms),
+            project_display(snapshot, project)
+        )),
+        Action::UndoQuickAdd(_) => Some("undid the quick add".to_string()),
+        Action::DeleteEntry(_) => Some("entry deleted".to_string()),
+        Action::ArchiveProject(id) => Some(format!("archived {}", project_display(snapshot, id))),
+        Action::UnarchiveProject(id) => {
+            Some(format!("unarchived {}", project_display(snapshot, id)))
+        }
+        Action::AddProject(name) => Some(format!(
+            "created project {}",
+            timetrack_core::sanitize_display(name)
+        )),
+        Action::UpdateProject { name, .. } => Some(format!(
+            "renamed project to {}",
+            timetrack_core::sanitize_display(name)
+        )),
+        Action::RecolourProject { id, .. } => {
+            Some(format!("recoloured {}", project_display(snapshot, id)))
+        }
+        Action::DeleteProject(id) => {
+            Some(format!("deleted project {}", project_display(snapshot, id)))
+        }
+        Action::SetProject { project, .. } => Some(format!(
+            "moved entry to {}",
+            project_display(snapshot, project)
+        )),
+        Action::AddEntry {
+            project,
+            started_at,
+            ended_at,
+            ..
+        } => Some(format!(
+            "added {} to {}",
+            timetrack_core::format_compact(ended_at - started_at),
+            project_display(snapshot, project)
+        )),
+        Action::SetTimes { .. } => Some("entry times updated".to_string()),
+        Action::SetText { .. } => Some("entry text updated".to_string()),
+        Action::SplitEntry { .. } => Some("entry split".to_string()),
+        Action::MergeEntries { ids } => Some(format!("merged {} entries", ids.len())),
+    };
+    Some(label)
+}
+
 pub struct TimetrackView {
     /// Snapshots, on their own bounded channel: a stale one is worth
     /// nothing, so the queue never grows (see `spawn_service_thread`).
@@ -158,7 +264,17 @@ pub struct TimetrackView {
     rx: Receiver<Msg>,
     actions: Sender<Action>,
     snapshot: Snapshot,
+    /// Whether any snapshot has arrived yet. Until it has, `snapshot`
+    /// is the empty default and the tabs say "Connecting" rather than
+    /// drawing it as an empty store (see `show_connecting`).
+    snapshot_received: bool,
     status: Option<StatusMsg>,
+    /// The success sentences of actions sent but not yet answered, in
+    /// send order (see `pending_outcome`). The service thread answers
+    /// in that same order, so each `ActionOk` or error consumes the
+    /// front slot. A queue, not one slot: two quick-adds in flight
+    /// must not let the first answer wear the second's label.
+    pending_outcomes: VecDeque<Option<String>>,
     selected: usize,
     tab: Tab,
     /// Index into the active projects, for quick-add attribution.
@@ -186,16 +302,19 @@ pub struct TimetrackView {
     /// The split prompt, when open. Modal like the dialog.
     split_prompt: Option<SplitPrompt>,
     /// A pending merge confirmation. Only `m` (confirm), escape (cancel)
-    /// and `q` (quit) do anything while this is `Some`.
+    /// and `q` (quit) do anything on the keyboard while this is `Some`;
+    /// the banner's buttons confirm and cancel with the mouse.
     merge_confirm: Option<MergeConfirm>,
     /// A pending delete confirmation. Only `d` (confirm), escape (cancel)
-    /// and `q` (quit) do anything while this is `Some`.
+    /// and `q` (quit) do anything on the keyboard while this is `Some`;
+    /// the banner's buttons confirm and cancel with the mouse.
     delete_confirm: Option<DeleteConfirm>,
     /// The recolour prompt, when open (#104). Modal like the project
     /// prompt: one typed field.
     recolour_prompt: Option<RecolourPrompt>,
     /// A pending delete-project confirmation (#104). Only `D` (confirm),
-    /// escape (cancel) and `q` (quit) do anything while this is `Some`.
+    /// escape (cancel) and `q` (quit) do anything on the keyboard while
+    /// this is `Some`; the banner's buttons do it with the mouse.
     delete_project_confirm: Option<DeleteProjectConfirm>,
     /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
     /// defaults to now at view creation; all time ignores it.
@@ -219,7 +338,9 @@ impl TimetrackView {
             rx,
             actions,
             snapshot: Snapshot::default(),
+            snapshot_received: false,
             status: None,
+            pending_outcomes: VecDeque::new(),
             selected: 0,
             tab: Tab::Home,
             project_cursor: 0,
@@ -284,6 +405,13 @@ impl TimetrackView {
     /// Take a fresh snapshot. Returns whether anything visible changed.
     fn apply_snapshot(&mut self, s: Snapshot) -> bool {
         let mut changed = false;
+        // The first snapshot ends "Connecting" even when it equals the
+        // empty default (a genuinely empty store): hearing that the
+        // store is empty is itself visible change.
+        if !self.snapshot_received {
+            self.snapshot_received = true;
+            changed = true;
+        }
         if s != self.snapshot {
             self.snapshot = s;
             changed = true;
@@ -370,7 +498,13 @@ impl TimetrackView {
 
         loop {
             match self.rx.try_recv() {
-                Ok(Msg::Error(note)) => set_status(&mut self.status, note, &mut changed),
+                Ok(Msg::Error(note)) => {
+                    // The failed action's success sentence will never be
+                    // spoken; drop its slot so the next action's answer
+                    // is not labelled with it.
+                    self.pending_outcomes.pop_front();
+                    set_status(&mut self.status, note, &mut changed)
+                }
                 Ok(Msg::Status(note)) => {
                     set_status(&mut self.status, StatusMsg::local(note), &mut changed)
                 }
@@ -389,12 +523,25 @@ impl TimetrackView {
                     }
                 }
                 Ok(Msg::ActionOk) => {
-                    // A success dismisses the previous error -- but only one
-                    // the actions own. The "service is not running" notice
-                    // belongs to the connection, not to any action.
-                    if !self.service_missing() && self.status.is_some() {
-                        self.status = None;
-                        changed = true;
+                    // A success speaks: the sentence queued when the
+                    // action was sent replaces whatever error stood
+                    // there, and stays until the next note (the same
+                    // lifetime an export's saved line already had). A
+                    // slot with no sentence, or no slot at all, keeps
+                    // the old behaviour of just dismissing the previous
+                    // error -- but only one the actions own. The
+                    // "service is not running" notice belongs to the
+                    // connection, not to any action.
+                    match self.pending_outcomes.pop_front() {
+                        Some(Some(label)) if !self.service_missing() => {
+                            set_status(&mut self.status, StatusMsg::local(label), &mut changed)
+                        }
+                        _ => {
+                            if !self.service_missing() && self.status.is_some() {
+                                self.status = None;
+                                changed = true;
+                            }
+                        }
                     }
                 }
                 Ok(Msg::UpdateAvailable { version, url }) => {
@@ -447,8 +594,19 @@ impl TimetrackView {
         changed
     }
 
-    fn send(&self, a: Action) {
+    fn send(&mut self, a: Action) {
+        // Queue the success sentence before the action can be answered:
+        // the service thread answers in send order, so the queue and
+        // the answers stay in step (see `pending_outcome`).
+        if let Some(outcome) = pending_outcome(&a, &self.snapshot) {
+            self.pending_outcomes.push_back(outcome);
+        }
         let _ = self.actions.send(a);
+    }
+
+    /// Whether the tabs should say "Connecting" (see `show_connecting`).
+    pub(crate) fn connecting(&self) -> bool {
+        show_connecting(self.snapshot_received, self.status.as_ref().map(|s| s.kind))
     }
 
     /// Projects offered for new entries: archived ones are hidden, because
@@ -773,6 +931,15 @@ impl TimetrackView {
         }
     }
 
+    /// Focus one entry-dialog field from a mouse click on its row: the
+    /// click route to the same focus Tab moves, so a mouse user can
+    /// start typing in Start or End without tabbing through the form.
+    pub(crate) fn focus_dialog_field(&mut self, field: self::dialogs::entry::DialogField) {
+        if let Some(dlg) = self.dialog.as_mut() {
+            dlg.focus_field(field);
+        }
+    }
+
     /// Open the project prompt for a new, typed name.
     fn open_project_prompt(&mut self) {
         self.status = None;
@@ -973,18 +1140,31 @@ impl TimetrackView {
         }
     }
 
+    /// Execute the pending delete-project confirmation: the second `D`
+    /// and the banner's Confirm button both land here, so the mouse
+    /// path sends exactly what the keyboard path sends.
+    pub(crate) fn confirm_delete_project(&mut self) {
+        if let Some(confirm) = self.delete_project_confirm.take() {
+            self.send(delete_project_action(&confirm));
+        }
+    }
+
+    /// Dismiss the pending delete-project confirmation without deleting:
+    /// Escape and the banner's Cancel button both land here.
+    pub(crate) fn cancel_delete_project(&mut self) {
+        self.delete_project_confirm = None;
+    }
+
     /// Handle a key press while a delete-project confirmation is pending.
     /// Only the confirmation's own answers do anything.
     fn on_delete_project_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
         if ev.keystroke.key.as_str() == "escape" {
-            self.delete_project_confirm = None;
+            self.cancel_delete_project();
             return true;
         }
         match ev.keystroke.key_char.as_deref() {
             Some("D") => {
-                if let Some(confirm) = self.delete_project_confirm.take() {
-                    self.send(Action::DeleteProject(confirm.id));
-                }
+                self.confirm_delete_project();
                 true
             }
             Some("q") => false,
@@ -1101,19 +1281,32 @@ impl TimetrackView {
     /// no other action can sneak in mid-confirmation.
     fn on_merge_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
         if ev.keystroke.key.as_str() == "escape" {
-            self.merge_confirm = None;
+            self.cancel_merge();
             return true;
         }
         match ev.keystroke.key_char.as_deref() {
             Some("m") => {
-                if let Some(confirm) = self.merge_confirm.take() {
-                    self.send(Action::MergeEntries { ids: confirm.ids });
-                }
+                self.confirm_merge();
                 true
             }
             Some("q") => false,
             _ => true,
         }
+    }
+
+    /// Execute the pending merge confirmation: the second `m` and the
+    /// banner's Confirm button both land here, so the mouse path sends
+    /// exactly what the keyboard path sends.
+    pub(crate) fn confirm_merge(&mut self) {
+        if let Some(confirm) = self.merge_confirm.take() {
+            self.send(merge_action(&confirm));
+        }
+    }
+
+    /// Dismiss the pending merge confirmation without merging: Escape
+    /// and the banner's Cancel button both land here.
+    pub(crate) fn cancel_merge(&mut self) {
+        self.merge_confirm = None;
     }
 
     /// Offer the delete confirmation for the selection, if there is one.
@@ -1135,19 +1328,32 @@ impl TimetrackView {
     /// no other action can sneak in mid-confirmation.
     fn on_delete_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
         if ev.keystroke.key.as_str() == "escape" {
-            self.delete_confirm = None;
+            self.cancel_delete();
             return true;
         }
         match ev.keystroke.key_char.as_deref() {
             Some("d") => {
-                if let Some(confirm) = self.delete_confirm.take() {
-                    self.send(Action::DeleteEntry(confirm.id));
-                }
+                self.confirm_delete();
                 true
             }
             Some("q") => false,
             _ => true,
         }
+    }
+
+    /// Execute the pending delete confirmation: the second `d` and the
+    /// banner's Confirm button both land here, so the mouse path sends
+    /// exactly what the keyboard path sends.
+    pub(crate) fn confirm_delete(&mut self) {
+        if let Some(confirm) = self.delete_confirm.take() {
+            self.send(delete_action(&confirm));
+        }
+    }
+
+    /// Dismiss the pending delete confirmation without deleting: Escape
+    /// and the banner's Cancel button both land here.
+    pub(crate) fn cancel_delete(&mut self) {
+        self.delete_confirm = None;
     }
 
     /// Validate the dialog and send the action(s). Stays open with an error
@@ -1310,7 +1516,7 @@ impl TimetrackView {
             .is_some_and(|s| s.kind == StatusKind::NoService)
     }
 
-    fn try_start_service(&self) {
+    fn try_start_service(&mut self) {
         self.send(Action::StartService);
     }
 
@@ -1419,16 +1625,27 @@ impl Render for TimetrackView {
                     .bg(rgba(theme::WINDOW_BG))
                     .when(!maximized, |el| el.rounded_xl().overflow_hidden())
                     .child(self.render_titlebar(window))
-                    // The prompt panels sit above the tab content, so a prompt
-                    // opened on any tab is on screen. They are drawn here
-                    // rather than inside the tab because the shortcuts that
-                    // open them are global.
-                    .child(self.render_prompts())
-                    .child(match self.tab {
-                        Tab::Home => self.render_home().into_any_element(),
-                        Tab::Projects => self.render_projects().into_any_element(),
-                        Tab::Export => self.render_export().into_any_element(),
-                    })
+                    // The tab content and the prompts share one relative
+                    // stage: the prompts are absolutely positioned over
+                    // its top (see `render_prompts`), so opening one
+                    // covers the content's first rows instead of shoving
+                    // every row down and back up on close. They are drawn
+                    // here rather than inside the tab because the
+                    // shortcuts that open them are global: a prompt opened
+                    // on any tab is on screen.
+                    .child(
+                        div()
+                            .relative()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .child(match self.tab {
+                                Tab::Home => self.render_home().into_any_element(),
+                                Tab::Projects => self.render_projects().into_any_element(),
+                                Tab::Export => self.render_export().into_any_element(),
+                            })
+                            .child(self.render_prompts()),
+                    )
                     .child(self.render_footer()),
             )
     }
@@ -1560,6 +1777,101 @@ mod tests {
         assert_eq!(
             which_prompt(false, false, false, true, true, true, true),
             Some(OpenPrompt::Merge)
+        );
+    }
+
+    // --- connecting, confirmations and success feedback ---
+
+    #[test]
+    fn connecting_shows_until_the_first_snapshot_or_status() {
+        // Before the first snapshot the view holds an empty default, and
+        // drawing it would claim the store is empty ("Nothing tracked
+        // yet", "No projects yet") when nothing has been heard at all.
+        // Any status ends it too: a connection error has arrived, and
+        // the footer is already telling that story.
+        assert!(show_connecting(false, None));
+        assert!(!show_connecting(true, None));
+        assert!(!show_connecting(false, Some(StatusKind::NoService)));
+        assert!(!show_connecting(false, Some(StatusKind::Local)));
+        assert!(!show_connecting(true, Some(StatusKind::Local)));
+    }
+
+    #[test]
+    fn confirm_actions_carry_exactly_the_confirmed_ids() {
+        // The Confirm buttons and the confirm keys share these builders,
+        // so a click can never send a different payload than the second
+        // keystroke the banner was opened for.
+        let merge = MergeConfirm {
+            ids: vec!["e1".into(), "e2".into()],
+            summary: String::new(),
+        };
+        match merge_action(&merge) {
+            Action::MergeEntries { ids } => assert_eq!(ids, ["e1", "e2"]),
+            other => panic!("expected MergeEntries, got {other:?}"),
+        }
+        let delete = DeleteConfirm {
+            id: "e9".into(),
+            summary: String::new(),
+        };
+        match delete_action(&delete) {
+            Action::DeleteEntry(id) => assert_eq!(id, "e9"),
+            other => panic!("expected DeleteEntry, got {other:?}"),
+        }
+        let delete_project = DeleteProjectConfirm {
+            id: "p9".into(),
+            summary: String::new(),
+        };
+        match delete_project_action(&delete_project) {
+            Action::DeleteProject(id) => assert_eq!(id, "p9"),
+            other => panic!("expected DeleteProject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn success_labels_name_the_project_not_its_id() {
+        // The footer is for the user: a quick-add reports the project by
+        // the name they typed, never the `p1` the action carries.
+        let snap = merge_snapshot();
+        assert_eq!(
+            pending_outcome(
+                &Action::QuickAdd {
+                    project: "p1".into(),
+                    ms: 3_600_000
+                },
+                &snap
+            ),
+            Some(Some("added 1h to Work".to_string()))
+        );
+        // StartService reports through `ActionOk` like the rest, so it
+        // is tracked (its outcome must consume a queue slot) but has no
+        // success sentence of its own: the arriving snapshot is the
+        // feedback.
+        assert_eq!(pending_outcome(&Action::StartService, &snap), Some(None));
+        // Exports, updates and refreshes report through their own
+        // messages, never `ActionOk`, so they take no slot: a slot here
+        // would steal the next real action's label.
+        assert_eq!(pending_outcome(&Action::Refresh, &snap), None);
+        assert_eq!(
+            pending_outcome(
+                &Action::ExportCsv(export_request(
+                    timetrack_core::ExportScope::All,
+                    0,
+                    0,
+                    &utc_tz()
+                )),
+                &snap
+            ),
+            None
+        );
+        assert_eq!(
+            pending_outcome(
+                &Action::InstallUpdate {
+                    url: "https://example.invalid/x".into(),
+                    version: "9.9".into()
+                },
+                &snap
+            ),
+            None
         );
     }
 

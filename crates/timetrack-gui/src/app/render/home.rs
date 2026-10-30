@@ -8,10 +8,12 @@
 //! The Home tab: the week total first, then quick add, then projects, then
 //! recent entries. Everything below the total is deliberately quieter.
 
+use std::time::Duration;
+
 use super::super::TimetrackView;
 use super::super::{service::Action, theme};
 use gpui::prelude::*;
-use gpui::{ElementId, IntoElement, div, px, rgb, rgba};
+use gpui::{Animation, AnimationExt as _, ElementId, IntoElement, div, ease_out_quint, px, rgba};
 use timetrack_core::QUICK_ADD_MS;
 
 /// Width of the per-project bar track on Home.
@@ -32,7 +34,11 @@ impl TimetrackView {
     /// Home: the week total first, then quick add, then projects, then recent
     /// entries. Everything below the total is deliberately quieter.
     pub(crate) fn render_home(&self) -> impl IntoElement {
+        if self.connecting() {
+            return self.render_connecting().into_any_element();
+        }
         let week = &self.snapshot.week;
+        let motion = theme::motion_enabled();
 
         // --- the number, at the top, largest on the screen ---
         let hero = div()
@@ -47,10 +53,25 @@ impl TimetrackView {
                 // An explicit size rather than a step from the scale: the
                 // largest step (text_3xl) was still smaller than this number
                 // is supposed to be. It has to be the first thing you see.
+                // When the total changes (a quick-add landed), it pulses
+                // once -- opacity only, never size -- keyed on the total
+                // itself so an unchanged total never replays it.
                 div()
                     .text_size(px(72.))
-                    .text_color(rgb(0xffffff))
-                    .child(timetrack_core::format_duration(week.total_ms)),
+                    .text_color(rgba(theme::SELECTED_TEXT))
+                    .child(timetrack_core::format_duration(week.total_ms))
+                    .with_animation(
+                        ElementId::from(("hero-total", week.total_ms as u64)),
+                        Animation::new(Duration::from_millis(theme::HERO_PULSE_MS))
+                            .with_easing(ease_out_quint()),
+                        move |el, delta| {
+                            el.opacity(if motion {
+                                theme::hero_opacity(delta)
+                            } else {
+                                1.0
+                            })
+                        },
+                    ),
             )
             .child(
                 div()
@@ -94,6 +115,7 @@ impl TimetrackView {
             .child(self.render_quick_add())
             .child(self.render_week_by_project())
             .child(self.render_entries())
+            .into_any_element()
     }
 
     /// The 5/15/30/60 row, naming the project it will go to.
@@ -120,7 +142,7 @@ impl TimetrackView {
                     .py_1()
                     .rounded_md()
                     .bg(rgba(theme::ACTION))
-                    .text_color(rgb(0xffffff))
+                    .text_color(rgba(theme::SELECTED_TEXT))
                     // With no project there is nothing to attribute the time
                     // to, so the button is present but inert rather than
                     // silently dropping the tap.
@@ -190,6 +212,7 @@ impl TimetrackView {
                     .child(
                         div()
                             .flex_1()
+                            .truncate()
                             .text_color(rgba(theme::STRONG_TEXT))
                             .child(name.to_string()),
                     )
@@ -197,6 +220,7 @@ impl TimetrackView {
                     // distribution reads without reading every number.
                     .child(
                         div()
+                            .flex_shrink_0()
                             .w(px(PROJECT_BAR_TRACK_PX))
                             .h(px(8.))
                             .rounded_md()
@@ -211,6 +235,7 @@ impl TimetrackView {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .w(px(110.))
                             .text_color(rgba(theme::ACCENT))
                             .child(timetrack_core::format_duration(ms)),
@@ -262,32 +287,40 @@ impl TimetrackView {
                 .bg(if selected {
                     rgba(theme::RAISED_BG)
                 } else {
-                    rgba(0x00000000)
+                    rgba(theme::TRANSPARENT)
                 })
                 // A quick-add is marked so it is visibly distinct from
                 // hand-entered time, and so `u` reads as "undo that".
-                .child(div().w_4().text_color(rgba(theme::ACTION)).child(
-                    if e.source == timetrack_proto::EntrySource::QuickAdd {
-                        "+"
-                    } else {
-                        " "
-                    },
-                ))
                 .child(
                     div()
+                        .flex_shrink_0()
+                        .w_4()
+                        .text_color(rgba(theme::ACTION))
+                        .child(if e.source == timetrack_proto::EntrySource::QuickAdd {
+                            "+"
+                        } else {
+                            " "
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
                         .w(px(110.))
                         .text_color(rgba(theme::ACCENT))
                         .child(timetrack_core::format_duration(e.duration_ms())),
                 )
                 .child(
                     div()
+                        .flex_shrink_0()
                         .w(px(160.))
+                        .truncate()
                         .text_color(rgba(theme::ROW_TEXT))
                         .child(project_name(&e.project_id)),
                 )
                 .child(
                     div()
                         .flex_1()
+                        .truncate()
                         .text_color(rgba(theme::BODY_TEXT))
                         .child(timetrack_core::sanitize_display(e.label())),
                 )

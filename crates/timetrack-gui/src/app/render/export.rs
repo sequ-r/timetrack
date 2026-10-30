@@ -15,13 +15,16 @@ use super::super::service::{Action, export_request, now_ms};
 use super::super::status::StatusMsg;
 use super::super::{display_tz, snapshot_tz, theme};
 use gpui::prelude::*;
-use gpui::{ElementId, IntoElement, div, rgb, rgba};
+use gpui::{ElementId, IntoElement, div, rgba};
 
 impl TimetrackView {
     /// Export. The service owns aggregation, so what is shown here is exactly
     /// what a CSV would contain, rather than a second aggregation that could
     /// disagree with the totals on Home.
     pub(crate) fn render_export(&self) -> impl IntoElement {
+        if self.connecting() {
+            return self.render_connecting().into_any_element();
+        }
         // Drawing only (labels and preview): the export click below
         // re-resolves strictly before anything is computed or sent.
         let tz = display_tz(&self.snapshot);
@@ -99,7 +102,7 @@ impl TimetrackView {
                     .px_3()
                     .py_1()
                     .text_color(if picker_active {
-                        rgb(0xffffff)
+                        rgba(theme::SELECTED_TEXT)
                     } else {
                         rgba(theme::HINT_TEXT)
                     })
@@ -127,7 +130,7 @@ impl TimetrackView {
                 .bg(if self.export_picker.editing {
                     rgba(theme::RAISED_BG)
                 } else {
-                    rgba(0x00000000)
+                    rgba(theme::TRANSPARENT)
                 })
                 .text_color(if picker_active {
                     rgba(theme::BODY_TEXT)
@@ -235,7 +238,7 @@ impl TimetrackView {
                     .rounded_md()
                     .cursor_pointer()
                     .bg(rgba(theme::ACTION))
-                    .text_color(rgb(0xffffff))
+                    .text_color(rgba(theme::SELECTED_TEXT))
                     .child(label)
                     .when_some(entity, move |el, entity| {
                         el.on_click(move |_ev, _window, cx| {
@@ -350,10 +353,10 @@ impl TimetrackView {
             .bg(if selected {
                 rgba(theme::RAISED_BG)
             } else {
-                rgba(0x00000000)
+                rgba(theme::TRANSPARENT)
             })
             .text_color(if selected {
-                rgb(0xffffff)
+                rgba(theme::SELECTED_TEXT)
             } else {
                 rgba(theme::MUTED_TEXT)
             })
@@ -388,7 +391,7 @@ impl TimetrackView {
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgba(0x3a3a4aff))
+            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
             .text_color(if active {
                 rgba(theme::STRONG_TEXT)
             } else {
