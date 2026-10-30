@@ -49,6 +49,11 @@ thiserror = "2"
 # point.
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 async-io = "2"
+# The `StreamExt`/`race` helpers for zbus signal streams (#103). Already in
+# the tree as zbus' own dependency; naming it as ours is what lets
+# `timetrack-proto` drive a `SignalStream` without client crates each
+# having to learn a futures crate.
+futures-lite = "2"
 ratatui = "0.29"
 crossterm = "0.28"
 anyhow = "1"

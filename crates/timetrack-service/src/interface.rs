@@ -9,7 +9,9 @@
 //!
 //! All state lives behind a single `Mutex<Inner>`, and every mutating method
 //! persists before it returns. That ordering matters: a client that is told
-//! "added" must be able to rely on the entry surviving a crash.
+//! "added" must be able to rely on the entry surviving a crash. Since #103
+//! the persisted form is a synced journal append of the mutation's diff
+//! (with periodic checkpoints), not a rewrite of the whole store.
 //!
 //! # This layer holds no rules
 //!
@@ -225,22 +227,46 @@ impl EntryService {
             data, ids, store, ..
         } = &mut *g;
         // Mutate a working copy and swap it in only once it is on disk, so
-        // a failed save (or a rule refusal after a partial mutation) leaves
-        // memory holding exactly what the file holds (#100). The copy is
-        // the one full-store clone a mutation pays for: mutating in place
-        // needed the same clone kept aside for the rollback, and then the
-        // save cloned again to stamp its version.
+        // a failed append (or a rule refusal after a partial mutation)
+        // leaves memory holding exactly what the files hold (#100). The
+        // copy is the one full-store clone a mutation pays for: mutating
+        // in place needed the same clone kept aside for the rollback, and
+        // the working copy doubles as the "after" side of the journal
+        // diff (#103).
         let mut next_data = data.clone();
         let mut next_ids = ids.clone();
         match f(&mut next_data, &mut next_ids, now) {
             Ok(value) => {
                 // Persist before acknowledging -- and before the new
-                // state becomes visible to snapshots.
-                if let Err(e) = store.save(&next_data) {
+                // state becomes visible to snapshots. Since #103 the
+                // persisted form is one journal line holding this
+                // mutation's diff, synced by `append`, so a tap no longer
+                // rewrites (or re-syncs) the whole history.
+                let record = core::Journal::between(data, &next_data);
+                // A journal with no checkpoint under it cannot be
+                // replayed into the full store, so a checkpoint that has
+                // gone missing (deleted while the service ran) heals with
+                // a whole-store save instead of an append.
+                let persisted = if store.path().exists() {
+                    store.append(&record)
+                } else {
+                    store.save(&next_data)
+                };
+                if let Err(e) = persisted {
                     return Err(ServiceError::Storage(e.to_string()));
                 }
                 *data = next_data;
                 *ids = next_ids;
+                // Fold the journal into the checkpoint once it outgrows
+                // its budget. The mutation is already durable in the
+                // journal, so a checkpoint failure must not fail it (that
+                // would roll memory back from disk, the #100 divergence):
+                // note it and retry on the next mutation.
+                if store.journal_len() > core::JOURNAL_CHECKPOINT_BYTES {
+                    if let Err(e) = store.save(data) {
+                        eprintln!("timetrack-service: checkpoint failed, journal kept ({e})");
+                    }
+                }
                 Ok(value)
             }
             Err(rule) => Err(ServiceError::from(rule)),
@@ -487,7 +513,11 @@ mod tests {
     #[test]
     fn a_failed_save_rolls_the_mutation_back() {
         // #100: memory must match disk after a save failure, so the entry
-        // the client was told failed must not linger in snapshots.
+        // the client was told failed must not linger in snapshots. Since
+        // #103 the mutation path appends to the journal, so the failure is
+        // injected there (a read-only directory alone no longer blocks an
+        // append to the existing journal file — which is correct: that
+        // mutation really would be durable).
         use std::os::unix::fs::PermissionsExt;
         let (svc, path) = service("save-failure-rollback");
         let p = project(&svc);
@@ -495,9 +525,12 @@ mod tests {
         svc.add(&p.id, "kept", now - 3_600_000, now).unwrap();
 
         let dir = path.parent().unwrap().to_path_buf();
+        let journal = JsonStore::new(path.clone()).journal_path();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o444)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let failed = svc.add(&p.id, "doomed", now - 1_800_000, now);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(
             matches!(failed, Err(ServiceError::Storage(_))),
@@ -556,16 +589,19 @@ mod tests {
 
     #[test]
     fn a_failed_write_does_not_leave_the_service_reporting_success() {
-        // The mutate funnel returns the save error, so a client never sees
-        // an entry the service could not persist as acknowledged.
+        // The mutate funnel returns the persist error, so a client never
+        // sees an entry the service could not persist as acknowledged.
+        // Since #103 a mutation persists by appending to the journal, so
+        // the journal is what gets sabotaged here.
         let (svc, path) = service("failedwrite");
         let p = project(&svc);
         let now = now_ms();
         svc.add(&p.id, "kept", now, now + 1).unwrap();
 
-        // Make the store unwritable by turning its path into a directory.
-        let _ = std::fs::remove_file(&path);
-        std::fs::create_dir_all(&path).unwrap();
+        // Make the journal unwritable by turning its path into a directory.
+        let journal = JsonStore::new(path).journal_path();
+        let _ = std::fs::remove_file(&journal);
+        std::fs::create_dir_all(&journal).unwrap();
         let err = svc.add(&p.id, "lost", now, now + 1);
         assert!(err.is_err(), "must not acknowledge an unpersisted entry");
     }
@@ -581,10 +617,14 @@ mod tests {
         let now = now_ms();
         svc.add(&p.id, "kept", now, now + 1).unwrap();
 
-        // Break persistence both ways by turning the store path into a
-        // directory: saves fail, and any reload would fail as well.
+        // Break persistence both ways by turning both store paths into
+        // directories: appends and checkpoints fail (#103: the journal is
+        // a persist target too), and any reload would fail as well.
+        let journal = JsonStore::new(path.clone()).journal_path();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&journal);
         std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir_all(&journal).unwrap();
         let err = svc.add(&p.id, "unpersisted", now, now + 1);
         assert!(err.is_err(), "must not acknowledge an unpersisted entry");
 
@@ -602,9 +642,12 @@ mod tests {
             "the failed mutation must not linger in memory: {snap:?}"
         );
 
-        // And the failure heals: once the path is writable again the next
-        // mutation persists normally.
+        // And the failure heals: once the paths are writable again the
+        // next mutation persists normally — with the checkpoint missing
+        // it heals as a whole-store save (#103), so nothing that was in
+        // memory is stranded in a journal with nothing under it.
         std::fs::remove_dir_all(&path).unwrap();
+        std::fs::remove_dir_all(&journal).unwrap();
         svc.add(&p.id, "healed", now, now + 1).unwrap();
         let reopened = EntryService::new(JsonStore::new(path)).unwrap();
         let snap = reopened.snapshot();

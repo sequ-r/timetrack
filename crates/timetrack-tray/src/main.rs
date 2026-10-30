@@ -33,7 +33,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use timetrack_proto::{Client, ClientError};
+use timetrack_proto::{ChangedStream, ChangedWait, Client, ClientError};
 
 mod actions;
 mod ipc;
@@ -58,9 +58,11 @@ use menu::{LastEntry, MAX_PROJECTS, ProjectItem};
 #[cfg(test)]
 use state::tooltip_text;
 
-/// How often the service is polled for a new snapshot. Slower than the
-/// GUI's 1s tick: the tray only needs fresh menu data, not animation.
-const POLL: Duration = Duration::from_secs(5);
+/// The fallback snapshot cadence (#103). Freshness normally arrives as
+/// a `Changed` signal the moment a mutation persists; this slow poll
+/// only covers an old (signalless) service, a missed signal, and
+/// noticing that the service has gone away.
+const POLL: Duration = Duration::from_secs(60);
 
 /// Take a lock without unwrapping it (#51).
 ///
@@ -111,7 +113,7 @@ async fn run() -> anyhow::Result<()> {
     let mut last_total_ms: Option<i64> = None;
     // The last menu pushed to the item, plus the last undo map and tooltip
     // state seen: compared by value so the host only re-renders on a real
-    // change, not every 5s tick. The undo map joins the gate because it
+    // change, not every tick. The undo map joins the gate because it
     // changes without any snapshot change: the quick-add worker records the
     // id after the service answers, which can land after the tick that
     // already rebuilt for the new week total -- without this the undo row
@@ -126,6 +128,10 @@ async fn run() -> anyhow::Result<()> {
     // Whether a snapshot ever succeeded: tells "not running" (never seen)
     // apart from "went away" (was here, now gone).
     let mut ever_ready = false;
+    // The `Changed` subscription on the live connection (#103), created
+    // with it and dropped with it. `None` while disconnected, and after
+    // a stream ends until the next connection recreates it.
+    let mut changed: Option<ChangedStream> = None;
 
     loop {
         // (Re)connect anonymously: `Client::connect` never requests BUS_NAME,
@@ -162,6 +168,10 @@ async fn run() -> anyhow::Result<()> {
                 }
             },
         };
+
+        if changed.is_none() {
+            changed = client.changed_stream().await.ok();
+        }
 
         let result = client.snapshot().await;
         let state = conn_state(&result);
@@ -222,6 +232,7 @@ async fn run() -> anyhow::Result<()> {
                 // The bus or the service went away: drop the connection so
                 // the next tick reconnects from scratch.
                 set_shared_client(&client_slot, None);
+                changed = None;
             }
             Err(ClientError::VersionMismatch { .. }) | Err(ClientError::Service(_)) => {
                 // Keep the connection: the bus is fine. A mismatch means a
@@ -231,16 +242,32 @@ async fn run() -> anyhow::Result<()> {
             }
         }
 
-        // Quit answers within a beat instead of a full tick: the flag is
-        // cheap to poll, and exiting here returns through `main`, which
-        // drops the SNI item cleanly. This stops the tray only -- nothing
-        // above calls the service on this path.
+        // Wait out the fallback tick in short slices (#103): a `Changed`
+        // announcement ends the wait at once, and the slices keep Quit
+        // answering within a beat instead of a full tick. Exiting here
+        // returns through `main`, which drops the SNI item cleanly. This
+        // stops the tray only -- nothing above calls the service on it.
         for _ in 0..POLL.as_millis() / 100 {
             if shutdown.load(Ordering::Relaxed) {
                 println!("timetrack-tray: quit requested; exiting");
                 return Ok(());
             }
-            async_io::Timer::after(Duration::from_millis(100)).await;
+            let slice = Duration::from_millis(100);
+            match changed.as_mut() {
+                Some(stream) => match stream.wait_timeout(slice).await {
+                    ChangedWait::Changed => break,
+                    // The connection ended: refresh now, which sorts the
+                    // failure out on the normal snapshot path.
+                    ChangedWait::Ended => {
+                        changed = None;
+                        break;
+                    }
+                    ChangedWait::TimedOut => {}
+                },
+                None => {
+                    async_io::Timer::after(slice).await;
+                }
+            }
         }
     }
 }

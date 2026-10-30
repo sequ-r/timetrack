@@ -42,8 +42,8 @@ pub(super) enum Msg {
         dest: String,
         via_portal: bool,
     },
-    /// An action succeeded. Snapshots never clear feedback (they arrive
-    /// every second and would make errors unreadable), so success arrives as
+    /// An action succeeded. Snapshots never clear feedback (they follow
+    /// every action and would make errors unreadable), so success arrives as
     /// its own message that dismisses the previous error.
     ActionOk,
     /// The update check found a newer release with this machine's AppImage
@@ -110,6 +110,10 @@ pub(super) fn export_request(
 /// connection, so the UI cannot issue D-Bus calls itself.
 #[derive(Debug, Clone)]
 pub(super) enum Action {
+    /// The service announced a change (#103): fetch a fresh snapshot now
+    /// instead of waiting for the fallback tick. Sent by the signal
+    /// thread, never by the view.
+    Refresh,
     /// Method 4: one of the fixed buckets, ending now.
     QuickAdd { project: String, ms: i64 },
     /// Remove the entry a quick add created.
@@ -226,12 +230,13 @@ pub(super) fn offer_snapshot(tx: &SyncSender<Snapshot>, s: Snapshot) -> Offered 
 ///
 /// The two channels back to the view are different on purpose.
 ///
-/// **Snapshots** are bounded. They arrive about once a second and the view
-/// drains them every 300 ms, so a view that stops draining -- a hidden
-/// window, a long paint -- must not make the queue grow without bound. A
-/// snapshot a second old is worth nothing, so the queue holds one and a
-/// newer one is dropped rather than queued behind it; the next tick's
-/// arrives and the view catches up.
+/// **Snapshots** are bounded. They arrive after actions and `Changed`
+/// announcements (plus a slow fallback tick) and the view drains them
+/// every 300 ms, so a view that stops draining -- a hidden window, a
+/// long paint -- must not make the queue grow without bound. A stale
+/// snapshot is worth nothing once a newer exists, so the queue holds one
+/// and a newer one is dropped rather than queued behind it; the next
+/// announcement's arrives and the view catches up.
 ///
 /// **Messages** -- errors, statuses, the result of an action -- are
 /// unbounded and never dropped. Those are the service's refusals and the
@@ -240,6 +245,30 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
     let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
     let (tx, rx) = std::sync::mpsc::channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
+    // The `Changed` listener (#103): its own bus connection on its own
+    // thread, forwarding each announcement to the service thread as a
+    // `Refresh` action, so the service thread's somebody-changed refresh
+    // goes through exactly the path a click takes. Any failure here is
+    // silence, like the update check below: the fallback snapshot tick
+    // still covers a signalless service, just more slowly.
+    {
+        let action_tx = action_tx.clone();
+        std::thread::spawn(move || {
+            async_io::block_on(async move {
+                let Ok(client) = timetrack_proto::Client::connect().await else {
+                    return;
+                };
+                let Ok(mut stream) = client.changed_stream().await else {
+                    return;
+                };
+                while stream.next().await.is_some() {
+                    if action_tx.send(Action::Refresh).is_err() {
+                        return;
+                    }
+                }
+            });
+        });
+    }
     // The self-update check: one blocking HTTPS call on its own thread, at
     // startup only. It never touches the bus, so it shares nothing with the
     // service loop below except the message channel back to the view. Any
@@ -331,6 +360,9 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                 // them means one snapshot per burst, not per click.
                 loop {
                     match pending {
+                        // Nothing to do here: the snapshot fetch below
+                        // the drain is the refresh this asks for.
+                        Ok(Action::Refresh) => {}
                         Ok(Action::QuickAdd { project, ms }) => {
                             report(&tx, client.quick_add(&project, ms).await.map(|_| ()));
                         }

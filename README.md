@@ -31,7 +31,7 @@ the terminal never loses anything, and both can be open at once.
 
 | Crate | Role |
 |---|---|
-| `timetrack-core` | Model, rules, aggregation, atomic JSON storage. No GUI, IPC, async, **or clock**. |
+| `timetrack-core` | Model, rules, aggregation, atomic checkpoint-plus-journal JSON storage. No GUI, IPC, async, **or clock**. |
 | `timetrack-proto` | The D-Bus contract and a client. All front ends depend on this. |
 | `timetrack-service` | D-Bus server. Owns the store, resolves the clock and timezone, persists on every change. |
 | `timetrack-cli` | Terminal client: a ratatui TUI plus one-shot subcommands. |
@@ -166,7 +166,10 @@ Uninstall is deleting the AppImage file (and the symlink, if you made
 one): the image writes nothing to the host — no desktop copy, no D-Bus
 activation file, no systemd unit — so there is nothing left that can
 dangle. Your tracked time lives outside the image at
-`~/.local/share/timetrack/store.json` and is untouched by this.
+`~/.local/share/timetrack/store.json` and is untouched by this. Changes
+land first in a small append-only sibling, `store.json.journal`, and are
+folded into `store.json` periodically: back up (or move) **both** files
+together, since the newest changes may live only in the journal.
 
 Host `cargo build` binaries are a development fallback only (see
 "Building" above): they need a service on the bus exactly like the tests
@@ -368,9 +371,10 @@ above.
 
 **A corrupt or newer store is refused, not repaired.** The service will
 not start rather than start empty, because starting empty would look like
-your tracked time had vanished. The file is at
-`~/.local/share/timetrack/store.json`; move it aside to start fresh. A
-file written by a newer TimeTrack is refused the same way, and says so.
+your tracked time had vanished. The files are at
+`~/.local/share/timetrack/store.json` plus its `store.json.journal`
+sibling; move both aside to start fresh. A file written by a newer
+TimeTrack is refused the same way, and says so.
 
 **A store from the stopwatch era cannot be migrated.** That format has no
 projects, so there is nothing to migrate it onto. The service says so

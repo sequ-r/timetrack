@@ -344,6 +344,67 @@ pub struct Client {
     proxy: zbus::Proxy<'static>,
 }
 
+/// How a bounded wait for `Changed` ended (#103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangedWait {
+    /// The service announced a persisted mutation: refresh now.
+    Changed,
+    /// Nothing arrived inside the bound: the caller's turn to act.
+    TimedOut,
+    /// The stream ended (the connection went away): resubscribe or fall
+    /// back to polling rather than spinning on a dead stream.
+    Ended,
+}
+
+/// A subscription to the service's `Changed` signal (#103).
+///
+/// Wraps zbus' signal stream so client crates need no futures traits of
+/// their own: await [`ChangedStream::next`] for the next announcement,
+/// or [`ChangedStream::wait_timeout`] to share a wait with a fallback
+/// timer. Coalescing is inexact by design — two mutations may arrive as
+/// one refresh — because the snapshot fetched after any signal is the
+/// service's current state either way.
+pub struct ChangedStream {
+    inner: std::pin::Pin<Box<zbus::proxy::SignalStream<'static>>>,
+}
+
+impl ChangedStream {
+    /// The next `Changed`, or `None` when the stream has ended.
+    ///
+    /// zbus also yields the proxy's internal `NameOwnerChanged`
+    /// bookkeeping messages on this stream; only the service's own
+    /// member counts, or merely subscribing would read as a change.
+    pub async fn next(&mut self) -> Option<()> {
+        loop {
+            let msg = futures_lite::StreamExt::next(&mut self.inner).await?;
+            if msg
+                .header()
+                .member()
+                .is_some_and(|m| m.as_str() == "Changed")
+            {
+                return Some(());
+            }
+        }
+    }
+
+    /// Wait at most `bound` for the next `Changed`.
+    pub async fn wait_timeout(&mut self, bound: Duration) -> ChangedWait {
+        futures_lite::future::race(
+            async {
+                match self.next().await {
+                    Some(()) => ChangedWait::Changed,
+                    None => ChangedWait::Ended,
+                }
+            },
+            async {
+                async_io::Timer::after(bound).await;
+                ChangedWait::TimedOut
+            },
+        )
+        .await
+    }
+}
+
 impl Client {
     /// Connect to the service.
     ///
@@ -416,6 +477,22 @@ impl Client {
 
     pub async fn snapshot(&self) -> Result<Snapshot, ClientError> {
         self.call("Snapshot").await
+    }
+
+    /// Subscribe to the service's `Changed` signal (#103).
+    ///
+    /// Subscribing only adds a bus match rule, so it succeeds even against
+    /// a service (or a bus) that never emits: old services simply never
+    /// fire, and callers keep a slow fallback poll for exactly that case.
+    pub async fn changed_stream(&self) -> Result<ChangedStream, ClientError> {
+        let inner = self
+            .proxy
+            .receive_signal("Changed")
+            .await
+            .map_err(ClientError::from_bus)?;
+        Ok(ChangedStream {
+            inner: Box::pin(inner),
+        })
     }
 
     // --- the four v1 entry methods (REQUIREMENTS §5) ---

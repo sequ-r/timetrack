@@ -16,7 +16,7 @@ use timetrack_proto::{ClientError, Snapshot};
 
 /// What the tooltip and icon state show. Replaced wholesale from the poll
 /// loop via `Handle::update`, like the menu -- and part of the same rebuild
-/// gate, so the host re-renders on any real change, not every 5s tick.
+/// gate, so the host re-renders on any real change, not every tick.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TooltipState {
     /// This ISO week's total, from the service aggregate.

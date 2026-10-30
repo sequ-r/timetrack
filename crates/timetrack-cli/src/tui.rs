@@ -7,10 +7,11 @@
 
 //! The ratatui front end.
 //!
-//! The service is the source of truth, so the TUI polls it rather than
-//! holding state. Nothing is running any more, so there is no local ticking
-//! to interpolate: every number on screen came from the last poll, and
-//! repainting at 1Hz is enough.
+//! The service is the source of truth, so the TUI holds no state of its
+//! own: it refreshes when the service announces a change (#103), with a
+//! slow fallback poll behind the signal. Nothing is running any more, so
+//! there is no local ticking to interpolate: every number on screen came
+//! from the last snapshot.
 //!
 //! # Layout mirrors the GUI's Home tab
 //!
@@ -45,8 +46,11 @@ use std::time::{Duration, Instant};
 use timetrack_core::QUICK_ADD_MS;
 use timetrack_proto::{Client, ClientError, EntryView, ProjectView, Snapshot};
 
-/// How often to refresh from the service.
-const TICK: Duration = Duration::from_millis(1000);
+/// The fallback refresh cadence (#103): the service's `Changed` signal
+/// wakes the service thread the moment a mutation persists, so this
+/// slow tick only covers an old (signalless) service, a missed signal,
+/// and noticing that the service has gone away.
+const TICK: Duration = Duration::from_secs(30);
 
 /// How often to check for a keypress while idle.
 const POLL: Duration = Duration::from_millis(100);
@@ -303,6 +307,9 @@ impl App {
 /// (issue #43).
 #[derive(Debug)]
 enum Request {
+    /// The service announced a change (#103): refresh now instead of at
+    /// the fallback tick. Sent by the signal thread, never by the UI.
+    Refresh,
     /// Record one of the quick-add buckets, ending now.
     QuickAdd { project: String, ms: i64 },
     /// Record a duration ending now.
@@ -343,6 +350,26 @@ enum Reply {
 fn spawn_service_thread(client: Client) -> (Receiver<Reply>, Sender<Request>) {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     let (request_tx, request_rx) = std::sync::mpsc::channel();
+    // The `Changed` listener (#103): a clone of the same connection on
+    // its own thread, forwarding each announcement as a refresh request.
+    // Any failure is silence — the fallback tick still covers a
+    // signalless service.
+    {
+        let client = client.clone();
+        let requests = request_tx.clone();
+        std::thread::spawn(move || {
+            async_io::block_on(async move {
+                let Ok(mut stream) = client.changed_stream().await else {
+                    return;
+                };
+                while stream.next().await.is_some() {
+                    if requests.send(Request::Refresh).is_err() {
+                        return;
+                    }
+                }
+            });
+        });
+    }
     std::thread::spawn(move || {
         // zbus uses the async-io backend (see the workspace Cargo.toml), so
         // the bus is driven with `async_io::block_on` on this thread, exactly
@@ -383,8 +410,12 @@ async fn service_loop(client: Client, requests: Receiver<Request>, replies: Send
             // The UI is gone; nothing left to do.
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        // A request of any kind — an action the user asked for, or a
+        // `Changed` announcement forwarded by the signal thread — is
+        // followed by a refresh below.
         let acted = request.is_some();
         match request {
+            Some(Request::Refresh) => {}
             Some(Request::QuickAdd { project, ms }) => match client.quick_add(&project, ms).await {
                 Ok(entry) => {
                     last_quick_add_id = Some(entry.id.clone());
