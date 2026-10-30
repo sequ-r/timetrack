@@ -319,6 +319,24 @@ The asymmetry is deliberate: `shorten` can never delete anything, and `undo`
 **refuses** an entry it did not create, so it cannot lose hand-entered time by
 accident.
 
+### The TUI
+
+Running `timetrack` with no subcommand opens the TUI. Beyond quick-add
+(`1`-`4`), a 30-minute entry (`a`), undo (`u`) and delete (`d` twice):
+
+- `e` records a hand-entered entry for the selected project — start and
+  end in the same `-90` / `09:30` spellings as the one-shot commands
+  (empty end means now), plus a description.
+- `p` creates a project and selects it, so a fresh store is usable
+  without leaving the TUI.
+- `7` / `8` export the week or month containing a day you type
+  (prefilled with today), and `9` exports everything; each writes the
+  same `timetrack-export-….csv` file name the GUI uses, in the
+  directory the TUI was started from.
+
+`Tab`/`Enter` move through a form's fields and `Esc` cancels it; while a
+form is open its keys are text, not commands.
+
 ## AppImage
 
 TimeTrack ships as a single portable file bundling `timetrack-gui`,
@@ -394,10 +412,6 @@ TimeTrack is refused the same way, and says so.
 **A store from the stopwatch era cannot be migrated.** That format has no
 projects, so there is nothing to migrate it onto. The service says so
 plainly and refuses it; move the file aside to start fresh.
-
-**The TUI cannot create a project.** It has no text field for one; create
-it from the command line (`timetrack project "Work"`) and it appears in
-the TUI at the next refresh.
 
 **The GUI's export preview shows the first rows, not the whole file.** It
 shows up to twenty rows, oldest first, in exactly the order the file
