@@ -70,6 +70,13 @@ struct App {
     /// The entry a pending delete would remove, if `d` is waiting for its
     /// second key.
     delete_confirm: Option<DeleteConfirm>,
+    /// The text prompt being filled in, if one is open (#106). While it
+    /// is, it owns the keyboard: its keys are text, not commands.
+    prompt: Option<Prompt>,
+    /// A project just created through the prompt: the next snapshot puts
+    /// the picker cursor on it, so the time that prompted creating it can
+    /// be recorded straight away.
+    pending_project_id: Option<String>,
     /// A transient message shown in the footer.
     status: Option<String>,
     should_quit: bool,
@@ -88,6 +95,171 @@ struct DeleteConfirm {
     summary: String,
 }
 
+/// Which prompt is open (#106): the three things the TUI could not do at
+/// all before — record a hand-entered entry, create a project, and export
+/// a chosen period — each a short form over a single text-field editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptKind {
+    /// `p`: one field, the new project's name.
+    NewProject,
+    /// `e`: start, end (empty = now), description, for the project that
+    /// was current when the form opened.
+    ManualEntry,
+    /// `7`/`8`: the anchor day of the week or month to export.
+    ExportAnchor { scope: timetrack_core::ExportScope },
+}
+
+/// One labelled line of a [`Prompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptField {
+    label: &'static str,
+    value: String,
+}
+
+/// A text form being filled in. Editing is deliberately the smallest
+/// thing that works — append, backspace, Tab/Enter to move, Esc to
+/// leave — matching how far the GUI's single-line fields went before
+/// #109, and resolvable by pure functions so the rules are testable
+/// without a terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Prompt {
+    kind: PromptKind,
+    title: String,
+    fields: Vec<PromptField>,
+    active: usize,
+    error: Option<String>,
+    /// The project a manual entry goes to, fixed at open time so a
+    /// refresh mid-typing cannot silently re-aim it.
+    project_id: Option<String>,
+}
+
+impl Prompt {
+    fn new_project() -> Self {
+        Prompt {
+            kind: PromptKind::NewProject,
+            title: "New project".into(),
+            fields: vec![PromptField {
+                label: "name",
+                value: String::new(),
+            }],
+            active: 0,
+            error: None,
+            project_id: None,
+        }
+    }
+
+    fn manual_entry(project_id: String, project_name: &str) -> Self {
+        Prompt {
+            kind: PromptKind::ManualEntry,
+            title: format!("New entry for {project_name}"),
+            fields: vec![
+                PromptField {
+                    label: "start (-90 or 09:30)",
+                    value: "-30".into(),
+                },
+                PromptField {
+                    label: "end (empty = now)",
+                    value: String::new(),
+                },
+                PromptField {
+                    label: "description",
+                    value: String::new(),
+                },
+            ],
+            active: 0,
+            error: None,
+            project_id: Some(project_id),
+        }
+    }
+
+    fn export_anchor(scope: timetrack_core::ExportScope, today: String) -> Self {
+        Prompt {
+            kind: PromptKind::ExportAnchor { scope },
+            title: format!("Export {} containing…", scope.as_str()),
+            fields: vec![PromptField {
+                label: "day (YYYY-MM-DD)",
+                value: today,
+            }],
+            active: 0,
+            error: None,
+            project_id: None,
+        }
+    }
+
+    /// The trimmed value of field `i` (empty past the end, defensively).
+    fn field(&self, i: usize) -> &str {
+        self.fields.get(i).map(|f| f.value.trim()).unwrap_or("")
+    }
+}
+
+/// A hand-entered entry as the form resolved it: instants already parsed
+/// in the service's zone, ready for the service thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualEntry {
+    description: String,
+    started_at: i64,
+    ended_at: i64,
+}
+
+/// Resolve a manual-entry form. Pure over an explicit clock and the
+/// service's zone (#102), in the spellings every client shares: `-90`
+/// minutes ago or `09:30` today for both ends, empty end = now.
+fn resolve_manual_entry(
+    start: &str,
+    end: &str,
+    description: &str,
+    now_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> Result<ManualEntry, String> {
+    if start.is_empty() {
+        return Err("start: type a time (-90 or 09:30)".into());
+    }
+    let started_at =
+        timetrack_core::parse_moment(start, "start", now_ms, tz).map_err(|e| e.to_string())?;
+    let ended_at = if end.is_empty() {
+        now_ms
+    } else {
+        timetrack_core::parse_moment(end, "end", now_ms, tz).map_err(|e| e.to_string())?
+    };
+    if ended_at <= started_at {
+        return Err("end must be after start".into());
+    }
+    Ok(ManualEntry {
+        description: description.to_string(),
+        started_at,
+        ended_at,
+    })
+}
+
+/// Resolve an export-anchor form: the anchor instant (local midday of
+/// the typed day, like every client) and the file it should be saved as,
+/// from the core's one naming table.
+fn resolve_export(
+    day: &str,
+    scope: timetrack_core::ExportScope,
+    tz: &timetrack_core::Tz,
+) -> Result<(i64, String), String> {
+    let anchor_ms =
+        timetrack_core::parse_anchor_day(day, "anchor day", tz).map_err(|e| e.to_string())?;
+    let file = timetrack_core::default_export_filename(scope, anchor_ms, tz);
+    Ok((anchor_ms, file))
+}
+
+/// The zone typed local times are parsed in: the service's, from the
+/// snapshot, strictly (#102). An unusable name is an error the form
+/// shows, never a guessed zone.
+fn snapshot_tz(snap: &Snapshot) -> Result<timetrack_core::Tz, String> {
+    timetrack_core::Tz::from_snapshot(&snap.tz).map_err(|e| e.to_string())
+}
+
+/// The wall clock in epoch milliseconds, for parsing relative moments.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 impl App {
     /// A fresh UI, with its commands going to the service thread.
     fn new(requests: Sender<Request>) -> Self {
@@ -97,6 +269,8 @@ impl App {
             selected: 0,
             project_cursor: 0,
             delete_confirm: None,
+            prompt: None,
+            pending_project_id: None,
             status: None,
             should_quit: false,
         }
@@ -117,6 +291,19 @@ impl App {
                 let project_count = active_projects(&self.snapshot).len();
                 if self.project_cursor >= project_count {
                     self.project_cursor = project_count.saturating_sub(1);
+                }
+                // A just-created project becomes the picker's project:
+                // creating it was presumably so the next entry lands
+                // there.
+                if let Some(id) = self.pending_project_id.take() {
+                    if let Some(at) = active_projects(&self.snapshot)
+                        .iter()
+                        .position(|p| p.id == id)
+                    {
+                        self.project_cursor = at;
+                    } else {
+                        self.pending_project_id = Some(id);
+                    }
                 }
                 // A routine poll must not wipe feedback from the last action
                 // ("added 30m", an undo error, ...): the tick fires every
@@ -145,6 +332,24 @@ impl App {
                     self.project_name(&entry.project_id)
                 ));
             }
+            Reply::EntryAdded(entry) => {
+                self.status = Some(format!(
+                    "added {} to {}",
+                    timetrack_core::format_compact(entry.duration_ms()),
+                    self.project_name(&entry.project_id)
+                ));
+            }
+            Reply::ProjectAdded(project) => {
+                self.pending_project_id = Some(project.id.clone());
+                self.status = Some(format!(
+                    "created project {}",
+                    timetrack_core::sanitize_display(&project.name)
+                ));
+            }
+            Reply::Exported { file, rows } => {
+                self.status = Some(format!("exported {rows} entries to {file}"));
+            }
+            Reply::ExportFailed(msg) => self.status = Some(msg),
             Reply::Undone { id } => self.status = Some(format!("undid quick add {id}")),
             Reply::Deleted { id } => self.status = Some(format!("deleted {id}")),
             Reply::NothingToUndo => self.status = Some("nothing to undo".into()),
@@ -174,8 +379,7 @@ impl App {
     /// status message, not a frozen TUI (issue #43).
     fn quick_add(&mut self, duration_ms: i64) {
         let Some(project) = self.current_project().map(|p| p.id.clone()) else {
-            self.status =
-                Some("no project yet -- create one with: timetrack project \"Work\"".into());
+            self.status = Some("no project yet -- press p to create one".into());
             return;
         };
         let _ = self.requests.send(Request::QuickAdd {
@@ -187,8 +391,7 @@ impl App {
     /// Ask the service thread to record a duration ending now.
     fn add_duration(&mut self) {
         let Some(project) = self.current_project().map(|p| p.id.clone()) else {
-            self.status =
-                Some("no project yet -- create one with: timetrack project \"Work\"".into());
+            self.status = Some("no project yet -- press p to create one".into());
             return;
         };
         // Thirty minutes is the middle default and the least destructive
@@ -197,6 +400,182 @@ impl App {
             project,
             ms: 30 * 60_000,
         });
+    }
+
+    /// Open the manual-entry form for the current project (#106).
+    fn open_manual_entry(&mut self) {
+        let Some(project) = self.current_project() else {
+            self.status = Some("no project yet -- press p to create one".into());
+            return;
+        };
+        let (id, name) = (
+            project.id.clone(),
+            timetrack_core::sanitize_display(&project.name),
+        );
+        self.prompt = Some(Prompt::manual_entry(id, &name));
+    }
+
+    /// Open the export-anchor form for a week or month (#106), prefilled
+    /// with today in the service's zone — the current period is one
+    /// Enter away, a chosen one is an edit of the day.
+    fn open_export(&mut self, scope: timetrack_core::ExportScope) {
+        match snapshot_tz(&self.snapshot) {
+            Ok(tz) => {
+                let today = timetrack_core::anchor_day_string(now_ms(), &tz);
+                self.prompt = Some(Prompt::export_anchor(scope, today.to_string()));
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Export everything now (#106): all time has no anchor to choose.
+    fn export_all(&mut self) {
+        let _ = self.requests.send(Request::Export {
+            scope: timetrack_core::ExportScope::All,
+            anchor_ms: 0,
+            file: timetrack_core::default_export_filename(
+                timetrack_core::ExportScope::All,
+                0,
+                &timetrack_core::Tz::utc(),
+            ),
+        });
+    }
+
+    /// A key while a prompt is open: text and field movement only. The
+    /// command keys cannot fire mid-typing — a `q` in a project name is
+    /// a letter, and `Esc` is the way out.
+    fn prompt_key(&mut self, key: event::KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => {
+                self.prompt = None;
+                self.should_quit = true;
+            }
+            KeyCode::Esc => self.prompt = None,
+            KeyCode::Enter => {
+                let last = self
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|p| p.active + 1 >= p.fields.len());
+                if last {
+                    self.submit_prompt();
+                } else if let Some(p) = self.prompt.as_mut() {
+                    p.active += 1;
+                }
+            }
+            KeyCode::Tab => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.active = (p.active + 1) % p.fields.len().max(1);
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.active = (p.active + p.fields.len().max(1) - 1) % p.fields.len().max(1);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = self.prompt.as_mut() {
+                    if let Some(field) = p.fields.get_mut(p.active) {
+                        field.value.pop();
+                    }
+                    p.error = None;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(p) = self.prompt.as_mut() {
+                    if let Some(field) = p.fields.get_mut(p.active) {
+                        field.value.push(c);
+                    }
+                    p.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Act on a completed prompt. A resolution failure stays in the form
+    /// as its error line (like the GUI dialog staying open); a success
+    /// closes it and hands the work to the service thread.
+    fn submit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        let fail = |prompt: &mut Prompt, e: String| prompt.error = Some(e);
+        match &prompt.kind {
+            PromptKind::NewProject => {
+                let name = prompt.field(0);
+                if name.is_empty() {
+                    let mut prompt = prompt;
+                    fail(&mut prompt, "type a project name".into());
+                    self.prompt = Some(prompt);
+                    return;
+                }
+                let _ = self.requests.send(Request::AddProject {
+                    name: name.to_string(),
+                });
+            }
+            PromptKind::ManualEntry => {
+                let tz = match snapshot_tz(&self.snapshot) {
+                    Ok(tz) => tz,
+                    Err(e) => {
+                        let mut prompt = prompt;
+                        fail(&mut prompt, e);
+                        self.prompt = Some(prompt);
+                        return;
+                    }
+                };
+                match resolve_manual_entry(
+                    prompt.field(0),
+                    prompt.field(1),
+                    prompt.field(2),
+                    now_ms(),
+                    &tz,
+                ) {
+                    Ok(entry) => {
+                        let Some(project) = prompt.project_id.clone() else {
+                            return;
+                        };
+                        let _ = self.requests.send(Request::AddEntry {
+                            project,
+                            description: entry.description,
+                            started_at: entry.started_at,
+                            ended_at: entry.ended_at,
+                        });
+                    }
+                    Err(e) => {
+                        let mut prompt = prompt;
+                        fail(&mut prompt, e);
+                        self.prompt = Some(prompt);
+                    }
+                }
+            }
+            PromptKind::ExportAnchor { scope } => {
+                let scope = *scope;
+                let tz = match snapshot_tz(&self.snapshot) {
+                    Ok(tz) => tz,
+                    Err(e) => {
+                        let mut prompt = prompt;
+                        fail(&mut prompt, e);
+                        self.prompt = Some(prompt);
+                        return;
+                    }
+                };
+                match resolve_export(prompt.field(0), scope, &tz) {
+                    Ok((anchor_ms, file)) => {
+                        let _ = self.requests.send(Request::Export {
+                            scope,
+                            anchor_ms,
+                            file,
+                        });
+                    }
+                    Err(e) => {
+                        let mut prompt = prompt;
+                        fail(&mut prompt, e);
+                        self.prompt = Some(prompt);
+                    }
+                }
+            }
+        }
     }
 
     /// Ask the service thread to undo the last quick add.
@@ -214,6 +593,12 @@ impl App {
     }
 
     fn on_key(&mut self, key: event::KeyEvent) {
+        // A prompt owns the keyboard while it is open (#106), ahead of
+        // even the delete confirmation: its keys are text.
+        if self.prompt.is_some() {
+            self.prompt_key(key);
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         // A pending confirmation listens only to its own answers: `d`
@@ -247,6 +632,17 @@ impl App {
 
             // --- method 2: a duration ending now ---
             KeyCode::Char('a') => self.add_duration(),
+
+            // --- method 1: a hand-entered interval (the form) ---
+            KeyCode::Char('e') => self.open_manual_entry(),
+
+            // --- a new project, so the TUI is usable from empty ---
+            KeyCode::Char('p') => self.prompt = Some(Prompt::new_project()),
+
+            // --- exports: chosen week/month via the anchor form, all now ---
+            KeyCode::Char('7') => self.open_export(timetrack_core::ExportScope::Week),
+            KeyCode::Char('8') => self.open_export(timetrack_core::ExportScope::Month),
+            KeyCode::Char('9') => self.export_all(),
 
             // --- undo: only ever the last quick add ---
             KeyCode::Char('u') => self.undo_quick_add(),
@@ -314,6 +710,21 @@ enum Request {
     QuickAdd { project: String, ms: i64 },
     /// Record a duration ending now.
     AddDuration { project: String, ms: i64 },
+    /// Record a hand-entered interval from the manual-entry form (#106).
+    AddEntry {
+        project: String,
+        description: String,
+        started_at: i64,
+        ended_at: i64,
+    },
+    /// Create a project (#106).
+    AddProject { name: String },
+    /// Export a period to `file` in the working directory (#106).
+    Export {
+        scope: timetrack_core::ExportScope,
+        anchor_ms: i64,
+        file: String,
+    },
     /// Undo the last quick add.
     UndoQuickAdd,
     /// Delete an entry.
@@ -329,6 +740,15 @@ enum Reply {
     QuickAdded(Box<EntryView>),
     /// A duration was recorded: here is the entry it made.
     DurationAdded(Box<EntryView>),
+    /// A hand-entered entry was recorded (#106).
+    EntryAdded(Box<EntryView>),
+    /// A project was created (#106).
+    ProjectAdded(Box<ProjectView>),
+    /// An export landed in `file` with `rows` entries (#106).
+    Exported { file: String, rows: usize },
+    /// An export itself worked but its file did not (#106): kept apart
+    /// from `ActionFailed` because the service is blameless here.
+    ExportFailed(String),
     /// A quick add was undone.
     Undone { id: String },
     /// An entry was deleted.
@@ -435,6 +855,52 @@ async fn service_loop(client: Client, requests: Receiver<Request>, replies: Send
                     }
                 }
             }
+            Some(Request::AddEntry {
+                project,
+                description,
+                started_at,
+                ended_at,
+            }) => match client
+                .add(&project, &description, started_at, ended_at)
+                .await
+            {
+                Ok(entry) => {
+                    let _ = replies.send(Reply::EntryAdded(Box::new(entry)));
+                }
+                Err(e) => {
+                    let _ = replies.send(Reply::ActionFailed(e));
+                }
+            },
+            Some(Request::AddProject { name }) => match client.add_project(&name).await {
+                Ok(project) => {
+                    let _ = replies.send(Reply::ProjectAdded(Box::new(project)));
+                }
+                Err(e) => {
+                    let _ = replies.send(Reply::ActionFailed(e));
+                }
+            },
+            Some(Request::Export {
+                scope,
+                anchor_ms,
+                file,
+            }) => match client.export_csv_at(scope.as_str(), anchor_ms).await {
+                Ok(csv) => {
+                    // Rows are the lines under the header.
+                    let rows = csv.lines().count().saturating_sub(1);
+                    match std::fs::write(&file, &csv) {
+                        Ok(()) => {
+                            let _ = replies.send(Reply::Exported { file, rows });
+                        }
+                        Err(e) => {
+                            let _ = replies
+                                .send(Reply::ExportFailed(format!("could not write {file}: {e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = replies.send(Reply::ActionFailed(e));
+                }
+            },
             Some(Request::UndoQuickAdd) => {
                 // The target is resolved here, not by the UI: a quick add
                 // that has not landed yet is still the one the user means to
@@ -612,12 +1078,18 @@ fn pending_answer(code: KeyCode, ctrl: bool) -> PendingAnswer {
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let area = f.area();
+    // An open prompt takes the footer's place and grows to its fields
+    // plus border and hint/error line; the week total stays topmost.
+    let footer_len = match &app.prompt {
+        Some(p) => p.fields.len() as u16 + 3,
+        None => 1,
+    };
     let chunks = Layout::vertical([
         Constraint::Length(5), // the week total -- the topmost element
         Constraint::Length(3), // quick-add row
         Constraint::Length(6), // this week, per project
         Constraint::Min(3),    // recent entries
-        Constraint::Length(1), // footer
+        Constraint::Length(footer_len),
     ])
     .split(area);
 
@@ -625,7 +1097,55 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_quick_add(f, chunks[1], app);
     draw_projects(f, chunks[2], app);
     draw_entries(f, chunks[3], app);
-    draw_footer(f, chunks[4], app);
+    match &app.prompt {
+        Some(prompt) => draw_prompt(f, chunks[4], prompt),
+        None => draw_footer(f, chunks[4], app),
+    }
+}
+
+/// The open prompt (#106): one line per field, the active one marked and
+/// tailed by a cursor bar, then the error that kept it open or the keys
+/// that move through it. Field values are sanitized for display (#101):
+/// they are typed text on its way to being stored text.
+fn draw_prompt(f: &mut ratatui::Frame, area: Rect, prompt: &Prompt) {
+    let mut lines: Vec<Line> = prompt
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let active = i == prompt.active;
+            let mut spans = vec![
+                Span::raw(if active { "▶ " } else { "  " }),
+                Span::styled(
+                    format!("{}: ", field.label),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(timetrack_core::sanitize_display(&field.value)),
+            ];
+            if active {
+                spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    match &prompt.error {
+        Some(e) => lines.push(Line::from(Span::styled(
+            timetrack_core::sanitize_display(e),
+            Style::default().fg(Color::Red),
+        ))),
+        None => lines.push(Line::from(Span::styled(
+            "tab next field · enter done · esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(timetrack_core::sanitize_display(&prompt.title)),
+        ),
+        area,
+    );
 }
 
 /// The week total, in the largest type the terminal can give us.
@@ -829,7 +1349,7 @@ fn draw_entries(f: &mut ratatui::Frame, area: Rect, app: &App) {
 /// user has to discover by pressing `u` and being refused, and a rule they
 /// can read.
 fn footer_hint() -> &'static str {
-    "1-4 quick add  a 30m  u undo quick add  d delete  j/k move  h/l project  q quit"
+    "1-4 quick add  a 30m  e new entry  p new project  7/8/9 export  u undo quick add  d delete  j/k move  h/l project  q quit"
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -1220,6 +1740,150 @@ mod tests {
                 assert_eq!(ms, QUICK_ADD_MS[0]);
             }
             other => panic!("expected a quick add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_entry_resolves_in_the_services_zone() {
+        // #106: the form speaks the shared spellings, in the zone the
+        // service named (#102) — Rome wall clocks on a known day.
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        let now = timetrack_core::parse_anchor_day("2026-10-08", "anchor", &rome).unwrap();
+        let got = resolve_manual_entry("09:00", "10:30", "review", now, &rome).unwrap();
+        assert_eq!(got.ended_at - got.started_at, 90 * 60_000);
+        assert_eq!(
+            timetrack_core::format_local_hm(got.started_at, &rome),
+            "09:00"
+        );
+        assert_eq!(got.description, "review");
+        // Empty end means now; a relative start measures from it.
+        let got = resolve_manual_entry("-45", "", "", now, &rome).unwrap();
+        assert_eq!(got.ended_at, now);
+        assert_eq!(got.ended_at - got.started_at, 45 * 60_000);
+        // Backwards and unparseable are form errors, not service calls.
+        assert!(resolve_manual_entry("10:30", "09:00", "", now, &rome).is_err());
+        assert!(resolve_manual_entry("25:99", "", "", now, &rome).is_err());
+        assert!(resolve_manual_entry("", "", "", now, &rome).is_err());
+    }
+
+    #[test]
+    fn export_resolution_names_the_periods_file() {
+        // #106: the anchor day picks the period; the file name comes
+        // from the core's one table, like the GUI's.
+        let utc = timetrack_core::Tz::utc();
+        let (anchor, file) =
+            resolve_export("2026-10-08", timetrack_core::ExportScope::Week, &utc).unwrap();
+        assert_eq!(file, "timetrack-export-week-2026-W41.csv");
+        assert_eq!(
+            anchor,
+            timetrack_core::parse_anchor_day("2026-10-08", "anchor day", &utc).unwrap()
+        );
+        assert!(resolve_export("2026-02-31", timetrack_core::ExportScope::Month, &utc).is_err());
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    fn app_with_project() -> (App, Receiver<Request>) {
+        let (mut app, requests) = app();
+        app.snapshot = Snapshot {
+            projects: vec![project("p1", "Work", false)],
+            tz: "UTC".into(),
+            ..Default::default()
+        };
+        (app, requests)
+    }
+
+    #[test]
+    fn p_creates_a_project_and_the_picker_follows_it() {
+        // #106: `p` + a name makes the project through the service
+        // thread, and the next snapshot lands the cursor on it.
+        let (mut app, requests) = app_with_project();
+        app.on_key(key(KeyCode::Char('p')));
+        type_text(&mut app, "Ops");
+        app.on_key(key(KeyCode::Enter));
+        match requests.try_recv().expect("a request") {
+            Request::AddProject { name } => assert_eq!(name, "Ops"),
+            other => panic!("expected AddProject, got {other:?}"),
+        }
+        app.apply(Reply::ProjectAdded(Box::new(project("p2", "Ops", false))));
+        app.apply(Reply::Snapshot(Box::new(Snapshot {
+            projects: vec![project("p1", "Work", false), project("p2", "Ops", false)],
+            ..Default::default()
+        })));
+        assert_eq!(app.current_project().map(|p| p.id.as_str()), Some("p2"));
+        assert_eq!(app.status.as_deref(), Some("created project Ops"));
+    }
+
+    #[test]
+    fn e_records_a_manual_entry_and_commands_do_not_fire_while_typing() {
+        // The prompt owns the keyboard: `q` inside it is a letter, and
+        // Enter walks the fields before submitting exactly one entry.
+        let (mut app, requests) = app_with_project();
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.prompt.is_some());
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit, "q is text inside a prompt");
+        // The `q` landed in the start field ("-30q"); remove it again.
+        app.on_key(key(KeyCode::Backspace));
+        app.on_key(key(KeyCode::Enter)); // -> end (empty = now)
+        app.on_key(key(KeyCode::Enter)); // -> description
+        type_text(&mut app, "sync");
+        app.on_key(key(KeyCode::Enter)); // submit
+        match requests.try_recv().expect("a request") {
+            Request::AddEntry {
+                project,
+                description,
+                started_at,
+                ended_at,
+            } => {
+                assert_eq!(project, "p1");
+                assert_eq!(description, "sync");
+                assert_eq!(ended_at - started_at, 30 * 60_000);
+            }
+            other => panic!("expected AddEntry, got {other:?}"),
+        }
+        assert!(app.prompt.is_none(), "a submitted form closes");
+    }
+
+    #[test]
+    fn a_bad_time_keeps_the_form_open_with_its_error() {
+        let (mut app, requests) = app_with_project();
+        app.on_key(key(KeyCode::Char('e')));
+        type_text(&mut app, "x");
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Enter));
+        let prompt = app.prompt.as_ref().expect("the form stays open");
+        assert!(prompt.error.is_some(), "with the parse error shown");
+        assert!(requests.try_recv().is_err(), "nothing was sent");
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.prompt.is_none(), "esc leaves");
+    }
+
+    #[test]
+    fn seven_asks_for_the_week_and_nine_exports_everything_now() {
+        let (mut app, requests) = app_with_project();
+        app.on_key(key(KeyCode::Char('9')));
+        match requests.try_recv().expect("a request") {
+            Request::Export { scope, file, .. } => {
+                assert_eq!(scope, timetrack_core::ExportScope::All);
+                assert_eq!(file, "timetrack-export-all.csv");
+            }
+            other => panic!("expected Export, got {other:?}"),
+        }
+        app.on_key(key(KeyCode::Char('7')));
+        assert!(app.prompt.is_some(), "the week needs its anchor day");
+        app.on_key(key(KeyCode::Enter)); // accept today's prefill
+        match requests.try_recv().expect("a request") {
+            Request::Export { scope, file, .. } => {
+                assert_eq!(scope, timetrack_core::ExportScope::Week);
+                assert!(file.starts_with("timetrack-export-week-"), "{file}");
+            }
+            other => panic!("expected Export, got {other:?}"),
         }
     }
 
