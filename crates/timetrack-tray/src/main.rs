@@ -278,10 +278,28 @@ mod tests {
         ConnState, MenuModel, TimetrackTray, TooltipState, build_menu_model, conn_state,
         quick_add_label, report_action, tooltip_text,
     };
+    use crate::state::no_watcher_notice;
     use ksni::Tray as _;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use timetrack_proto::{ClientError, ProjectView, ServiceError, Snapshot};
+
+    #[test]
+    fn the_no_watcher_notice_names_the_working_quick_add_paths() {
+        // #105: a tray that cannot appear must not be a silent dead
+        // surface — its one notice has to say both that it cannot show
+        // and where quick-add lives instead.
+        let (summary, body) = no_watcher_notice();
+        assert!(summary.contains("cannot appear"), "summary: {summary}");
+        for path in [
+            "right-click the TimeTrack launcher",
+            "keys 1-4",
+            "timetrack quick -m 15",
+            "AppIndicator extension",
+        ] {
+            assert!(body.contains(path), "body must name {path:?}: {body}");
+        }
+    }
 
     fn tray() -> TimetrackTray {
         TimetrackTray::new(

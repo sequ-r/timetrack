@@ -106,6 +106,20 @@ pub(crate) enum ConnState {
     Transport,
 }
 
+/// What the user is told when the tray has nowhere to appear (#105).
+///
+/// The tray keeps running — a watcher can appear later, and ksni
+/// re-registers when it does — but running *silently* invisible would
+/// read exactly like quick-add being broken. This is the notification
+/// (and log line) that says where quick-add lives on such a desktop
+/// instead, in the same terms the README uses.
+pub(crate) fn no_watcher_notice() -> (&'static str, &'static str) {
+    (
+        "The TimeTrack tray cannot appear on this desktop",
+        "No status-notifier watcher is running. Quick-add instead: right-click the TimeTrack launcher for +5/+15/+30/+60, use keys 1-4 in the app, or run `timetrack quick -m 15`. For the tray on GNOME, install an AppIndicator extension.",
+    )
+}
+
 pub(crate) fn conn_state(result: &Result<Snapshot, ClientError>) -> ConnState {
     match result {
         Ok(_) => ConnState::Ready,

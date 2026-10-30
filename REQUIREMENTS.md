@@ -435,6 +435,7 @@ specification and the implementation do not quietly diverge.
 | §5 Shorten never deletes | `rules.rs::set_times` | service test |
 | §5 Undo refuses a non-quick-add | `rules.rs` + service | e2e and unit tests |
 | §6 Quick-add 5/15/30/60, own entry each | `rules.rs::quick_add` | e2e |
+| §6/#105 Quick-add reachable per desktop | ADR 0011: tray bundled in AppImage for watcher desktops, launcher quick-add actions + `quick --notify` on stock GNOME, watcherless tray notice | CLI notification unit test, tray notice unit test, AppImage contents check |
 | §7 Timer cut; no `running` anywhere | whole tree | a test asserts no `running` field exists |
 | §8 Split and merge | core + service D-Bus, GUI `s`/`m`, CLI `split`/`merge` | unit tests + e2e + gui-smoke |
 | §8 Split/merge confirmation stating the shrink | shared `merge_shrink_ms`/`format_merge_delta` in `rules.rs`; GUI confirm banner, CLI prompt/`--yes` | core/GUI/CLI tests + e2e (touching + overlap merges, 5 refusal guards) |

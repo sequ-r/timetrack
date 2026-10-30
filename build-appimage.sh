@@ -4,9 +4,10 @@
 #   ./build-appimage.sh
 #
 # Produces TimeTrack-<arch>.AppImage: one portable file bundling
-# timetrack-gui, timetrack-service and the timetrack CLI. It needs no
-# install -- its AppRun starts the bundled service in the background,
-# then the GUI (or the CLI, when invoked as `timetrack` or with `cli`).
+# timetrack-gui, timetrack-service, the timetrack CLI and timetrack-tray.
+# It needs no install -- its AppRun starts the bundled service in the
+# background, then the GUI (or the CLI / tray, when invoked as
+# `timetrack` / `timetrack-tray` or with `cli` / `tray`).
 #
 # Uses linuxdeploy (library bundling) and appimagetool (image assembly),
 # fetched on demand from their continuous releases. Both run with
@@ -47,7 +48,7 @@ for pair in "$LINUXDEPLOY $LINUXDEPLOY_URL" "$APPIMAGETOOL $APPIMAGETOOL_URL"; d
     fi
 done
 
-cargo build --release --locked --package timetrack-gui --package timetrack-service --package timetrack-cli
+cargo build --release --locked --package timetrack-gui --package timetrack-service --package timetrack-cli --package timetrack-tray
 
 rm -rf AppDir
 mkdir -p AppDir/usr/bin \
@@ -59,7 +60,15 @@ mkdir -p AppDir/usr/bin \
 install -m0755 target/release/timetrack-gui AppDir/usr/bin/timetrack-gui
 install -m0755 target/release/timetrack-service AppDir/usr/bin/timetrack-service
 install -m0755 target/release/timetrack AppDir/usr/bin/timetrack
+install -m0755 target/release/timetrack-tray AppDir/usr/bin/timetrack-tray
 install -m0644 data/org.sequ.timetrack.desktop AppDir/usr/share/applications/
+# The tray's launcher, rewritten for the image: its host form starts a
+# host `timetrack-tray` binary, while inside the AppImage the tray is an
+# AppRun mode of the image itself (#105).
+sed 's/^Exec=timetrack-tray$/Exec=timetrack-gui tray/' \
+    data/org.sequ.timetrack.tray.desktop \
+    > AppDir/usr/share/applications/org.sequ.timetrack.tray.desktop
+chmod 0644 AppDir/usr/share/applications/org.sequ.timetrack.tray.desktop
 install -m0644 data/org.sequ.timetrack.metainfo.xml AppDir/usr/share/metainfo/
 install -m0644 data/icons/hicolor/scalable/apps/org.sequ.timetrack.svg \
     AppDir/usr/share/icons/hicolor/scalable/apps/
@@ -72,6 +81,7 @@ install -m0644 data/icons/hicolor/symbolic/apps/org.sequ.timetrack-symbolic.svg 
     -e AppDir/usr/bin/timetrack-gui \
     -e AppDir/usr/bin/timetrack-service \
     -e AppDir/usr/bin/timetrack \
+    -e AppDir/usr/bin/timetrack-tray \
     -d AppDir/usr/share/applications/org.sequ.timetrack.desktop \
     -i AppDir/usr/share/icons/hicolor/scalable/apps/org.sequ.timetrack.svg
 
@@ -101,11 +111,20 @@ case "$(basename "$0")" in
         start_service
         exec "$HERE/usr/bin/timetrack" "$@"
         ;;
+    timetrack-tray)
+        start_service
+        exec "$HERE/usr/bin/timetrack-tray" "$@"
+        ;;
 esac
 if [ "${1:-}" = "cli" ]; then
     shift
     start_service
     exec "$HERE/usr/bin/timetrack" "$@"
+fi
+if [ "${1:-}" = "tray" ]; then
+    shift
+    start_service
+    exec "$HERE/usr/bin/timetrack-tray" "$@"
 fi
 start_service
 exec "$HERE/AppRun.wrapped" "$@"

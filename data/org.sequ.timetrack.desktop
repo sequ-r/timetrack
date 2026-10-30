@@ -9,3 +9,25 @@ Type=Application
 Categories=Utility;
 Keywords=time;track;todo;productivity;
 StartupNotify=true
+Actions=Add5;Add15;Add30;Add60;
+
+# Quick-add from the launcher (#105): the stock-GNOME path, where there is
+# no tray watcher for the tray menu to live in. Each action runs the
+# bundled CLI against the first active project (the CLI's own default)
+# and confirms with a desktop notification naming that project.
+
+[Desktop Action Add5]
+Name=Add 5 minutes
+Exec=timetrack-gui cli quick -m 5 --notify
+
+[Desktop Action Add15]
+Name=Add 15 minutes
+Exec=timetrack-gui cli quick -m 15 --notify
+
+[Desktop Action Add30]
+Name=Add 30 minutes
+Exec=timetrack-gui cli quick -m 30 --notify
+
+[Desktop Action Add60]
+Name=Add 60 minutes
+Exec=timetrack-gui cli quick -m 60 --notify
