@@ -14,9 +14,22 @@ use super::super::chrome::{maximize_glyph, titlebar_drag, window_button};
 use super::super::tabs::Tab;
 use super::super::theme;
 use gpui::prelude::*;
-use gpui::{ElementId, IntoElement, Window, WindowControlArea, div, rgb, rgba};
+use gpui::{ElementId, IntoElement, Window, WindowControlArea, div, rgba};
 
 impl TimetrackView {
+    /// The pre-snapshot placeholder every tab shows instead of data:
+    /// until the first snapshot (or the first connection error) the
+    /// view holds an empty default, and drawing it would claim the
+    /// store is empty when nothing has been heard at all.
+    pub(crate) fn render_connecting(&self) -> impl IntoElement {
+        div()
+            .flex_1()
+            .px_6()
+            .pt_6()
+            .text_color(rgba(theme::HINT_TEXT))
+            .child("Connecting to service…")
+    }
+
     /// The integrated titlebar: the window has no system title bar (see
     /// `main.rs`), so this row is the drag handle, the tab strip and the
     /// minimize/maximize/close buttons in one.
@@ -49,10 +62,10 @@ impl TimetrackView {
                     .bg(if is_selected {
                         rgba(theme::RAISED_BG)
                     } else {
-                        rgba(0x00000000)
+                        rgba(theme::TRANSPARENT)
                     })
                     .text_color(if is_selected {
-                        rgb(0xffffff)
+                        rgba(theme::SELECTED_TEXT)
                     } else {
                         rgba(theme::MUTED_TEXT)
                     })
@@ -123,7 +136,7 @@ impl TimetrackView {
                         .rounded_md()
                         .cursor_pointer()
                         .bg(rgba(theme::ACTION))
-                        .text_color(rgb(0xffffff))
+                        .text_color(rgba(theme::SELECTED_TEXT))
                         .on_click(move |_ev, _window, cx| {
                             this.update(cx, |view, cx| {
                                 view.try_start_service();

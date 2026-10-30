@@ -44,7 +44,8 @@ pub(super) enum Msg {
     },
     /// An action succeeded. Snapshots never clear feedback (they follow
     /// every action and would make errors unreadable), so success arrives as
-    /// its own message that dismisses the previous error.
+    /// its own message: the view speaks the sentence it queued when the
+    /// action was sent, replacing the previous error.
     ActionOk,
     /// The update check found a newer release with this machine's AppImage
     /// asset. The view announces it; nothing downloads until the user

@@ -189,6 +189,19 @@ impl EntryDialog {
         self.reset_caret();
     }
 
+    /// Focus `field` directly: the mouse route to the same place Tab
+    /// goes, seating the caret at that field's end like `next_field`.
+    /// The project field exists only in edit mode, so asking for it in
+    /// a new-entry dialog leaves focus where it is rather than
+    /// stranding it on a field that is never drawn.
+    pub(crate) fn focus_field(&mut self, field: DialogField) {
+        if field == DialogField::Project && self.edit_id.is_none() {
+            return;
+        }
+        self.field = field;
+        self.reset_caret();
+    }
+
     /// Shift-Tab to the previous field, skipping like `next_field`.
     pub(crate) fn prev_field(&mut self) {
         self.field = self.field.prev();
@@ -471,6 +484,26 @@ mod tests {
         assert_eq!(dlg.field, DialogField::Project);
         dlg.prev_field();
         assert_eq!(dlg.field, DialogField::Description);
+    }
+
+    #[test]
+    fn clicking_a_field_focuses_it_and_seats_the_caret_at_its_end() {
+        // The click-to-focus route (render/prompts.rs `field_row`) lands
+        // here: a mouse user must be able to reach Start/End without
+        // Tabbing through Description first, and typing must then land
+        // at the end of the field they clicked, like Tab does.
+        let mut dlg = new_dialog();
+        dlg.focus_field(DialogField::End);
+        assert_eq!(dlg.field, DialogField::End);
+        assert_eq!(dlg.caret.pos, dlg.end.len());
+        // A new entry has no project field to click: asking for it must
+        // not strand focus on a field that is never drawn.
+        dlg.focus_field(DialogField::Project);
+        assert_eq!(dlg.field, DialogField::End);
+        // In edit mode the project field is drawn, so it is focusable.
+        let mut dlg = edit_dialog("kept", 0, 3_600_000);
+        dlg.focus_field(DialogField::Project);
+        assert_eq!(dlg.field, DialogField::Project);
     }
 
     #[test]
