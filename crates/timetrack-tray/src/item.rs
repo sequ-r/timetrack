@@ -320,6 +320,31 @@ impl TimetrackTray {
 }
 
 impl ksni::Tray for TimetrackTray {
+    /// No watcher, no icon (#105) — but not silently: log it and post the
+    /// one notification that names the quick-add paths this desktop
+    /// *does* have. Returns `true` (stay alive): a watcher can appear
+    /// later — the user enables an extension, the shell restarts — and
+    /// ksni re-registers then, calling `watcher_online`. The callback is
+    /// synchronous, so the notification goes out on a worker thread like
+    /// every other bus call from this item.
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        let (summary, body) = crate::state::no_watcher_notice();
+        eprintln!("timetrack-tray: {summary} ({reason:?}). {body}");
+        std::thread::spawn(move || {
+            async_io::block_on(async {
+                // Best effort: a desktop with no watcher may also have
+                // no notification daemon, and the log line above is then
+                // the record. Nothing depends on this landing.
+                let _ = timetrack_proto::desktop_notify(summary, body).await;
+            });
+        });
+        true
+    }
+
+    fn watcher_online(&self) {
+        println!("timetrack-tray: a status-notifier watcher appeared; the tray can show");
+    }
+
     fn id(&self) -> String {
         "org.sequ.timetrack.tray".into()
     }

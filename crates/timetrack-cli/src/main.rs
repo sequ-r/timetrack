@@ -117,6 +117,11 @@ enum Command {
         /// One of 5, 15, 30 or 60.
         #[arg(short, long)]
         minutes: i64,
+        /// Confirm with a desktop notification as well as stdout. For
+        /// launcher actions and keyboard shortcuts (#105), where stdout
+        /// goes nowhere a person can see.
+        #[arg(long)]
+        notify: bool,
     },
 
     // --- the three ways time comes back off ---
@@ -306,6 +311,21 @@ fn validate_project_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// What `--notify` announces after a quick add (#105): the confirmation
+/// a launcher action or keyboard shortcut has no stdout for. The project
+/// is named because the default (first active project) is exactly what a
+/// user firing a blind shortcut cannot otherwise see was chosen.
+fn quick_add_notification(project_name: &str, duration_ms: i64, id: &str) -> (String, String) {
+    (
+        format!(
+            "Added {} to {}",
+            timetrack_core::format_compact(duration_ms),
+            project_name
+        ),
+        format!("Undo with: timetrack undo {id}"),
+    )
+}
+
 /// The quick-add bucket for `minutes`, in milliseconds.
 ///
 /// Checked (#98): the multiplication used to run before the bucket
@@ -381,7 +401,11 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             );
         }
 
-        Command::Quick { project, minutes } => {
+        Command::Quick {
+            project,
+            minutes,
+            notify,
+        } => {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
             let ms = quick_add_ms(minutes).ok_or_else(|| {
@@ -400,6 +424,21 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 e.id,
                 e.id
             );
+            if notify {
+                // Best effort (#105): the time is recorded either way, so
+                // a missing notification daemon is a note on stderr, not
+                // a failed quick-add.
+                let project_name = snap
+                    .projects
+                    .iter()
+                    .find(|p| p.id == project)
+                    .map(|p| disp(&p.name))
+                    .unwrap_or_else(|| project.clone());
+                let (summary, body) = quick_add_notification(&project_name, e.duration_ms(), &e.id);
+                if let Err(err) = timetrack_proto::desktop_notify(&summary, &body).await {
+                    eprintln!("could not show a notification: {err}");
+                }
+            }
         }
 
         Command::Shorten { id, start, end } => {
@@ -879,6 +918,15 @@ mod tests {
         let text = explain(err).to_string();
         assert_eq!(text, "a project named 'Evil  [2J' already exists");
         assert!(!text.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn the_quick_add_notification_names_project_duration_and_undo() {
+        // #105: a launcher action has no stdout, so the notification is
+        // the only proof of what landed where.
+        let (summary, body) = quick_add_notification("Work", 15 * 60_000, "e7");
+        assert_eq!(summary, "Added 15m to Work");
+        assert_eq!(body, "Undo with: timetrack undo e7");
     }
 
     #[test]

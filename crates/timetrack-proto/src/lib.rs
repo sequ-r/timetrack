@@ -329,6 +329,53 @@ pub fn no_service_hint() -> String {
     "the timetrack service is not running. Launch the TimeTrack AppImage (it starts its bundled service), then retry".to_string()
 }
 
+/// Post a desktop notification (`org.freedesktop.Notifications`), best
+/// effort by contract: callers use it to confirm work that has already
+/// happened (a launcher quick-add, a tray that cannot appear), so a
+/// missing notification daemon must surface as an error the caller can
+/// log and drop — never as a reason to undo or fail the work itself.
+/// Shared here, with the other client-facing bus helpers, so the CLI and
+/// the tray speak to the notification server one way (#105).
+pub async fn desktop_notify(summary: &str, body: &str) -> Result<(), ClientError> {
+    // Not `ClientError::from_bus`: that mapping reads `ServiceUnknown`
+    // as "the timetrack service is not running", which here would blame
+    // the wrong service — it is the notification daemon that is absent.
+    let unavailable =
+        |e: zbus::Error| ClientError::Transport(format!("notification server unavailable: {e}"));
+    let conn = zbus::connection::Builder::session()
+        .map_err(unavailable)?
+        .build()
+        .await
+        .map_err(unavailable)?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+    )
+    .await
+    .map_err(unavailable)?;
+    let hints: std::collections::HashMap<String, zbus::zvariant::Value<'_>> =
+        std::collections::HashMap::new();
+    proxy
+        .call_method(
+            "Notify",
+            &(
+                "TimeTrack",
+                0u32,
+                "org.sequ.timetrack",
+                summary,
+                body,
+                Vec::<String>::new(),
+                hints,
+                -1i32,
+            ),
+        )
+        .await
+        .map_err(unavailable)?;
+    Ok(())
+}
+
 /// The version-skew guidance, shared by the GUI footer and the tray
 /// tooltip. Names the client (`GUI`, `tray`, ...) so each client states who
 /// disagrees with the service. Shown for [`ClientError::VersionMismatch`].

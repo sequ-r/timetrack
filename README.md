@@ -17,7 +17,7 @@ the terminal never loses anything, and both can be open at once.
 ## Architecture
 
 ```
-  timetrack-gui (AppImage)          timetrack (CLI, in the AppImage)        timetrack-tray (host only)
+  timetrack-gui (AppImage)          timetrack (CLI, in the AppImage)        timetrack-tray (in the AppImage)
   gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands     SNI item: week-total tooltip,
                                                                             per-project quick-add/undo/delete
         |                                  |                                   |
@@ -56,7 +56,7 @@ about where a week starts.
 | Projects | create, rename, archive, unarchive, recolour and delete (GUI `c`/`D` or the Projects rows' buttons; entries move projects from the edit dialog); archiving keeps the history in totals |
 | Persistence | atomic writes; survives restart; corrupt or newer stores are refused, never silently reset |
 | CSV export | current or chosen week/month (`--at YYYY-MM-DD`, default now) or all time; the CLI prints or writes a file, the GUI Export tab saves through the system dialog with period-stamped names |
-| System tray | week-total tooltip with over-24h attention state, per-project quick-add / undo / delete-confirm, Open TimeTrack, Quit (host only) |
+| System tray | week-total tooltip with over-24h attention state, per-project quick-add / undo / delete-confirm, Open TimeTrack, Quit |
 
 The GUI Export tab picks the period with a previous/next stepper (labelled
 `2026-W41` / `2026-09`) plus a typed `YYYY-MM-DD` day, shows a preview of
@@ -149,7 +149,7 @@ install and no D-Bus activation file to write:
 ```sh
 ./TimeTrack-x86_64.AppImage          # desktop GUI (starts the service too)
 ./TimeTrack-x86_64.AppImage cli      # terminal client, same image
-timetrack-tray &                     # system tray (host only)
+./TimeTrack-x86_64.AppImage tray &   # system tray, same image
 ```
 
 For a bare `timetrack` on `PATH`, symlink it to the image — AppRun notices
@@ -193,11 +193,22 @@ MATE provide one; on GNOME install a tray extension first, or the icon has
 nowhere to appear. It runs on the host (never sandboxed), next to the
 service.
 
-### The tray has to be installed once
+### Running the tray
 
-Same pattern as the service: a binary in `~/.local/bin`, the desktop file
-in `~/.local/share/applications`, and a copy of it in `~/.config/autostart`
-so it starts at login:
+The tray ships inside the AppImage. Start it like the CLI — after adding it
+to your desktop's startup applications if you want it at login (the image
+itself writes no autostart file for you):
+
+```sh
+./TimeTrack-x86_64.AppImage tray &
+# or symlink it like the CLI, and run the bare name:
+ln -s /path/to/TimeTrack-x86_64.AppImage ~/.local/bin/timetrack-tray
+timetrack-tray &
+```
+
+From a host build it installs the same way as before — a binary in
+`~/.local/bin`, the desktop file in `~/.local/share/applications`, and a
+copy in `~/.config/autostart`:
 
 ```sh
 install -Dm755 target/release/timetrack-tray ~/.local/bin/timetrack-tray
@@ -207,19 +218,27 @@ install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.config/autostart/org.sequ
 
 Bus-name ownership is unchanged by all of this: the tray connects anonymously
 and never owns `org.sequ.timetrack`, so it can neither steal the service's
-name nor keep a stale service alive — it only reads. The AppImage ships no
-tray in v1 (it bundles the GUI, the service and the CLI); the tray is
-host-only until it is decided whether it belongs in the image.
+name nor keep a stale service alive — it only reads.
 
-### Tray on GNOME, and why the AppImage ships none
+### Quick-add without a tray (stock GNOME)
 
-GNOME Shell provides no StatusNotifier watcher, so the tray icon has nowhere
-to appear there unless a tray extension (e.g. an AppIndicator extension)
-registers one. KDE, XFCE and MATE ship a watcher, and the icon shows as-is.
+GNOME Shell provides no StatusNotifier watcher, so on stock GNOME the tray
+icon has nowhere to appear. The tray does not sit there silently: it logs
+why, posts one desktop notification saying so, and keeps waiting in case a
+watcher shows up (an AppIndicator extension provides one, and the icon then
+appears without restarting anything). Quick-add itself does not need the
+tray on GNOME:
 
-The tray is host-only in v1, deliberately: it runs on the host next to the
-service and is installed with the autostart file below. Until it is decided
-whether the tray belongs inside the AppImage, run it from a host build.
+- **Launcher actions:** right-click the TimeTrack icon in the dash or app
+  grid and pick *Add 5/15/30/60 minutes*. Time lands on your first active
+  project and a notification confirms how much and where.
+- **In the app:** keys `1`-`4` on the Home tab add a bucket to the selected
+  project.
+- **A global shortcut you bind yourself:** in GNOME Settings → Keyboard →
+  Custom Shortcuts, bind a key to
+  `/path/to/TimeTrack-x86_64.AppImage cli quick -m 15 --notify` (add
+  `-p Work` to pin a project). That is a one-keystroke quick-add from any
+  app, no extension involved.
 
 ### The service needs no install
 
@@ -303,7 +322,7 @@ accident.
 ## AppImage
 
 TimeTrack ships as a single portable file bundling `timetrack-gui`,
-`timetrack-service` and the `timetrack` CLI, built with linuxdeploy +
+`timetrack-service`, the `timetrack` CLI and `timetrack-tray`, built with linuxdeploy +
 appimagetool (fetched on demand). It needs no install and no service
 setup: its AppRun starts the bundled service in the background, then the
 GUI — or the CLI, when the image is invoked as `timetrack` (a symlink) or
@@ -359,15 +378,11 @@ instead (~10 MB) and needs neither.
 The things below are open, known, and not worked around. Everything else in
 this README works today.
 
-**The tray icon does not appear on GNOME.** GNOME Shell ships no
-StatusNotifierItem watcher, so the icon has nowhere to go. Install a tray
-extension (an AppIndicator one is the usual choice) or use the desktop
-client. See "Tray on GNOME" above.
-
-**The tray is not in the AppImage.** It is host-only for now: the image
-bundles the GUI, the service and the CLI, and the tray is installed
-separately with its autostart file. See "The tray has to be installed once"
-above.
+**The tray icon does not appear on stock GNOME.** GNOME Shell ships no
+StatusNotifierItem watcher, so the icon has nowhere to go; the tray says
+so in a notification rather than running invisibly. Quick-add on GNOME is
+the launcher's right-click actions (or a tray extension restores the
+icon). See "Quick-add without a tray (stock GNOME)" above.
 
 **A corrupt or newer store is refused, not repaired.** The service will
 not start rather than start empty, because starting empty would look like
