@@ -26,7 +26,10 @@ APPIMAGE="TimeTrack-$ARCH.AppImage"
 LINUXDEPLOY="linuxdeploy-$ARCH.AppImage"
 APPIMAGETOOL="appimagetool-$ARCH.AppImage"
 LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/$LINUXDEPLOY"
-APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/$APPIMAGETOOL"
+# appimagetool is pinned: its `continuous` build changed validation on
+# 2026-10-29 and silently broke every release (#135). Bumping the tool is
+# a deliberate edit here, verified by a release dry-run.
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/$APPIMAGETOOL"
 
 # Update information, embedded by appimagetool (`-u` below). It tells
 # AppImageUpdate where to look: the latest GitHub release's zsync file for
@@ -55,6 +58,7 @@ mkdir -p AppDir/usr/bin \
     AppDir/usr/share/applications \
     AppDir/usr/share/metainfo \
     AppDir/usr/share/icons/hicolor/scalable/apps \
+    AppDir/usr/share/icons/hicolor/256x256/apps \
     AppDir/usr/share/icons/hicolor/symbolic/apps
 
 install -m0755 target/release/timetrack-gui AppDir/usr/bin/timetrack-gui
@@ -72,6 +76,10 @@ chmod 0644 AppDir/usr/share/applications/org.sequ.timetrack.tray.desktop
 install -m0644 data/org.sequ.timetrack.metainfo.xml AppDir/usr/share/metainfo/
 install -m0644 data/icons/hicolor/scalable/apps/org.sequ.timetrack.svg \
     AppDir/usr/share/icons/hicolor/scalable/apps/
+# The PNG is what makes `.DirIcon` a regular file: appimagetool rejects
+# an image whose only icon is SVG (#135).
+install -m0644 data/icons/hicolor/256x256/apps/org.sequ.timetrack.png \
+    AppDir/usr/share/icons/hicolor/256x256/apps/
 install -m0644 data/icons/hicolor/symbolic/apps/org.sequ.timetrack-symbolic.svg \
     AppDir/usr/share/icons/hicolor/symbolic/apps/
 
@@ -83,7 +91,13 @@ install -m0644 data/icons/hicolor/symbolic/apps/org.sequ.timetrack-symbolic.svg 
     -e AppDir/usr/bin/timetrack \
     -e AppDir/usr/bin/timetrack-tray \
     -d AppDir/usr/share/applications/org.sequ.timetrack.desktop \
-    -i AppDir/usr/share/icons/hicolor/scalable/apps/org.sequ.timetrack.svg
+    -i AppDir/usr/share/icons/hicolor/scalable/apps/org.sequ.timetrack.svg \
+    -i AppDir/usr/share/icons/hicolor/256x256/apps/org.sequ.timetrack.png
+
+# linuxdeploy leaves `.DirIcon` as a symlink to the SVG; appimagetool
+# wants a regular PNG file there. Replace it outright (#135).
+rm -f AppDir/.DirIcon
+install -m0644 data/icons/hicolor/256x256/apps/org.sequ.timetrack.png AppDir/.DirIcon
 
 # Wrap the generated AppRun so the bundled service starts with the app, and
 # so the image also serves the terminal client. The service owns the store
