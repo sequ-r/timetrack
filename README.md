@@ -21,7 +21,7 @@ the terminal never loses anything, and both can be open at once.
   gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands     SNI item: week-total tooltip,
                                                                             per-project quick-add/undo/delete
         |                                  |                                   |
-        +--------- D-Bus: org.sequ.timetrack.Entries ----+
+        +--- D-Bus: org.sequ.timetrack.Entries2 (typed) --+
                            |
               timetrack-service  (started by the AppImage)
               owns the store; does all aggregation
@@ -466,7 +466,9 @@ was never stored.
 
 The service stores the model with no `running` concept and no
 start/stop/cancel methods or `AlreadyRunning` / `NotRunning` errors: the
-interface is `org.sequ.timetrack.Entries`, with D-Bus methods for entry
+interfaces are `org.sequ.timetrack.Entries2` (typed structs and named
+errors) and the legacy JSON `org.sequ.timetrack.Entries` it supersedes,
+dual-served through the transition (ADR 0012), with D-Bus methods for entry
 CRUD, projects and split/merge. `Snapshot` carries the week, month and
 all-time aggregates plus the over-24h day list, so both UIs read the
 same totals. Two details worth knowing: a genuinely empty store seeds

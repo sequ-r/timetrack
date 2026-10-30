@@ -11,23 +11,27 @@
 //! clients: the GPUI GUI and the ratatui CLI, which means tracked data
 //! outlives either one.
 //!
-//! # Why the payloads are JSON strings
+//! # Two interfaces, one core
 //!
-//! Every method takes and returns a single `s` holding JSON. A hand-written
-//! D-Bus signature per call would mean two definitions of every type -- one in
-//! the interface, one in the client -- and they would drift. With JSON the
-//! serde structs in `timetrack-proto` are the single definition, so adding a
-//! field to `Snapshot` is not a signature change.
+//! The same object serves the original JSON-in-string interface and
+//! the typed `Entries2` (#110, ADR 0012), both over the one
+//! `EntryService`. The legacy surface exists so older clients keep
+//! working through the transition; its retirement is #129.
 
 mod interface;
 
 use interface::EntryService;
+use std::sync::Arc;
 use timetrack_core::JsonStore;
-use timetrack_proto::{BUS_NAME, OBJECT_PATH, ServiceError};
+use timetrack_proto::{
+    BUS_NAME, Entry2, OBJECT_PATH, Project2, ServiceError, Snapshot2, TYPED_API_VERSION, WireError,
+};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 
-struct EntryIface(EntryService);
+struct EntryIface(Arc<EntryService>);
+
+struct Entry2Iface(Arc<EntryService>);
 
 /// Convert a service refusal into a D-Bus error.
 ///
@@ -48,8 +52,13 @@ fn encode<T: serde::Serialize>(value: &T) -> Wire {
 /// mutation — it is already durable, and clients keep a slow fallback
 /// poll that notices a missed signal — so the error is only logged.
 async fn announce(emitter: &SignalEmitter<'_>) {
+    // Both interfaces announce (#110): clients subscribe on whichever
+    // one they speak, and both must hear about every mutation.
     if let Err(e) = EntryIface::changed(emitter).await {
         eprintln!("timetrack-service: could not emit Changed: {e}");
+    }
+    if let Err(e) = Entry2Iface::changed(emitter).await {
+        eprintln!("timetrack-service: could not emit Changed (typed): {e}");
     }
 }
 
@@ -61,6 +70,20 @@ async fn changed_wire<T: serde::Serialize>(
     result: Result<T, ServiceError>,
 ) -> zbus::fdo::Result<Wire> {
     let out = result.map(|v| encode(&v)).map_err(to_dbus_err);
+    if out.is_ok() {
+        announce(emitter).await;
+    }
+    out
+}
+
+/// Finish a typed mutating call (#110): map the refusal to its named
+/// error, and announce on success before replying, as the legacy
+/// helpers do.
+async fn finish2<T>(
+    emitter: &SignalEmitter<'_>,
+    result: Result<T, ServiceError>,
+) -> Result<T, WireError> {
+    let out = result.map_err(WireError::from);
     if out.is_ok() {
         announce(emitter).await;
     }
@@ -299,6 +322,253 @@ impl EntryIface {
     }
 }
 
+/// The typed interface (#110, ADR 0012): the same operations over the
+/// same core, with struct arguments and replies and [`WireError`]
+/// refusals, so introspection shows the real contract. Method names
+/// match the legacy interface deliberately — the interface name is the
+/// version, the vocabulary does not change.
+#[interface(name = "org.sequ.timetrack.Entries2")]
+impl Entry2Iface {
+    /// The typed API revision, probed by clients at connect.
+    #[zbus(name = "ApiVersion")]
+    fn api_version(&self) -> u32 {
+        TYPED_API_VERSION
+    }
+
+    /// See the legacy interface's `Changed`: emitted on both.
+    #[zbus(signal)]
+    async fn changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    #[zbus(name = "Snapshot")]
+    fn snapshot(&self) -> Snapshot2 {
+        Snapshot2::from(&self.0.snapshot())
+    }
+
+    #[zbus(name = "Add")]
+    async fn add(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        project_id: &str,
+        description: &str,
+        started_at: i64,
+        ended_at: i64,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .add(project_id, description, started_at, ended_at)
+                .map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "AddDuration")]
+    async fn add_duration(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        project_id: &str,
+        description: &str,
+        duration_ms: i64,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .add_duration(project_id, description, duration_ms)
+                .map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "AddDurationEnding")]
+    async fn add_duration_ending(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        project_id: &str,
+        description: &str,
+        duration_ms: i64,
+        ended_at: i64,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .add_duration_ending(project_id, description, duration_ms, ended_at)
+                .map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "QuickAdd")]
+    async fn quick_add(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        project_id: &str,
+        duration_ms: i64,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .quick_add(project_id, duration_ms)
+                .map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "SetTimes")]
+    async fn set_times(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+        started_at: i64,
+        ended_at: i64,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .set_times(id, started_at, ended_at)
+                .map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "SetText")]
+    async fn set_text(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+        description: &str,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0.set_text(id, description).map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "SetProject")]
+    async fn set_project(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+        project_id: &str,
+    ) -> Result<Entry2, WireError> {
+        finish2(
+            &emitter,
+            self.0.set_project(id, project_id).map(|e| Entry2::from(&e)),
+        )
+        .await
+    }
+
+    #[zbus(name = "UndoQuickAdd")]
+    async fn undo_quick_add(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+    ) -> Result<(), WireError> {
+        finish2(&emitter, self.0.undo_quick_add(id)).await
+    }
+
+    #[zbus(name = "DeleteEntry")]
+    async fn delete_entry(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+    ) -> Result<(), WireError> {
+        finish2(&emitter, self.0.delete_entry(id)).await
+    }
+
+    #[zbus(name = "Split")]
+    async fn split(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+        at_ms: i64,
+    ) -> Result<(Entry2, Entry2), WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .split(id, at_ms)
+                .map(|(a, b)| (Entry2::from(&a), Entry2::from(&b))),
+        )
+        .await
+    }
+
+    #[zbus(name = "Merge")]
+    async fn merge(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        ids: Vec<String>,
+    ) -> Result<Entry2, WireError> {
+        finish2(&emitter, self.0.merge(&ids).map(|e| Entry2::from(&e))).await
+    }
+
+    #[zbus(name = "AddProject")]
+    async fn add_project(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        name: &str,
+    ) -> Result<Project2, WireError> {
+        finish2(
+            &emitter,
+            self.0.add_project(name).map(|p| Project2::from(&p)),
+        )
+        .await
+    }
+
+    #[zbus(name = "UpdateProject")]
+    async fn update_project(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+        name: &str,
+        colour: i64,
+    ) -> Result<Project2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .update_project(id, name, colour)
+                .map(|p| Project2::from(&p)),
+        )
+        .await
+    }
+
+    #[zbus(name = "SetArchived")]
+    async fn set_archived(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+        archived: bool,
+    ) -> Result<Project2, WireError> {
+        finish2(
+            &emitter,
+            self.0
+                .set_archived(id, archived)
+                .map(|p| Project2::from(&p)),
+        )
+        .await
+    }
+
+    #[zbus(name = "DeleteProject")]
+    async fn delete_project(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: &str,
+    ) -> Result<(), WireError> {
+        finish2(&emitter, self.0.delete_project(id)).await
+    }
+
+    #[zbus(name = "ExportCsv")]
+    fn export_csv(&self, scope: &str) -> Result<String, WireError> {
+        self.0.export_csv(scope).map_err(WireError::from)
+    }
+
+    #[zbus(name = "ExportCsvAt")]
+    fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, WireError> {
+        self.0
+            .export_csv_at(scope, anchor_ms)
+            .map_err(WireError::from)
+    }
+}
+
 /// zbus uses the async-io backend (see the workspace Cargo.toml), so the
 /// runtime is `async_io`, not tokio. A tokio main would leave no reactor for
 /// zbus' internal executor.
@@ -313,11 +583,15 @@ async fn run() -> anyhow::Result<()> {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(JsonStore::default_path),
     );
-    let service = EntryService::new(store)?;
+    let service = Arc::new(EntryService::new(store)?);
 
+    // Both interfaces on the one object through the transition (#110,
+    // ADR 0012): typed for new clients, JSON for older ones, one core
+    // under both.
     let _dbus = zbus::connection::Builder::session()?
         .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, EntryIface(service))?
+        .serve_at(OBJECT_PATH, EntryIface(Arc::clone(&service)))?
+        .serve_at(OBJECT_PATH, Entry2Iface(service))?
         .build()
         .await?;
 

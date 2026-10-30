@@ -11,13 +11,18 @@
 //! (an AppImage) and the CLI (bundled in that same image) agree on one
 //! definition. It carries no GUI and no storage code.
 //!
-//! # Why payloads are JSON strings
+//! # Two interfaces, one contract
 //!
-//! Every method takes and returns a single `s` holding JSON. A hand-written
-//! D-Bus signature per call would mean two definitions of every type -- one
-//! in the interface, one in the client -- and they would drift. With JSON the
-//! serde structs below are the single definition, so a field added on the
-//! service side arrives on the client side with no signature change at all.
+//! The original interface (`org.sequ.timetrack.Entries`) carries one
+//! JSON string per call: serde structs were the single definition, so a
+//! field added service-side arrived client-side with no signature
+//! change. The typed interface (`org.sequ.timetrack.Entries2`, #110,
+//! ADR 0012) speaks real D-Bus signatures — introspectable structs and
+//! named, typed errors — now that the types have settled enough for
+//! signatures to be worth more than they cost. The service serves both
+//! through the transition; [`Client`] probes `ApiVersion`, prefers the
+//! typed interface, and maps both back to the structs below, so no
+//! caller downstream can tell which answered.
 //!
 //! # The running timer is gone
 //!
@@ -34,8 +39,19 @@ pub const BUS_NAME: &str = "org.sequ.timetrack";
 /// Object path of the single exported interface.
 pub const OBJECT_PATH: &str = "/org/sequ/timetrack";
 
-/// Interface name.
+/// Interface name (the original JSON-in-string interface, "v1").
 pub const INTERFACE: &str = "org.sequ.timetrack.Entries";
+
+/// The typed interface name (#110). Same bus name and object path, new
+/// interface: that is the version discriminator. A service answers on
+/// the interfaces it speaks, so a client probes this one first and a
+/// service too old for it simply never answers here.
+pub const INTERFACE2: &str = "org.sequ.timetrack.Entries2";
+
+/// The typed API revision `ApiVersion` reports. Bump when a typed
+/// signature changes; clients refuse anything but their own value and
+/// fall back to the legacy interface instead of guessing.
+pub const TYPED_API_VERSION: u32 = 2;
 
 /// How long a method call may take before the client gives up on it.
 ///
@@ -58,7 +74,12 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const TIMEOUT_WORDING: &str = "the service did not answer in time";
 
 /// How an entry was recorded, mirroring `timetrack_core::EntrySource`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// On the typed interface (#110) this travels as its string spelling
+/// (`Manual`/`QuickAdd` — the same bytes the JSON form used), so the
+/// signature is pinned to `s` rather than a variant box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
+#[zvariant(signature = "s")]
 pub enum EntrySource {
     Manual,
     QuickAdd,
@@ -109,7 +130,7 @@ pub struct ProjectView {
 }
 
 /// Totals for one period, mirroring `timetrack_core::aggregate::Totals`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
 pub struct TotalsView {
     pub total_ms: i64,
     pub per_project: std::collections::BTreeMap<String, i64>,
@@ -184,6 +205,133 @@ impl Snapshot {
     }
 }
 
+/// The typed-interface (`org.sequ.timetrack.Entries2`, #110) shapes.
+///
+/// They mirror the JSON views field for field, with the two changes
+/// D-Bus itself forces: it has no `Option`, so an entry's note travels
+/// as `(has_note, note)` and a project's colour as the `i64` encoding
+/// `UpdateProject` already used (-1 for none). Conversions keep one
+/// internal representation ([`Snapshot`]/[`EntryView`]/[`ProjectView`])
+/// for every client, whichever interface answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
+pub struct Entry2 {
+    pub id: String,
+    pub project_id: String,
+    pub description: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub source: EntrySource,
+    pub has_note: bool,
+    pub note: String,
+}
+
+impl From<&EntryView> for Entry2 {
+    fn from(e: &EntryView) -> Self {
+        Entry2 {
+            id: e.id.clone(),
+            project_id: e.project_id.clone(),
+            description: e.description.clone(),
+            started_at: e.started_at,
+            ended_at: e.ended_at,
+            source: e.source,
+            has_note: e.note.is_some(),
+            note: e.note.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl From<Entry2> for EntryView {
+    fn from(e: Entry2) -> Self {
+        EntryView {
+            id: e.id,
+            project_id: e.project_id,
+            description: e.description,
+            started_at: e.started_at,
+            ended_at: e.ended_at,
+            source: e.source,
+            note: e.has_note.then_some(e.note),
+        }
+    }
+}
+
+/// The typed twin of [`ProjectView`]; colour is -1 for none, else the
+/// `0xRRGGBB` value, as `UpdateProject` has always spelled it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
+pub struct Project2 {
+    pub id: String,
+    pub name: String,
+    pub colour: i64,
+    pub archived: bool,
+}
+
+impl From<&ProjectView> for Project2 {
+    fn from(p: &ProjectView) -> Self {
+        Project2 {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            colour: p.colour.map(i64::from).unwrap_or(-1),
+            archived: p.archived,
+        }
+    }
+}
+
+impl From<Project2> for ProjectView {
+    fn from(p: Project2) -> Self {
+        ProjectView {
+            id: p.id,
+            name: p.name,
+            colour: u32::try_from(p.colour).ok(),
+            archived: p.archived,
+        }
+    }
+}
+
+/// The typed twin of [`Snapshot`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
+pub struct Snapshot2 {
+    pub projects: Vec<Project2>,
+    pub entries: Vec<Entry2>,
+    pub week: TotalsView,
+    pub month: TotalsView,
+    pub all: TotalsView,
+    pub total_ms: i64,
+    pub over_24h_days: Vec<i64>,
+    pub local_offset_ms: i64,
+    pub tz: String,
+}
+
+impl From<&Snapshot> for Snapshot2 {
+    fn from(s: &Snapshot) -> Self {
+        Snapshot2 {
+            projects: s.projects.iter().map(Project2::from).collect(),
+            entries: s.entries.iter().map(Entry2::from).collect(),
+            week: s.week.clone(),
+            month: s.month.clone(),
+            all: s.all.clone(),
+            total_ms: s.total_ms,
+            over_24h_days: s.over_24h_days.clone(),
+            local_offset_ms: s.local_offset_ms,
+            tz: s.tz.clone(),
+        }
+    }
+}
+
+impl From<Snapshot2> for Snapshot {
+    fn from(s: Snapshot2) -> Self {
+        Snapshot {
+            projects: s.projects.into_iter().map(ProjectView::from).collect(),
+            entries: s.entries.into_iter().map(EntryView::from).collect(),
+            week: s.week,
+            month: s.month,
+            all: s.all,
+            total_ms: s.total_ms,
+            over_24h_days: s.over_24h_days,
+            local_offset_ms: s.local_offset_ms,
+            tz: s.tz,
+        }
+    }
+}
+
 /// Convert a core entry into its wire representation.
 pub fn entry_to_view(e: &timetrack_core::Entry) -> EntryView {
     EntryView {
@@ -244,6 +392,224 @@ impl ServiceError {
     /// Encode for the D-Bus `Failed` message body.
     pub fn to_failed_body(&self) -> String {
         serde_json::to_string(self).expect("service errors are always serializable")
+    }
+}
+
+/// [`ServiceError`] as named D-Bus errors, for the typed interface
+/// (#110): one error name per refusal variant
+/// (`org.sequ.timetrack.Error.DuplicateProject`, …) with the variant's
+/// fields as the typed error body, replacing the JSON-in-`Failed`
+/// encoding the legacy interface retains during the transition. There
+/// is still exactly one error mechanism per interface, and the client
+/// maps both back to the same [`ServiceError`], so nothing downstream
+/// of `timetrack-proto` can tell which interface answered.
+#[derive(Debug, Clone)]
+pub enum WireError {
+    UnknownEntry(String),
+    UnknownProject(String),
+    DuplicateProject(String),
+    BlankProjectName,
+    TextTooLong(String, u64),
+    TextHasControlCharacters(String),
+    NegativeDuration,
+    InstantOutOfRange(i64),
+    LastProject,
+    ProjectHasEntries(String),
+    InvalidQuickAdd(i64),
+    InvalidMerge(String),
+    NotQuickAdd(String),
+    UnknownExportScope(String),
+    Storage(String),
+    /// A refusal with no typed shape (a hand-edited discrepancy between
+    /// client and service builds): its message, verbatim.
+    Other(String),
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wording is ServiceError's, as everywhere downstream.
+        write!(f, "{}", ServiceError::from(self.clone()))
+    }
+}
+
+impl std::error::Error for WireError {}
+
+/// Hand-written rather than derived: the derive assumes a variant's
+/// first field is the human description string, while ours are the
+/// refusal's own typed fields (an id, an instant, a cap). The error
+/// *name* identifies the variant; the body carries exactly its fields.
+impl zbus::DBusError for WireError {
+    fn name(&self) -> zbus::names::ErrorName<'_> {
+        use zbus::names::ErrorName;
+        match self {
+            WireError::UnknownEntry(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.UnknownEntry")
+            }
+            WireError::UnknownProject(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.UnknownProject")
+            }
+            WireError::DuplicateProject(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.DuplicateProject")
+            }
+            WireError::BlankProjectName => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.BlankProjectName")
+            }
+            WireError::TextTooLong(..) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.TextTooLong")
+            }
+            WireError::TextHasControlCharacters(_) => ErrorName::from_static_str_unchecked(
+                "org.sequ.timetrack.Error.TextHasControlCharacters",
+            ),
+            WireError::NegativeDuration => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.NegativeDuration")
+            }
+            WireError::InstantOutOfRange(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.InstantOutOfRange")
+            }
+            WireError::LastProject => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.LastProject")
+            }
+            WireError::ProjectHasEntries(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.ProjectHasEntries")
+            }
+            WireError::InvalidQuickAdd(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.InvalidQuickAdd")
+            }
+            WireError::InvalidMerge(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.InvalidMerge")
+            }
+            WireError::NotQuickAdd(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.NotQuickAdd")
+            }
+            WireError::UnknownExportScope(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.UnknownExportScope")
+            }
+            WireError::Storage(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.Storage")
+            }
+            WireError::Other(_) => {
+                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.Other")
+            }
+        }
+    }
+
+    fn description(&self) -> Option<&str> {
+        // The body carries the typed fields; clients rebuild the
+        // wording from the variant, like everywhere else.
+        None
+    }
+
+    fn create_reply(&self, call: &zbus::message::Header<'_>) -> zbus::Result<zbus::Message> {
+        let builder = zbus::Message::error(call, self.name())?;
+        match self {
+            WireError::BlankProjectName | WireError::NegativeDuration | WireError::LastProject => {
+                builder.build(&())
+            }
+            WireError::TextTooLong(what, cap) => builder.build(&(what, *cap)),
+            WireError::InstantOutOfRange(v) | WireError::InvalidQuickAdd(v) => {
+                builder.build(&(*v,))
+            }
+            WireError::UnknownEntry(v)
+            | WireError::UnknownProject(v)
+            | WireError::DuplicateProject(v)
+            | WireError::TextHasControlCharacters(v)
+            | WireError::ProjectHasEntries(v)
+            | WireError::InvalidMerge(v)
+            | WireError::NotQuickAdd(v)
+            | WireError::UnknownExportScope(v)
+            | WireError::Storage(v)
+            | WireError::Other(v) => builder.build(&(v,)),
+        }
+    }
+}
+
+impl WireError {
+    /// Rebuild from a typed-interface error reply: the D-Bus error name
+    /// picks the variant and the body supplies its fields. Anything
+    /// that is not one of ours keeps the caller's generic mapping.
+    fn from_bus_error(error: &zbus::Error) -> Option<Self> {
+        let zbus::Error::MethodError(name, _detail, msg) = error else {
+            return None;
+        };
+        let variant = name.strip_prefix("org.sequ.timetrack.Error.")?;
+        let body = msg.body();
+        let one_string = |body: &zbus::message::Body| -> Option<String> {
+            body.deserialize::<(String,)>().ok().map(|(v,)| v)
+        };
+        Some(match variant {
+            "UnknownEntry" => WireError::UnknownEntry(one_string(&body)?),
+            "UnknownProject" => WireError::UnknownProject(one_string(&body)?),
+            "DuplicateProject" => WireError::DuplicateProject(one_string(&body)?),
+            "BlankProjectName" => WireError::BlankProjectName,
+            "TextTooLong" => {
+                let (what, cap) = body.deserialize::<(String, u64)>().ok()?;
+                WireError::TextTooLong(what, cap)
+            }
+            "TextHasControlCharacters" => WireError::TextHasControlCharacters(one_string(&body)?),
+            "NegativeDuration" => WireError::NegativeDuration,
+            "InstantOutOfRange" => {
+                WireError::InstantOutOfRange(body.deserialize::<(i64,)>().ok()?.0)
+            }
+            "LastProject" => WireError::LastProject,
+            "ProjectHasEntries" => WireError::ProjectHasEntries(one_string(&body)?),
+            "InvalidQuickAdd" => WireError::InvalidQuickAdd(body.deserialize::<(i64,)>().ok()?.0),
+            "InvalidMerge" => WireError::InvalidMerge(one_string(&body)?),
+            "NotQuickAdd" => WireError::NotQuickAdd(one_string(&body)?),
+            "UnknownExportScope" => WireError::UnknownExportScope(one_string(&body)?),
+            "Storage" => WireError::Storage(one_string(&body)?),
+            "Other" => WireError::Other(one_string(&body)?),
+            _ => return None,
+        })
+    }
+}
+
+impl From<ServiceError> for WireError {
+    fn from(e: ServiceError) -> Self {
+        use timetrack_core::RuleError as R;
+        match e {
+            ServiceError::Rule(rule) => match rule {
+                R::UnknownEntry(v) => WireError::UnknownEntry(v),
+                R::UnknownProject(v) => WireError::UnknownProject(v),
+                R::DuplicateProject(v) => WireError::DuplicateProject(v),
+                R::BlankProjectName => WireError::BlankProjectName,
+                R::TextTooLong(what, cap) => WireError::TextTooLong(what, cap as u64),
+                R::TextHasControlCharacters(v) => WireError::TextHasControlCharacters(v),
+                R::NegativeDuration => WireError::NegativeDuration,
+                R::InstantOutOfRange(v) => WireError::InstantOutOfRange(v),
+                R::LastProject => WireError::LastProject,
+                R::ProjectHasEntries(v) => WireError::ProjectHasEntries(v),
+                R::InvalidQuickAdd(v) => WireError::InvalidQuickAdd(v),
+                R::InvalidMerge(v) => WireError::InvalidMerge(v),
+                R::NotQuickAdd(v) => WireError::NotQuickAdd(v),
+            },
+            ServiceError::UnknownExportScope(v) => WireError::UnknownExportScope(v),
+            ServiceError::Storage(v) => WireError::Storage(v),
+            ServiceError::Other(v) => WireError::Other(v),
+        }
+    }
+}
+
+impl From<WireError> for ServiceError {
+    fn from(e: WireError) -> Self {
+        use timetrack_core::RuleError as R;
+        match e {
+            WireError::UnknownEntry(v) => R::UnknownEntry(v).into(),
+            WireError::UnknownProject(v) => R::UnknownProject(v).into(),
+            WireError::DuplicateProject(v) => R::DuplicateProject(v).into(),
+            WireError::BlankProjectName => R::BlankProjectName.into(),
+            WireError::TextTooLong(what, cap) => R::TextTooLong(what, cap as usize).into(),
+            WireError::TextHasControlCharacters(v) => R::TextHasControlCharacters(v).into(),
+            WireError::NegativeDuration => R::NegativeDuration.into(),
+            WireError::InstantOutOfRange(v) => R::InstantOutOfRange(v).into(),
+            WireError::LastProject => R::LastProject.into(),
+            WireError::ProjectHasEntries(v) => R::ProjectHasEntries(v).into(),
+            WireError::InvalidQuickAdd(v) => R::InvalidQuickAdd(v).into(),
+            WireError::InvalidMerge(v) => R::InvalidMerge(v).into(),
+            WireError::NotQuickAdd(v) => R::NotQuickAdd(v).into(),
+            WireError::UnknownExportScope(v) => ServiceError::UnknownExportScope(v),
+            WireError::Storage(v) => ServiceError::Storage(v),
+            WireError::Other(v) => ServiceError::Other(v),
+        }
     }
 }
 
@@ -385,10 +751,24 @@ pub fn version_mismatch_hint(client: &str) -> String {
     )
 }
 
+/// Which interface a [`Client`] is speaking (#110).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiMode {
+    /// `org.sequ.timetrack.Entries2`: typed arguments, structs and
+    /// named errors.
+    Typed,
+    /// `org.sequ.timetrack.Entries`: the original JSON-in-string
+    /// interface, kept for services older than the typed one (and new
+    /// services keep serving it for older clients).
+    Legacy,
+}
+
 /// A connection to the running service.
 #[derive(Clone)]
 pub struct Client {
     proxy: zbus::Proxy<'static>,
+    typed: zbus::Proxy<'static>,
+    mode: ApiMode,
 }
 
 /// How a bounded wait for `Changed` ended (#103).
@@ -480,7 +860,69 @@ impl Client {
         let proxy = zbus::Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
             .await
             .map_err(ClientError::from_bus)?;
-        Ok(Client { proxy })
+        let typed = zbus::Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE2)
+            .await
+            .map_err(ClientError::from_bus)?;
+        // Probe the typed interface (#110). Anything but our exact
+        // revision — an older service with no such interface, no
+        // service at all yet, a future revision — means the legacy
+        // interface, which every service in the transition serves.
+        // Connecting must not fail on a missing service (see above), so
+        // every probe failure is a mode, never an error.
+        let mode = match typed.call_method("ApiVersion", &()).await {
+            Ok(reply) if reply.body().deserialize::<u32>().ok() == Some(TYPED_API_VERSION) => {
+                ApiMode::Typed
+            }
+            _ => ApiMode::Legacy,
+        };
+        Ok(Client { proxy, typed, mode })
+    }
+
+    /// Which interface this client is speaking.
+    pub fn api_mode(&self) -> ApiMode {
+        self.mode
+    }
+
+    /// Sort a typed-interface failure: our named errors rebuild the
+    /// exact [`ServiceError`]; anything else keeps the generic mapping.
+    fn map_typed(error: zbus::Error) -> ClientError {
+        if let Some(wire) = WireError::from_bus_error(&error) {
+            return ClientError::Service(wire.into());
+        }
+        ClientError::from_bus(error)
+    }
+
+    /// Call a typed method with arguments and decode its typed reply.
+    async fn call2<
+        T: serde::de::DeserializeOwned + zbus::zvariant::Type,
+        A: serde::Serialize + zbus::zvariant::DynamicType,
+    >(
+        &self,
+        method: &str,
+        arg: &A,
+    ) -> Result<T, ClientError> {
+        let reply = self
+            .typed
+            .call_method(method, arg)
+            .await
+            .map_err(Self::map_typed)?;
+        reply
+            .body()
+            .deserialize()
+            .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    /// Call a typed method that answers nothing.
+    async fn call2_unit<A: serde::Serialize + zbus::zvariant::DynamicType>(
+        &self,
+        method: &str,
+        arg: &A,
+    ) -> Result<(), ClientError> {
+        self.typed
+            .call_method(method, arg)
+            .await
+            .map(|_| ())
+            .map_err(Self::map_typed)
     }
 
     /// Call a no-argument method and decode its JSON reply.
@@ -523,6 +965,10 @@ impl Client {
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let snap: Snapshot2 = self.call2("Snapshot", &()).await?;
+            return Ok(snap.into());
+        }
         self.call("Snapshot").await
     }
 
@@ -532,8 +978,11 @@ impl Client {
     /// a service (or a bus) that never emits: old services simply never
     /// fire, and callers keep a slow fallback poll for exactly that case.
     pub async fn changed_stream(&self) -> Result<ChangedStream, ClientError> {
-        let inner = self
-            .proxy
+        let proxy = match self.mode {
+            ApiMode::Typed => &self.typed,
+            ApiMode::Legacy => &self.proxy,
+        };
+        let inner = proxy
             .receive_signal("Changed")
             .await
             .map_err(ClientError::from_bus)?;
@@ -552,6 +1001,12 @@ impl Client {
         started_at: i64,
         ended_at: i64,
     ) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self
+                .call2("Add", &(project_id, description, started_at, ended_at))
+                .await?;
+            return Ok(e.into());
+        }
         self.call1("Add", &(project_id, description, started_at, ended_at))
             .await
     }
@@ -563,6 +1018,12 @@ impl Client {
         description: &str,
         duration_ms: i64,
     ) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self
+                .call2("AddDuration", &(project_id, description, duration_ms))
+                .await?;
+            return Ok(e.into());
+        }
         self.call1("AddDuration", &(project_id, description, duration_ms))
             .await
     }
@@ -575,6 +1036,15 @@ impl Client {
         duration_ms: i64,
         ended_at: i64,
     ) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self
+                .call2(
+                    "AddDurationEnding",
+                    &(project_id, description, duration_ms, ended_at),
+                )
+                .await?;
+            return Ok(e.into());
+        }
         self.call1(
             "AddDurationEnding",
             &(project_id, description, duration_ms, ended_at),
@@ -588,6 +1058,10 @@ impl Client {
         project_id: &str,
         duration_ms: i64,
     ) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self.call2("QuickAdd", &(project_id, duration_ms)).await?;
+            return Ok(e.into());
+        }
         self.call1("QuickAdd", &(project_id, duration_ms)).await
     }
 
@@ -601,21 +1075,36 @@ impl Client {
         started_at: i64,
         ended_at: i64,
     ) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self.call2("SetTimes", &(id, started_at, ended_at)).await?;
+            return Ok(e.into());
+        }
         self.call1("SetTimes", &(id, started_at, ended_at)).await
     }
 
     /// Edit an entry's description.
     pub async fn set_text(&self, id: &str, description: &str) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self.call2("SetText", &(id, description)).await?;
+            return Ok(e.into());
+        }
         self.call1("SetText", &(id, description)).await
     }
 
     /// Reassign an entry to another project.
     pub async fn set_project(&self, id: &str, project_id: &str) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self.call2("SetProject", &(id, project_id)).await?;
+            return Ok(e.into());
+        }
         self.call1("SetProject", &(id, project_id)).await
     }
 
     /// Undo exactly the entry a quick-add created.
     pub async fn undo_quick_add(&self, id: &str) -> Result<(), ClientError> {
+        if self.mode == ApiMode::Typed {
+            return self.call2_unit("UndoQuickAdd", &(id,)).await;
+        }
         self.proxy
             .call_method("UndoQuickAdd", &(id,))
             .await
@@ -625,6 +1114,9 @@ impl Client {
 
     /// Explicit deletion. The only way an entry is removed on purpose.
     pub async fn delete_entry(&self, id: &str) -> Result<(), ClientError> {
+        if self.mode == ApiMode::Typed {
+            return self.call2_unit("DeleteEntry", &(id,)).await;
+        }
         self.proxy
             .call_method("DeleteEntry", &(id,))
             .await
@@ -633,6 +1125,10 @@ impl Client {
     }
 
     pub async fn split(&self, id: &str, at_ms: i64) -> Result<(EntryView, EntryView), ClientError> {
+        if self.mode == ApiMode::Typed {
+            let (a, b): (Entry2, Entry2) = self.call2("Split", &(id, at_ms)).await?;
+            return Ok((a.into(), b.into()));
+        }
         self.call1("Split", &(id, at_ms)).await
     }
 
@@ -641,12 +1137,20 @@ impl Client {
     /// The result's duration is the union, so merging *overlapping* entries
     /// reduces the total by the overlap. Clients must say so before calling.
     pub async fn merge(&self, ids: &[String]) -> Result<EntryView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let e: Entry2 = self.call2("Merge", &ids.to_vec()).await?;
+            return Ok(e.into());
+        }
         self.call1("Merge", &ids.to_vec()).await
     }
 
     // --- projects ---
 
     pub async fn add_project(&self, name: &str) -> Result<ProjectView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let p: Project2 = self.call2("AddProject", &name).await?;
+            return Ok(p.into());
+        }
         self.call1("AddProject", &name).await
     }
 
@@ -660,14 +1164,25 @@ impl Client {
         name: &str,
         colour: i64,
     ) -> Result<ProjectView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let p: Project2 = self.call2("UpdateProject", &(id, name, colour)).await?;
+            return Ok(p.into());
+        }
         self.call1("UpdateProject", &(id, name, colour)).await
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> Result<ProjectView, ClientError> {
+        if self.mode == ApiMode::Typed {
+            let p: Project2 = self.call2("SetArchived", &(id, archived)).await?;
+            return Ok(p.into());
+        }
         self.call1("SetArchived", &(id, archived)).await
     }
 
     pub async fn delete_project(&self, id: &str) -> Result<(), ClientError> {
+        if self.mode == ApiMode::Typed {
+            return self.call2_unit("DeleteProject", &(id,)).await;
+        }
         self.proxy
             .call_method("DeleteProject", &(id,))
             .await
@@ -682,6 +1197,9 @@ impl Client {
     /// service, so it works against both old and new services: current-period
     /// behaviour never needs the new call.
     pub async fn export_csv(&self, scope: &str) -> Result<String, ClientError> {
+        if self.mode == ApiMode::Typed {
+            return self.call2("ExportCsv", &scope).await;
+        }
         self.call1("ExportCsv", &scope).await
     }
 
@@ -697,6 +1215,9 @@ impl Client {
     /// services; only a chosen anchor needs the new call, and only a chosen
     /// anchor can meet an old service.
     pub async fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, ClientError> {
+        if self.mode == ApiMode::Typed {
+            return self.call2("ExportCsvAt", &(scope, anchor_ms)).await;
+        }
         self.call1("ExportCsvAt", &(scope, anchor_ms)).await
     }
 
@@ -849,6 +1370,102 @@ mod tests {
         assert_eq!(view.source, EntrySource::QuickAdd);
         assert_eq!(view.duration_ms(), 5);
         assert_eq!(view.note.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn typed_shapes_round_trip_through_the_views() {
+        // #110: the typed twins differ only where D-Bus has no Option,
+        // and converting there and back must lose nothing — including
+        // a present-but-empty note and an explicit colour.
+        let mut e = entry();
+        e.note = Some(String::new());
+        assert_eq!(EntryView::from(Entry2::from(&e)), e);
+        e.note = None;
+        assert_eq!(EntryView::from(Entry2::from(&e)), e);
+        let p = ProjectView {
+            id: "p1".into(),
+            name: "Work".into(),
+            colour: Some(0x00aa00),
+            archived: true,
+        };
+        assert_eq!(ProjectView::from(Project2::from(&p)), p);
+        let p_none = ProjectView {
+            colour: None,
+            ..p.clone()
+        };
+        assert_eq!(ProjectView::from(Project2::from(&p_none)), p_none);
+    }
+
+    #[test]
+    fn every_service_error_round_trips_through_the_typed_names() {
+        // #110: clients pattern-match refusal variants (tray undo
+        // staleness, GUI recovery), so the typed error names must carry
+        // the same variant and fields, not just a message.
+        use timetrack_core::RuleError as R;
+        let all = [
+            ServiceError::Rule(R::UnknownEntry("e1".into())),
+            ServiceError::Rule(R::UnknownProject("p1".into())),
+            ServiceError::Rule(R::DuplicateProject("Work".into())),
+            ServiceError::Rule(R::BlankProjectName),
+            ServiceError::Rule(R::TextTooLong("project name".into(), 80)),
+            ServiceError::Rule(R::TextHasControlCharacters("description".into())),
+            ServiceError::Rule(R::NegativeDuration),
+            ServiceError::Rule(R::InstantOutOfRange(-5)),
+            ServiceError::Rule(R::LastProject),
+            ServiceError::Rule(R::ProjectHasEntries("p1".into())),
+            ServiceError::Rule(R::InvalidQuickAdd(7)),
+            ServiceError::Rule(R::InvalidMerge("why".into())),
+            ServiceError::Rule(R::NotQuickAdd("e1".into())),
+            ServiceError::UnknownExportScope("daily".into()),
+            ServiceError::Storage("disk sad".into()),
+            ServiceError::Other("misc".into()),
+        ];
+        for err in all {
+            let wire = WireError::from(err.clone());
+            assert!(
+                zbus::DBusError::name(&wire)
+                    .as_str()
+                    .starts_with("org.sequ.timetrack.Error."),
+                "typed name for {err:?}"
+            );
+            assert_eq!(ServiceError::from(wire), err);
+        }
+    }
+
+    #[test]
+    fn a_typed_snapshot_serializes_smaller_than_its_json() {
+        // #110's snapshot sizing, pinned: at a generated multi-thousand
+        // entry workload the typed snapshot must not be *larger* than
+        // the JSON it replaces. (Absolute size is the ADR's measured
+        // argument for keeping the whole snapshot in v2.)
+        let mut snap = Snapshot::default();
+        snap.projects.push(ProjectView {
+            id: "p1".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        for n in 0..2_000 {
+            let mut e = entry();
+            e.id = format!("e{n}");
+            e.description = format!("task {n}");
+            e.started_at = 1_700_000_000_000 + n * 3_600_000;
+            e.ended_at = e.started_at + 1_800_000;
+            snap.entries.push(e);
+        }
+        let json_len = serde_json::to_string(&snap).unwrap().len();
+        let snap2 = Snapshot2::from(&snap);
+        let ctx = zbus::zvariant::serialized::Context::new_dbus(zbus::zvariant::Endian::Little, 0);
+        let typed = zbus::zvariant::to_bytes(ctx, &snap2).unwrap();
+        let typed_len = typed.len();
+        // And it comes back identical.
+        let back: Snapshot2 = typed.deserialize().unwrap().0;
+        assert_eq!(back, snap2);
+        assert_eq!(Snapshot::from(back), snap);
+        assert!(
+            typed_len < json_len,
+            "typed {typed_len} must beat json {json_len}"
+        );
     }
 
     #[test]

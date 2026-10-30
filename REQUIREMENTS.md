@@ -435,6 +435,7 @@ specification and the implementation do not quietly diverge.
 | §5 Shorten never deletes | `rules.rs::set_times` | service test |
 | §5 Undo refuses a non-quick-add | `rules.rs` + service | e2e and unit tests |
 | §6 Quick-add 5/15/30/60, own entry each | `rules.rs::quick_add` | e2e |
+| #110 Typed D-Bus API, dual-served transition | ADR 0012: `Entries2` typed structs + named `WireError`s, clients probe `ApiVersion` and fall back to legacy JSON | proto round-trip/size tests, e2e typed checks, both-directions skew probe |
 | §6/#105 Quick-add reachable per desktop | ADR 0011: tray bundled in AppImage for watcher desktops, launcher quick-add actions + `quick --notify` on stock GNOME, watcherless tray notice | CLI notification unit test, tray notice unit test, AppImage contents check |
 | §7 Timer cut; no `running` anywhere | whole tree | a test asserts no `running` field exists |
 | §8 Split and merge | core + service D-Bus, GUI `s`/`m`, CLI `split`/`merge` | unit tests + e2e + gui-smoke |
