@@ -237,6 +237,29 @@ merely absent, because the two need different fixes:
 With one artifact carrying both, that means: quit the old image (and its
 leftover service, which exits with the session) and launch the new one.
 
+### Timezone
+
+The service is the only timezone authority: it resolves its zone from `TZ`
+(or the system timezone) at startup, reports the zone's name with every
+snapshot, and the GUI and CLI read it from there — they never look at their
+own `TZ`. That is what keeps a typed `09:30` and the service's week and
+month totals in the same local day, DST transitions included.
+
+- **Travelling needs no restart.** The service re-reads the system timezone
+  continuously, so changing it (GNOME Settings, `timedatectl set-timezone`)
+  takes effect within a second or two. Changing the `TZ` environment
+  variable is the one exception: a process's environment is fixed at
+  launch, so relaunch the AppImage for a new `TZ` to reach its service.
+- **An unusable zone stops the service at startup** with a message naming
+  the bad value, instead of silently tracking time in UTC. Fix `TZ` (an
+  IANA name such as `Europe/Rome`, `UTC`, or `UTC+2`) or the system zone
+  and launch again. A client talking to a service too old to report a zone
+  name likewise refuses to parse typed times rather than guess.
+- **Clock-change days:** a wall-clock time the spring-forward jump skips
+  (e.g. `02:30` on the day 02:00 becomes 03:00) is refused, because it
+  never occurs; a time in the repeated fall-back hour means its first
+  occurrence.
+
 ## The terminal client
 
 `timetrack` ships inside the AppImage — it is the same `timetrack-cli`
@@ -416,8 +439,10 @@ all-time aggregates plus the over-24h day list, so both UIs read the
 same totals. Two details worth knowing: a genuinely empty store seeds
 one `General` project (otherwise every quick-add was inert until the
 user made a project, and an archived-only store is never re-seeded
-over), and the service holds exactly one clock read and one timezone
-resolution, so every `ended_at` traces to a single instant per call.
+over), and the service holds exactly one clock read per call and is the
+one timezone authority (resolved strictly, refreshed live — see
+"Timezone" above), so every `ended_at` traces to a single instant per
+call.
 
 Note for the test rig: `scripts/e2e.sh` drives a real service over a
 private bus with an explicit bus config, because a plain
@@ -485,9 +510,9 @@ is described under "What works today" above.
    with the `cx.notify()` refresh fix described above.
 3. **Per-instant timezone lookup** — `core/src/tz.rs` (`Tz` over
    `chrono-tz`, fixed-point `day_start`); aggregation, rules, export
-   and parsing all take `&Tz`, the service resolves it once
-   (`Tz::from_env`) and snapshots carry the zone name for clients
-   (`Tz::from_snapshot`). Before this, named zones such as
+   and parsing all take `&Tz`, the service resolves it strictly and
+   refreshes it live (`Tz::try_from_env`; #102) and snapshots carry the
+   zone name for clients (`Tz::from_snapshot`). Before this, named zones such as
    `Europe/Rome` fell back to UTC and mis-bucketed near DST and week
    boundaries; DST transition and week-split tests now pin it down.
 

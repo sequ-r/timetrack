@@ -14,11 +14,49 @@
 //! and a named `TZ` such as `Europe/Rome` is not a fixed offset at all.
 //!
 //! This module is the single place that knows about the tz database. It takes
-//! no clock and reads the environment only in [`Tz::from_env`]; everything
+//! no clock and reads the environment only in [`Tz::try_from_env`]; everything
 //! else is pure over explicit instants, so it stays testable like the rest of
 //! the core.
+//!
+//! # Who owns the zone (#102, ADR 0009)
+//!
+//! The service is the single zone authority: it resolves the zone with
+//! [`Tz::try_from_env`], reports its name on every snapshot, and clients may
+//! only build a `Tz` from that name ([`Tz::from_snapshot`]). Resolution is
+//! strict — an unusable zone is an explicit [`TzError`], never a silent
+//! fixed-offset or UTC fallback, because a guessed zone buckets entries into
+//! the wrong local day while looking exactly like success.
 
 use crate::model::MS_PER_DAY;
+
+/// Why a timezone could not be resolved (#102).
+///
+/// There is deliberately no fallback variant: a caller that cannot name the
+/// zone must fail loudly (the service at startup, a client when it would
+/// parse a typed local time), not guess UTC or a fixed offset.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TzError {
+    /// `TZ` was set but names nothing usable.
+    #[error(
+        "TZ='{0}' is not a usable timezone (use an IANA name such as Europe/Rome, UTC, or UTC+2)"
+    )]
+    BadTzVar(String),
+    /// The system zone named something unusable.
+    #[error("the system timezone '{0}' is not usable (set TZ to an IANA name such as Europe/Rome)")]
+    BadSystemZone(String),
+    /// No zone could be determined at all.
+    #[error("could not determine the local timezone (set TZ to an IANA name such as Europe/Rome)")]
+    Undetermined,
+    /// A service snapshot carried no zone name: an older service, which new
+    /// clients must refuse rather than fall back to its fixed offset.
+    #[error(
+        "the service did not report a timezone name; client and service are different versions"
+    )]
+    MissingSnapshotZone,
+    /// A service snapshot carried a zone name this client cannot parse.
+    #[error("the service reported an unusable timezone '{0}'")]
+    BadSnapshotZone(String),
+}
 
 /// A local timezone: UTC, a fixed offset, or a named IANA zone.
 ///
@@ -59,11 +97,12 @@ impl Tz {
     }
 
     /// Parse a `TZ` value: `UTC`, `UTC±HH[:MM]`, `UTC±HHMM`, or an IANA name.
+    /// A leading `:` (the POSIX implementation-defined prefix) is accepted.
     ///
     /// Returns `None` rather than guessing: mis-parsing a zone puts entries
-    /// in the wrong local day, which is worse than falling back to UTC.
+    /// in the wrong local day, which is worse than failing.
     pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
+        let s = s.trim().strip_prefix(':').unwrap_or(s.trim());
         if s.is_empty() {
             return None;
         }
@@ -90,44 +129,49 @@ impl Tz {
         None
     }
 
-    /// Resolve the local zone from the environment.
+    /// Resolve the local zone from the environment, strictly (#102).
     ///
-    /// `TZ` wins when it names something parseable. Otherwise the system
-    /// timezone is tried, and UTC is the last resort — never a mis-parse.
-    pub fn from_env() -> Self {
-        if let Ok(tz) = std::env::var("TZ") {
-            let trimmed = tz.trim();
-            if !trimmed.is_empty() {
-                if let Some(parsed) = Tz::parse(trimmed) {
-                    return parsed;
-                }
-                // Unrecognised TZ: fall back to UTC rather than bucketing
-                // entries into the wrong day.
-                return Tz::Utc;
-            }
+    /// `TZ` wins when set; otherwise the system timezone. An unusable zone
+    /// is an error, never a silent UTC fallback: the service resolves its
+    /// zone this way at startup, so a typo'd `TZ` stops it with a message
+    /// the user can act on instead of bucketing a day wrong.
+    pub fn try_from_env() -> Result<Self, TzError> {
+        let tz_var = std::env::var("TZ").ok();
+        if tz_var.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+            return Self::resolve(tz_var.as_deref(), None);
         }
-        // No TZ: use the system zone when it names something we understand.
-        if let Ok(name) = iana_time_zone::get_timezone() {
-            if let Some(parsed) = Tz::parse(name.trim()) {
-                return parsed;
-            }
-        }
-        Tz::Utc
+        Self::resolve(None, iana_time_zone::get_timezone().ok().as_deref())
     }
 
-    /// Build from a snapshot's wire fields.
+    /// The pure half of [`Tz::try_from_env`], so both sources are testable
+    /// without mutating the process environment.
+    fn resolve(tz_var: Option<&str>, system_zone: Option<&str>) -> Result<Self, TzError> {
+        if let Some(value) = tz_var {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Tz::parse(value).ok_or_else(|| TzError::BadTzVar(value.to_string()));
+            }
+        }
+        match system_zone {
+            Some(name) if !name.trim().is_empty() => Tz::parse(name.trim())
+                .ok_or_else(|| TzError::BadSystemZone(name.trim().to_string())),
+            _ => Err(TzError::Undetermined),
+        }
+    }
+
+    /// Build from a snapshot's zone name, strictly (#102).
     ///
-    /// New services send a parseable [`Tz::name`]; old ones send an empty
-    /// `tz` with only `local_offset_ms` set. Prefer the name, fall back to
-    /// the fixed offset.
-    pub fn from_snapshot(tz_name: &str, local_offset_ms: i64) -> Self {
-        if let Some(parsed) = Tz::parse(tz_name) {
-            return parsed;
+    /// The service always sends a parseable [`Tz::name`]. Anything else —
+    /// an empty name from an older service, a name this client cannot
+    /// parse — is an error the client must surface, never a fall back to
+    /// the snapshot's fixed `local_offset_ms`, which can bucket a typed
+    /// local time differently from the service's totals across DST.
+    pub fn from_snapshot(tz_name: &str) -> Result<Self, TzError> {
+        let name = tz_name.trim();
+        if name.is_empty() {
+            return Err(TzError::MissingSnapshotZone);
         }
-        if local_offset_ms == 0 {
-            return Tz::Utc;
-        }
-        Tz::fixed_ms(local_offset_ms)
+        Tz::parse(name).ok_or_else(|| TzError::BadSnapshotZone(name.to_string()))
     }
 
     /// A parseable name for this zone: `UTC`, the fixed-offset spelling, or
@@ -303,16 +347,54 @@ mod tests {
     }
 
     #[test]
-    fn from_snapshot_prefers_the_name() {
-        let tz = Tz::from_snapshot("Europe/Rome", 0);
+    fn from_snapshot_uses_the_name() {
+        let tz = Tz::from_snapshot("Europe/Rome").expect("a named zone resolves");
         assert_eq!(tz.name(), "Europe/Rome");
     }
 
     #[test]
-    fn from_snapshot_falls_back_to_the_fixed_offset() {
-        // Old services send no name, only the offset at snapshot time.
-        assert_eq!(Tz::from_snapshot("", 0), Tz::Utc);
-        assert_eq!(Tz::from_snapshot("", 3_600_000).offset_at_ms(0), 3_600_000);
+    fn from_snapshot_refuses_missing_and_unusable_names() {
+        // #102: no silent fixed-offset/UTC fallback. An old service that
+        // sends no name, or a name this client cannot parse, is an error
+        // the client surfaces — never a guess.
+        assert_eq!(Tz::from_snapshot(""), Err(TzError::MissingSnapshotZone));
+        assert_eq!(Tz::from_snapshot("  "), Err(TzError::MissingSnapshotZone));
+        assert_eq!(
+            Tz::from_snapshot("Europe/Romeo"),
+            Err(TzError::BadSnapshotZone("Europe/Romeo".into()))
+        );
+    }
+
+    #[test]
+    fn resolution_is_strict_for_both_sources() {
+        // A usable TZ wins over the system zone.
+        assert_eq!(
+            Tz::resolve(Some("Europe/Rome"), Some("UTC"))
+                .unwrap()
+                .name(),
+            "Europe/Rome"
+        );
+        // A bad TZ is an explicit error, not UTC.
+        assert_eq!(
+            Tz::resolve(Some("Europe/Romeo"), Some("UTC")),
+            Err(TzError::BadTzVar("Europe/Romeo".into()))
+        );
+        // No TZ: the system zone, strictly.
+        assert_eq!(
+            Tz::resolve(None, Some("Europe/Rome")).unwrap().name(),
+            "Europe/Rome"
+        );
+        assert_eq!(
+            Tz::resolve(Some(""), Some("Nowhere/Special")),
+            Err(TzError::BadSystemZone("Nowhere/Special".into()))
+        );
+        // Nothing usable anywhere is an error, not a guess.
+        assert_eq!(Tz::resolve(None, None), Err(TzError::Undetermined));
+        // The POSIX `:` prefix is accepted rather than refused.
+        assert_eq!(
+            Tz::resolve(Some(":Europe/Rome"), None).unwrap().name(),
+            "Europe/Rome"
+        );
     }
 
     #[test]

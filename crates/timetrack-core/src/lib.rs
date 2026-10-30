@@ -26,8 +26,11 @@
 //! # Timezone
 //!
 //! Local-time arithmetic (which day or week an instant falls in) takes an
-//! explicit [`Tz`] rather than reading a clock or the environment. The service
-//! resolves the zone once from `TZ` (or the system zone); every instant below
+//! explicit [`Tz`] rather than reading a clock or the environment. The
+//! service is the single zone authority (#102): it resolves the zone
+//! strictly from `TZ` (or the system zone), refreshes it live, and reports
+//! its name on every snapshot — clients parse typed local times only with
+//! that snapshot zone, through this crate's one parser. Every instant below
 //! this line is then mapped through the offset in force *at that instant*,
 //! so DST transitions bucket correctly. This is the app's
 //! likeliest source of off-by-one bugs, so it is deliberately concentrated
@@ -66,7 +69,7 @@ pub use rules::{
     split_entry, update_project,
 };
 pub use storage::{JsonStore, StorageError, StorageResult};
-pub use tz::Tz;
+pub use tz::{Tz, TzError};
 
 /// A single-line display copy of stored free text (#101).
 ///

@@ -439,8 +439,9 @@ fi
 
 echo
 echo "== a named timezone restarts cleanly and keeps every total =="
-# The service resolves TZ once at startup; a named zone must bucket through
-# the tz database rather than falling back to UTC, without moving any total.
+# A process's TZ is fixed at launch, hence the restart; a named zone must
+# bucket through the tz database rather than falling back to UTC, without
+# moving any total. (The *system* zone is re-read live — #102.)
 before_all=$(total)
 before_n=$(listed)
 kill "$SVC_PID"; wait "$SVC_PID" 2>/dev/null
@@ -479,6 +480,19 @@ TZ=UTC "$SVC" "$STORE" >>"$WORK/svc.log" 2>&1 &
 SVC_PID=$!
 wait_for_service || { echo "service did not come back on UTC"; cat "$WORK/svc.log"; exit 1; }
 check "all-time total survived the return to UTC" "$before_all" "$(total)"
+
+echo
+echo "== an unusable timezone refuses to start (#102) =="
+# Strict resolution: a typo'd TZ must stop the service with a message
+# naming it, never silently run in UTC. This is a second throwaway
+# process (it exits before ever asking for the bus name), so the live
+# service above is untouched.
+if badtz_out=$(TZ=Europe/Romeo timeout 5 "$SVC" "$WORK/badtz.json" 2>&1); then
+  bad "service with TZ=Europe/Romeo exits" "it started anyway: $badtz_out"
+else
+  ok "service with TZ=Europe/Romeo exits"
+fi
+contains "the refusal names the bad zone" "Europe/Romeo" "$badtz_out"
 
 echo
 echo "== archiving keeps history in the totals =="

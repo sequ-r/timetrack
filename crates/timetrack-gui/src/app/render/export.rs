@@ -12,7 +12,8 @@
 use super::super::TimetrackView;
 use super::super::export::save::{export_location_text, export_preview_entries};
 use super::super::service::{Action, export_request, now_ms};
-use super::super::{snapshot_tz, theme};
+use super::super::status::StatusMsg;
+use super::super::{display_tz, snapshot_tz, theme};
 use gpui::prelude::*;
 use gpui::{ElementId, IntoElement, div, rgb, rgba};
 
@@ -21,7 +22,9 @@ impl TimetrackView {
     /// what a CSV would contain, rather than a second aggregation that could
     /// disagree with the totals on Home.
     pub(crate) fn render_export(&self) -> impl IntoElement {
-        let tz = snapshot_tz(&self.snapshot);
+        // Drawing only (labels and preview): the export click below
+        // re-resolves strictly before anything is computed or sent.
+        let tz = display_tz(&self.snapshot);
         div()
             .id("export-scroll")
             .flex_1()
@@ -241,14 +244,20 @@ impl TimetrackView {
                                 // that changed between the last paint and
                                 // the click would have put the file in a
                                 // directory named for a different week.
-                                let tz = snapshot_tz(&view.snapshot);
-                                let request = export_request(
-                                    button_scope,
-                                    view.export_picker.anchor_ms,
-                                    now_ms(),
-                                    &tz,
-                                );
-                                view.send(Action::ExportCsv(request));
+                                match snapshot_tz(&view.snapshot) {
+                                    Ok(tz) => {
+                                        let request = export_request(
+                                            button_scope,
+                                            view.export_picker.anchor_ms,
+                                            now_ms(),
+                                            &tz,
+                                        );
+                                        view.send(Action::ExportCsv(request));
+                                    }
+                                    Err(e) => {
+                                        view.status = Some(StatusMsg::local(e.to_string()));
+                                    }
+                                }
                                 cx.notify();
                             });
                         })
@@ -349,8 +358,12 @@ impl TimetrackView {
             .when_some(entity, move |el, entity| {
                 el.on_click(move |_ev, _window, cx| {
                     entity.update(cx, |view, cx| {
-                        let tz = snapshot_tz(&view.snapshot);
-                        view.export_picker.set_scope(scope, &tz);
+                        match snapshot_tz(&view.snapshot) {
+                            Ok(tz) => view.export_picker.set_scope(scope, &tz),
+                            Err(e) => {
+                                view.status = Some(StatusMsg::local(e.to_string()));
+                            }
+                        }
                         cx.notify();
                     });
                 })

@@ -429,6 +429,32 @@ mod tests {
     }
 
     #[test]
+    fn saving_on_a_clock_change_day_keeps_the_typed_wall_clocks() {
+        // #102: the dialog parses through the same core parser and the
+        // snapshot's zone as the CLI, so on Rome's spring-forward day the
+        // created interval must carry the wall clocks the user typed,
+        // not the hour-late pair midnight anchoring produced.
+        let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
+        let now = timetrack_core::parse_anchor_day("2026-03-29", "anchor", &rome).unwrap();
+        let mut dlg = new_dialog();
+        dlg.start = "00:30".into();
+        dlg.end = "09:30".into();
+        match resolve_save(&dlg, now, &rome) {
+            SaveOutcome::Create {
+                started_at,
+                ended_at,
+                ..
+            } => {
+                assert_eq!(timetrack_core::format_local_hm(started_at, &rome), "00:30");
+                assert_eq!(timetrack_core::format_local_hm(ended_at, &rome), "09:30");
+                assert_eq!(rome.day_of(started_at), rome.day_of(now));
+                assert_eq!(rome.day_of(ended_at), rome.day_of(now));
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_backwards_interval_stays_open_with_an_error() {
         let mut dlg = new_dialog();
         dlg.start = "now".into();
