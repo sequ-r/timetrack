@@ -7,13 +7,13 @@
 
 //! The project prompt: one name field, for creating or renaming.
 //!
-//! Plain keystroke editing like the other prompts, and likewise pure state
+//! Keystroke editing with a caret and selection like the other prompts, and likewise pure state
 //! so resolving is unit-testable without a window.
 
 /// The project prompt: one name field, for creating (`edit_id` none) or
 /// renaming (`edit_id` set, prefilled with the current name).
 ///
-/// Plain keystroke editing like the other prompts, and likewise pure state
+/// Keystroke editing with a caret and selection like the other prompts, and likewise pure state
 /// so resolving is unit-testable without a window.
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectPrompt {
@@ -21,6 +21,8 @@ pub(crate) struct ProjectPrompt {
     /// The typed name. Prefilled when renaming, so saving untouched would
     /// be a no-op the service round-trips harmlessly.
     pub(crate) name: String,
+    /// The caret (and any selection) in the name field (#109).
+    pub(crate) caret: crate::app::textline::Caret,
     pub(crate) error: Option<String>,
 }
 

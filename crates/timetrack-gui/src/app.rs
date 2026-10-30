@@ -484,6 +484,74 @@ impl TimetrackView {
     }
 
     /// Handle a key press. Returns false when the app should quit.
+    /// The text field a clipboard chord would act on, if any prompt with
+    /// one is open (#109). Mirrors the routing priority of `on_key`:
+    /// the entry dialog, then the project and split prompts, then the
+    /// export anchor while it is being edited.
+    fn focused_text_mut(&mut self) -> Option<(&mut String, &mut self::textline::Caret)> {
+        if let Some(dlg) = self.dialog.as_mut() {
+            return dlg.focused_text_mut();
+        }
+        if let Some(prompt) = self.project_prompt.as_mut() {
+            return Some((&mut prompt.name, &mut prompt.caret));
+        }
+        if let Some(prompt) = self.split_prompt.as_mut() {
+            return Some((&mut prompt.at, &mut prompt.caret));
+        }
+        if self.export_picker.editing {
+            return Some((
+                &mut self.export_picker.anchor_text,
+                &mut self.export_picker.caret,
+            ));
+        }
+        None
+    }
+
+    /// Ctrl+C / Ctrl+X / Ctrl+V against the focused field (#109).
+    /// Handled here, ahead of `on_key`, because the clipboard lives on
+    /// the gpui context the pure per-dialog handlers never see. Returns
+    /// whether the key was a clipboard chord with a field to act on;
+    /// outside a field the chords keep their normal fates (Ctrl+C in
+    /// particular is not intercepted anywhere else).
+    fn clipboard_key(&mut self, ev: &gpui::KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let m = &ev.keystroke.modifiers;
+        if !(m.control || m.platform) || m.alt {
+            return false;
+        }
+        match ev.keystroke.key.as_str() {
+            "c" | "x" => {
+                let Some((text, caret)) = self.focused_text_mut() else {
+                    return false;
+                };
+                let Some(selected) = self::textline::selected_text(text, caret) else {
+                    return true;
+                };
+                let selected = selected.to_string();
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
+                if ev.keystroke.key == "x" {
+                    if let Some((text, caret)) = self.focused_text_mut() {
+                        self::textline::delete_selection(text, caret);
+                    }
+                }
+                true
+            }
+            "v" => {
+                let Some(item) = cx.read_from_clipboard() else {
+                    return false;
+                };
+                let Some(pasted) = item.text() else {
+                    return false;
+                };
+                let Some((text, caret)) = self.focused_text_mut() else {
+                    return false;
+                };
+                self::textline::insert_text(text, caret, &pasted);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn on_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
         // A prompt that is open owns the keyboard, including the letters the
         // app shortcuts are bound to. Which prompt is open is one question
@@ -600,6 +668,14 @@ impl TimetrackView {
     /// Handle a key press while the entry dialog is open. Always returns true:
     /// `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_dialog_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        // Caret and selection keys (#109) edit the focused field; the
+        // project field reports false and keeps its cycling keys below.
+        if let Some(dlg) = self.dialog.as_mut() {
+            let m = &ev.keystroke.modifiers;
+            if dlg.edit_key(&ev.keystroke.key, m.shift, m.control) {
+                return true;
+            }
+        }
         match ev.keystroke.key.as_str() {
             "escape" => {
                 self.dialog = None;
@@ -703,6 +779,7 @@ impl TimetrackView {
         self.project_prompt = Some(ProjectPrompt {
             edit_id: None,
             name: String::new(),
+            caret: Default::default(),
             error: None,
         });
     }
@@ -716,8 +793,10 @@ impl TimetrackView {
         match current {
             Some((id, name)) => {
                 self.status = None;
+                let caret = self::textline::Caret::at_end(&name);
                 self.project_prompt = Some(ProjectPrompt {
                     edit_id: Some(id),
+                    caret,
                     name,
                     error: None,
                 });
@@ -729,6 +808,19 @@ impl TimetrackView {
     /// Handle a key press while the project prompt is open. Always returns
     /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_project_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if let Some(prompt) = self.project_prompt.as_mut() {
+            let m = &ev.keystroke.modifiers;
+            if self::textline::handle_edit_key(
+                &mut prompt.name,
+                &mut prompt.caret,
+                &ev.keystroke.key,
+                m.shift,
+                m.control,
+            ) {
+                prompt.error = None;
+                return true;
+            }
+        }
         match ev.keystroke.key.as_str() {
             "escape" => {
                 self.project_prompt = None;
@@ -736,7 +828,7 @@ impl TimetrackView {
             "enter" => self.project_save(),
             "backspace" => {
                 if let Some(prompt) = self.project_prompt.as_mut() {
-                    prompt.name.pop();
+                    self::textline::backspace(&mut prompt.name, &mut prompt.caret);
                     prompt.error = None;
                 }
             }
@@ -745,7 +837,7 @@ impl TimetrackView {
                 // prompts, so shortcuts never leak into the name.
                 if let Some(ch) = printable_char(ev) {
                     if let Some(prompt) = self.project_prompt.as_mut() {
-                        prompt.name.push_str(ch);
+                        self::textline::insert_text(&mut prompt.name, &mut prompt.caret, ch);
                         prompt.error = None;
                     }
                 }
@@ -910,6 +1002,7 @@ impl TimetrackView {
                     started_at: e.started_at,
                     ended_at: e.ended_at,
                     at: String::new(),
+                    caret: Default::default(),
                     error: None,
                 });
             }
@@ -920,6 +1013,19 @@ impl TimetrackView {
     /// Handle a key press while the split prompt is open. Always returns
     /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_split_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if let Some(prompt) = self.split_prompt.as_mut() {
+            let m = &ev.keystroke.modifiers;
+            if self::textline::handle_edit_key(
+                &mut prompt.at,
+                &mut prompt.caret,
+                &ev.keystroke.key,
+                m.shift,
+                m.control,
+            ) {
+                prompt.error = None;
+                return true;
+            }
+        }
         match ev.keystroke.key.as_str() {
             "escape" => {
                 self.split_prompt = None;
@@ -927,7 +1033,7 @@ impl TimetrackView {
             "enter" => self.split_save(),
             "backspace" => {
                 if let Some(prompt) = self.split_prompt.as_mut() {
-                    prompt.at.pop();
+                    self::textline::backspace(&mut prompt.at, &mut prompt.caret);
                     prompt.error = None;
                 }
             }
@@ -936,7 +1042,7 @@ impl TimetrackView {
                 // shortcuts and special keys never leak into the moment.
                 if let Some(ch) = printable_char(ev) {
                     if let Some(prompt) = self.split_prompt.as_mut() {
-                        prompt.at.push_str(ch);
+                        self::textline::insert_text(&mut prompt.at, &mut prompt.caret, ch);
                         prompt.error = None;
                     }
                 }
@@ -1127,6 +1233,13 @@ impl TimetrackView {
     /// Handle a key press while the anchor day field is open. Always returns
     /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_anchor_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        let m = &ev.keystroke.modifiers;
+        if self
+            .export_picker
+            .edit_key(&ev.keystroke.key, m.shift, m.control)
+        {
+            return true;
+        }
         match ev.keystroke.key.as_str() {
             "escape" => match snapshot_tz(&self.snapshot) {
                 Ok(tz) => self.export_picker.cancel_editing(&tz),
@@ -1286,7 +1399,11 @@ impl Render for TimetrackView {
                 // and a frame is scheduled solely by `notify`. Without it a
                 // keystroke changes state that no frame ever shows.
                 this.update(cx, |view, cx| {
-                    if !view.on_key(ev) {
+                    // Clipboard chords run first (#109): they need the
+                    // context, which the pure key handlers never see.
+                    if view.clipboard_key(ev, cx) {
+                        cx.notify();
+                    } else if !view.on_key(ev) {
                         cx.quit();
                     } else {
                         cx.notify();
@@ -1521,3 +1638,5 @@ mod dialogs;
 mod export;
 
 mod render;
+
+mod textline;

@@ -110,7 +110,10 @@ impl TimetrackView {
         }
         {
             let field_text = if self.export_picker.editing {
-                format!("{}_", self.export_picker.anchor_text)
+                super::super::textline::render_with_caret(
+                    &self.export_picker.anchor_text,
+                    &self.export_picker.caret,
+                )
             } else {
                 self.export_picker.anchor_text.clone()
             };

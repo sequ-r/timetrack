@@ -7,7 +7,7 @@
 
 //! The manual-entry dialog (REQUIREMENTS §5 methods 1 and 2, one form).
 //!
-//! Plain keystroke editing (type to append, backspace to delete) rather than
+//! Keystroke editing with a movable caret and selection rather than
 //! a toolkit text field: the window already routes every key through one
 //! focused root, and three small fields do not need IME or cursor movement.
 //! Everything here is pure state over strings, so the whole interaction is
@@ -55,7 +55,7 @@ impl DialogField {
 /// `keep_*` labels say what that is — which is the dialog form of `shorten`:
 /// unspecified endpoints are left alone and the entry is always kept.
 ///
-/// Plain keystroke editing (type to append, backspace to delete) rather than
+/// Keystroke editing with a movable caret and selection rather than
 /// a toolkit text field: the window already routes every key through one
 /// focused root, and three small fields do not need IME or cursor movement.
 /// Everything here is pure state over strings, so the whole interaction is
@@ -88,6 +88,9 @@ pub(crate) struct EntryDialog {
     pub(crate) orig_end: i64,
     pub(crate) orig_description: String,
     pub(crate) field: DialogField,
+    /// The caret (and any selection) in the focused text field (#109).
+    /// Reset to the field's end whenever focus moves.
+    pub(crate) caret: crate::app::textline::Caret,
     pub(crate) error: Option<String>,
 }
 
@@ -109,6 +112,7 @@ impl EntryDialog {
             orig_end: 0,
             orig_description: String::new(),
             field: DialogField::Description,
+            caret: crate::app::textline::Caret::default(),
             error: None,
         }
     }
@@ -150,6 +154,7 @@ impl EntryDialog {
             description: description.clone(),
             start: String::new(),
             end: String::new(),
+            caret: crate::app::textline::Caret::at_end(&description),
             orig_start: started_at,
             orig_end: ended_at,
             orig_description: description,
@@ -181,6 +186,7 @@ impl EntryDialog {
         if self.field == DialogField::Project && self.edit_id.is_none() {
             self.field = self.field.next();
         }
+        self.reset_caret();
     }
 
     /// Shift-Tab to the previous field, skipping like `next_field`.
@@ -189,6 +195,52 @@ impl EntryDialog {
         if self.field == DialogField::Project && self.edit_id.is_none() {
             self.field = self.field.prev();
         }
+        self.reset_caret();
+    }
+
+    /// The focused text field and its caret, or `None` on the project
+    /// field, which cycles instead of taking text.
+    pub(crate) fn focused_text_mut(
+        &mut self,
+    ) -> Option<(&mut String, &mut crate::app::textline::Caret)> {
+        let field = self.field;
+        let text = match field {
+            DialogField::Description => &mut self.description,
+            DialogField::Project => return None,
+            DialogField::Start => &mut self.start,
+            DialogField::End => &mut self.end,
+        };
+        Some((text, &mut self.caret))
+    }
+
+    /// Put the caret at the end of the newly focused field: where
+    /// append-style typing used to put it, and the least surprising
+    /// place to arrive.
+    fn reset_caret(&mut self) {
+        let len = match self.field {
+            DialogField::Description => self.description.len(),
+            DialogField::Project => 0,
+            DialogField::Start => self.start.len(),
+            DialogField::End => self.end.len(),
+        };
+        self.caret = crate::app::textline::Caret {
+            pos: len,
+            anchor: None,
+        };
+    }
+
+    /// Apply an editing key (caret movement, selection, deletes) to the
+    /// focused field. Returns false when the key was not an editing key
+    /// or the field takes no text.
+    pub(crate) fn edit_key(&mut self, key: &str, shift: bool, ctrl: bool) -> bool {
+        let Some((text, caret)) = self.focused_text_mut() else {
+            return false;
+        };
+        let handled = crate::app::textline::handle_edit_key(text, caret, key, shift, ctrl);
+        if handled {
+            self.error = None;
+        }
+        handled
     }
 
     /// Label for the start row: the hint in edit mode says what empty keeps.
@@ -213,31 +265,27 @@ impl EntryDialog {
         }
     }
 
-    /// Append typed text to the focused field. Any edit clears a stale error:
+    /// Insert typed text at the caret in the focused field, replacing
+    /// any selection. Any edit clears a stale error:
     /// the message described the text as it was, not as it is now.
     ///
     /// The project field takes no text: it is cycled (`cycle_project`), so
     /// keystrokes there simply do not land anywhere.
     pub(crate) fn type_text(&mut self, ch: &str) {
-        let target = match self.field {
-            DialogField::Description => &mut self.description,
-            DialogField::Project => return,
-            DialogField::Start => &mut self.start,
-            DialogField::End => &mut self.end,
+        let Some((text, caret)) = self.focused_text_mut() else {
+            return;
         };
-        target.push_str(ch);
+        crate::app::textline::insert_text(text, caret, ch);
         self.error = None;
     }
 
-    /// Delete the last character of the focused field.
+    /// Delete backwards in the focused field: the selection if one is
+    /// held, else the character before the caret.
     pub(crate) fn backspace(&mut self) {
-        let target = match self.field {
-            DialogField::Description => &mut self.description,
-            DialogField::Project => return,
-            DialogField::Start => &mut self.start,
-            DialogField::End => &mut self.end,
+        let Some((text, caret)) = self.focused_text_mut() else {
+            return;
         };
-        target.pop();
+        crate::app::textline::backspace(text, caret);
         self.error = None;
     }
 }
@@ -369,6 +417,26 @@ mod tests {
         assert_eq!(dlg.start, "-60");
         assert_eq!(dlg.end, "now");
         assert_eq!(dlg.field, DialogField::Description);
+    }
+
+    #[test]
+    fn a_typo_mid_word_is_fixed_without_deleting_back_to_it() {
+        // The scenario that opened #109: "caffé" typed for the
+        // description, then fixed by moving the caret, not by
+        // backspacing through the word.
+        let mut dlg = new_dialog();
+        dlg.type_text("caffé");
+        assert!(dlg.edit_key("left", false, false));
+        assert!(dlg.edit_key("left", false, false));
+        dlg.type_text("e");
+        assert_eq!(dlg.description, "cafefé");
+        assert!(dlg.edit_key("a", false, true), "ctrl-a selects all");
+        dlg.type_text("caffè");
+        assert_eq!(dlg.description, "caffè");
+        // Tabbing re-seats the caret at the next field's end.
+        dlg.next_field();
+        assert_eq!(dlg.field, DialogField::Start);
+        assert_eq!(dlg.caret.pos, dlg.start.len());
     }
 
     #[test]
