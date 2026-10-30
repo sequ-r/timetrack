@@ -638,6 +638,29 @@ for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject 
 done
 # #103: clients refresh on this instead of polling.
 printf '%s' "$INTRO" | grep -q "Changed" && ok "Changed signal is exposed" || bad "Changed signal is exposed" "not found"
+
+echo
+echo "== the typed interface (Entries2, #110) =="
+printf '%s' "$INTRO" | grep -q "org.sequ.timetrack.Entries2" && ok "Entries2 is exposed beside Entries" || bad "Entries2 is exposed beside Entries" "not found"
+API_V=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries2.ApiVersion 2>/dev/null)
+check "ApiVersion reports 2" "(uint32 2,)" "$API_V"
+# A typed QuickAdd replies with a struct, not a JSON string.
+TYPED_ADD=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries2.QuickAdd "p1" 900000 2>/dev/null)
+contains "typed QuickAdd returns the entry struct" "'QuickAdd'" "$TYPED_ADD"
+case "$TYPED_ADD" in
+  *'{"'* ) bad "typed reply is not JSON-in-string" "looked like JSON: $TYPED_ADD" ;;
+  * ) ok "typed reply is not JSON-in-string" ;;
+esac
+created=$((created+1))
+# Refusals arrive as named typed errors, variant preserved.
+DUP_ERR=$(gdbus call --session --dest org.sequ.timetrack \
+  --object-path /org/sequ/timetrack \
+  --method org.sequ.timetrack.Entries2.AddProject "General" 2>&1)
+contains "duplicate project is a named typed error" "org.sequ.timetrack.Error.DuplicateProject" "$DUP_ERR"
 # The journal rode along with every mutation above, beside the checkpoint.
 [ -f "$STORE.journal" ] && ok "the journal sits beside the checkpoint" || bad "the journal sits beside the checkpoint" "no $STORE.journal"
 
