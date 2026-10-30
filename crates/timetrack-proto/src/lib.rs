@@ -149,15 +149,13 @@ pub struct Snapshot {
     #[serde(default)]
     pub local_offset_ms: i64,
     /// The service's timezone name (`UTC`, `UTC+2`, or an IANA name such as
-    /// `Europe/Rome`). New clients resolve per-instant offsets from this;
-    /// old services leave it empty, in which case clients fall back to
-    /// `local_offset_ms`.
-    #[serde(default = "default_tz")]
+    /// `Europe/Rome`). Clients resolve per-instant offsets from this and
+    /// parse typed local times only with it (#102). A service too old to
+    /// send the field leaves it empty — detectable, so a new client can
+    /// refuse instead of silently assuming UTC (the old serde default
+    /// here) or the fixed `local_offset_ms`.
+    #[serde(default)]
     pub tz: String,
-}
-
-fn default_tz() -> String {
-    "UTC".to_string()
 }
 
 impl Snapshot {
@@ -661,6 +659,18 @@ mod tests {
         assert!(back.entries.is_empty());
         assert!(back.projects.is_empty());
         assert_eq!(back.total_ms, 0);
+    }
+
+    #[test]
+    fn a_snapshot_without_a_tz_field_is_detectably_nameless() {
+        // #102: an old service's JSON has no `tz` field. It must arrive
+        // empty — never defaulted to "UTC" — so a new client can refuse
+        // to parse typed local times against a guessed zone.
+        let back: Snapshot = serde_json::from_str(
+            r#"{"projects":[],"entries":[],"week":{"total_ms":0,"per_project":{},"entry_count":0},"month":{"total_ms":0,"per_project":{},"entry_count":0},"total_ms":0}"#,
+        )
+        .unwrap();
+        assert_eq!(back.tz, "");
     }
 
     #[test]

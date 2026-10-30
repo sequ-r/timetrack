@@ -23,7 +23,7 @@ use super::super::dialogs::merge::MergeConfirm;
 use super::super::dialogs::project::ProjectPrompt;
 use super::super::dialogs::recolour::RecolourPrompt;
 use super::super::dialogs::split::SplitPrompt;
-use super::super::{snapshot_tz, theme};
+use super::super::{display_tz, theme};
 use gpui::prelude::*;
 use gpui::{Div, IntoElement, div, px, rgb, rgba};
 
@@ -86,7 +86,8 @@ impl TimetrackView {
     /// eye already is rather than competing from below. Keyboard-driven like
     /// everything else here — no mouse targets, no toolkit text field.
     fn render_entry_dialog(&self, dlg: &EntryDialog) -> impl IntoElement {
-        let tz = snapshot_tz(&self.snapshot);
+        // Drawing only (the keep-hints): saving re-resolves strictly.
+        let tz = display_tz(&self.snapshot);
         let title = match &dlg.edit_id {
             None => format!("NEW ENTRY → {}", dlg.project_name),
             Some(id) => format!("EDIT ENTRY {id} · {}", dlg.project_name),

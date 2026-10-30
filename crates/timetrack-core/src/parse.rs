@@ -14,8 +14,12 @@
 //! disagree, which is exactly what the shared core exists to prevent.
 //!
 //! Like the rest of the core this takes the clock as a parameter (`now_ms`)
-//! and reads nothing itself. The service owns the timezone and reports its
-//! offset; callers pass it in (the CLI and GUI read it from the snapshot).
+//! and reads nothing itself. The service is the single timezone authority
+//! (#102, ADR 0009): it reports its zone *name* on every snapshot, and the
+//! CLI and GUI may parse only with the zone that name strictly resolves to
+//! ([`crate::Tz::from_snapshot`]) — never their own environment, never a
+//! guessed fallback. That is what keeps a typed `HH:MM` and the service's
+//! totals bucketing the same entry into the same local day.
 
 use crate::model::MS_PER_DAY;
 use crate::tz::Tz;
@@ -35,6 +39,10 @@ pub enum ParseError {
     BadMinute { what: String, text: String },
     #[error("{what}: '{text}' is not a real time of day")]
     BadTimeOfDay { what: String, text: String },
+    /// A wall-clock time skipped by a DST spring-forward (#102): it names
+    /// no instant today, so storing either neighbour would be a silent lie.
+    #[error("{what}: '{text}' does not occur today (the clocks change)")]
+    NoSuchTime { what: String, text: String },
     #[error("{what}: '{text}' is not a calendar day (use YYYY-MM-DD)")]
     BadDay { what: String, text: String },
     #[error("duration cannot be empty")]
@@ -148,12 +156,41 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult
         });
     }
 
-    let local_midnight = tz.day_start(tz.day_of(now_ms));
-    // `h`/`m` are bounded above, so only the final add can overflow, and
-    // only for a caller-supplied `now_ms` near the `i64` edges (#98).
-    local_midnight
-        .checked_add(h * 3_600_000 + m * 60_000)
-        .ok_or_else(overflow)
+    // Resolve the wall clock in the zone, not as elapsed time since local
+    // midnight (#102). On a DST transition day the two disagree: midnight
+    // anchoring put 09:30 an hour out on both 2026 Rome transitions. Find
+    // the instant whose local time *is* HH:MM today instead — a skipped
+    // spring-forward time has none and is refused, a repeated fall-back
+    // time reads as its first occurrence.
+    let day = tz.day_of(now_ms);
+    let target_local = day
+        .checked_mul(MS_PER_DAY)
+        .and_then(|d| d.checked_add(h * 3_600_000 + m * 60_000))
+        .ok_or_else(overflow)?;
+    let mut candidates: Vec<i64> = Vec::new();
+    for probe in [
+        tz.day_start(day),
+        tz.day_start(day.saturating_add(1)).saturating_sub(1),
+        target_local,
+    ] {
+        let Some(utc) = target_local.checked_sub(tz.offset_at_ms(probe)) else {
+            continue;
+        };
+        if tz.day_of(utc) == day
+            && utc.saturating_add(tz.offset_at_ms(utc)) == target_local
+            && !candidates.contains(&utc)
+        {
+            candidates.push(utc);
+        }
+    }
+    candidates.sort_unstable();
+    candidates
+        .first()
+        .copied()
+        .ok_or_else(|| ParseError::NoSuchTime {
+            what: what.to_string(),
+            text: text.to_string(),
+        })
 }
 
 /// Whether an `i64` parse failed because the value does not fit, as opposed
@@ -410,6 +447,44 @@ mod tests {
         let t = parse_moment("00:30", "start", now, &rome).unwrap();
         assert_eq!(rome.day_of(t), rome.day_of(now));
         assert_eq!(format_local_hm(t, &rome), "00:30");
+    }
+
+    #[test]
+    fn a_wall_clock_time_on_the_spring_forward_day_uses_the_new_offset() {
+        // #102: on 2026-03-29 Rome's clocks jump 02:00 -> 03:00. Anchoring
+        // on that day's midnight (CET) and adding elapsed time puts 09:30
+        // an hour late; the wall clock the user typed is what must land.
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        let now = parse_anchor_day("2026-03-29", "anchor", &rome).unwrap();
+        for text in ["00:30", "09:30", "23:30"] {
+            let t = parse_moment(text, "start", now, &rome).unwrap();
+            assert_eq!(rome.day_of(t), rome.day_of(now), "{text} day");
+            assert_eq!(format_local_hm(t, &rome), text, "{text} wall clock");
+        }
+        // 02:30 never happens that day: refuse it rather than storing the
+        // wrong hour silently.
+        assert!(parse_moment("02:30", "start", now, &rome).is_err());
+    }
+
+    #[test]
+    fn a_wall_clock_time_on_the_fall_back_day_uses_the_new_offset() {
+        // #102: on 2026-10-25 Rome's clocks fall back 03:00 -> 02:00.
+        // 09:30 is CET by then; midnight anchoring (CEST) lands an hour
+        // early. The repeated 02:30 reads as its first occurrence (CEST).
+        let rome = Tz::parse("Europe/Rome").unwrap();
+        let now = parse_anchor_day("2026-10-25", "anchor", &rome).unwrap();
+        for text in ["00:30", "09:30", "23:30"] {
+            let t = parse_moment(text, "start", now, &rome).unwrap();
+            assert_eq!(rome.day_of(t), rome.day_of(now), "{text} day");
+            assert_eq!(format_local_hm(t, &rome), text, "{text} wall clock");
+        }
+        let repeated = parse_moment("02:30", "start", now, &rome).unwrap();
+        assert_eq!(format_local_hm(repeated, &rome), "02:30");
+        assert_eq!(
+            rome.offset_at_ms(repeated),
+            7_200_000,
+            "the repeated hour reads as its first (CEST) occurrence"
+        );
     }
 
     #[test]

@@ -53,10 +53,27 @@ use timetrack_proto::{ProjectView, Snapshot};
 /// How often the service is polled for a new snapshot.
 const REFRESH: Duration = Duration::from_millis(1000);
 
-/// The snapshot's zone: prefer the name, fall back to the fixed offset for
-/// old services that send no name.
-fn snapshot_tz(snap: &timetrack_proto::Snapshot) -> timetrack_core::Tz {
-    timetrack_core::Tz::from_snapshot(&snap.tz, snap.local_offset_ms)
+/// The service's zone, from the snapshot's name, strictly (#102).
+///
+/// The GUI never reads its own `TZ`: the service is the zone authority.
+/// Anything that turns typed local times into instants, or computes an
+/// export from them, goes through here and surfaces the error inline
+/// instead of parsing against a guessed zone.
+fn snapshot_tz(
+    snap: &timetrack_proto::Snapshot,
+) -> Result<timetrack_core::Tz, timetrack_core::TzError> {
+    timetrack_core::Tz::from_snapshot(&snap.tz)
+}
+
+/// The zone used only to *draw* times.
+///
+/// Before the first snapshot arrives the view holds the empty default
+/// snapshot, which has no entries and no usable zone, yet a frame still
+/// has to render. Drawing with UTC there is a placeholder, never a parse:
+/// every action that could store an instant goes through
+/// [`snapshot_tz`] and refuses on error.
+fn display_tz(snap: &timetrack_proto::Snapshot) -> timetrack_core::Tz {
+    snapshot_tz(snap).unwrap_or_else(|_| timetrack_core::Tz::utc())
 }
 
 /// The newest quick-add, which is what undo removes.
@@ -270,9 +287,12 @@ impl TimetrackView {
         // it from the snapshot zone now that a real zone exists.
         // User edits stay intact — only the just-opened value is
         // fixed (see `refresh_from_snapshot`).
-        let tz = snapshot_tz(&self.snapshot);
+        // An unusable zone leaves the picker as it is; the first action
+        // that needs the zone surfaces the error inline (#102).
         let before = self.export_picker.anchor_text.clone();
-        self.export_picker.refresh_from_snapshot(&tz);
+        if let Ok(tz) = snapshot_tz(&self.snapshot) {
+            self.export_picker.refresh_from_snapshot(&tz);
+        }
         if self.export_picker.anchor_text != before {
             changed = true;
         }
@@ -926,7 +946,15 @@ impl TimetrackView {
         let Some(prompt) = self.split_prompt.clone() else {
             return;
         };
-        let tz = snapshot_tz(&self.snapshot);
+        let tz = match snapshot_tz(&self.snapshot) {
+            Ok(tz) => tz,
+            Err(e) => {
+                if let Some(open) = self.split_prompt.as_mut() {
+                    open.error = Some(e.to_string());
+                }
+                return;
+            }
+        };
         match resolve_split(&prompt, now_ms(), &tz) {
             Err(msg) => {
                 if let Some(open) = self.split_prompt.as_mut() {
@@ -1014,11 +1042,22 @@ impl TimetrackView {
     /// Validate the dialog and send the action(s). Stays open with an error
     /// on invalid input; closes on success or when nothing changed.
     fn dialog_save(&mut self) {
+        let Some((orig_start, orig_end)) = self.dialog.as_ref().map(|d| (d.orig_start, d.orig_end))
+        else {
+            return;
+        };
+        let tz = match snapshot_tz(&self.snapshot) {
+            Ok(tz) => tz,
+            Err(e) => {
+                if let Some(dlg) = self.dialog.as_mut() {
+                    dlg.error = Some(e.to_string());
+                }
+                return;
+            }
+        };
         let Some(dlg) = self.dialog.as_ref() else {
             return;
         };
-        let (orig_start, orig_end) = (dlg.orig_start, dlg.orig_end);
-        let tz = snapshot_tz(&self.snapshot);
         match resolve_save(dlg, now_ms(), &tz) {
             SaveOutcome::Invalid(msg) => {
                 if let Some(dlg) = self.dialog.as_mut() {
@@ -1074,22 +1113,31 @@ impl TimetrackView {
 
     /// Move the export anchor one period in `delta` (±1 per press).
     fn step_export_anchor(&mut self, delta: i32) {
-        let tz = snapshot_tz(&self.snapshot);
-        self.export_picker.step(delta, &tz);
+        match snapshot_tz(&self.snapshot) {
+            Ok(tz) => self.export_picker.step(delta, &tz),
+            Err(e) => self.status = Some(StatusMsg::local(e.to_string())),
+        }
     }
 
     /// Handle a key press while the anchor day field is open. Always returns
     /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
     fn on_anchor_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
         match ev.keystroke.key.as_str() {
-            "escape" => {
-                let tz = snapshot_tz(&self.snapshot);
-                self.export_picker.cancel_editing(&tz);
-            }
-            "enter" => {
-                let tz = snapshot_tz(&self.snapshot);
-                self.export_picker.commit(&tz);
-            }
+            "escape" => match snapshot_tz(&self.snapshot) {
+                Ok(tz) => self.export_picker.cancel_editing(&tz),
+                // No usable zone to re-mirror the day from (#102): close
+                // the field anyway and say why in the footer.
+                Err(e) => {
+                    self.export_picker.editing = false;
+                    self.status = Some(StatusMsg::local(e.to_string()));
+                }
+            },
+            "enter" => match snapshot_tz(&self.snapshot) {
+                Ok(tz) => {
+                    self.export_picker.commit(&tz);
+                }
+                Err(e) => self.export_picker.error = Some(e.to_string()),
+            },
             "backspace" => self.export_picker.backspace(),
             // Tab stays in the field: enter sets the day, escape cancels.
             "tab" => {}
@@ -1394,6 +1442,22 @@ mod tests {
     }
 
     // --- tabs and bars (§11) ---
+
+    #[test]
+    fn the_snapshot_zone_is_strict_for_parsing_and_placeholder_for_drawing() {
+        // #102: the empty default snapshot (and an old service's) has no
+        // usable zone. Parsing must refuse with that error; drawing the
+        // still-empty first frame gets the documented UTC placeholder.
+        let mut snap = Snapshot::default();
+        assert_eq!(
+            snapshot_tz(&snap),
+            Err(timetrack_core::TzError::MissingSnapshotZone)
+        );
+        assert_eq!(display_tz(&snap), timetrack_core::Tz::utc());
+        snap.tz = "Europe/Rome".into();
+        assert_eq!(snapshot_tz(&snap).unwrap().name(), "Europe/Rome");
+        assert_eq!(display_tz(&snap).name(), "Europe/Rome");
+    }
 
     #[test]
     fn an_export_request_names_one_period_everywhere() {

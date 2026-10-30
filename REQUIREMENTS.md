@@ -451,7 +451,7 @@ specification and the implementation do not quietly diverge.
 | §2 Corrupt store refused, not reset | `storage.rs` | storage test |
 | §5 Methods 1 and 2 as one dialog, GUI + CLI | `core/src/parse.rs` (shared spellings), GUI dialog (`a` new / `e` edit), CLI wrappers | core/GUI tests + gui-smoke (open, cancel, save, typed text) |
 | §10 CSV export, ISO 8601 local time, `HH:MM:SS` + minutes, `source`, GUI + CLI, week/month/all | `core/src/export.rs`, service `ExportCsv`, CLI `export`, GUI Export tab | core/service tests + e2e (65 checks) |
-| §9 Named-zone DST bucketing per instant | `core/src/tz.rs` (`Tz`, tz-database via `chrono-tz`), service `Tz::from_env`, snapshot `tz` + per-instant `local_offset_ms`, CLI/GUI `Tz::from_snapshot` | core DST tests (Rome winter/summer, transition days, week-split), service DST test, live `TZ=Europe/Rome` snapshot check |
+| §9 Named-zone DST bucketing per instant | `core/src/tz.rs` (`Tz`, tz-database via `chrono-tz`), service `Tz::try_from_env` (strict, refreshed live; ADR 0009), snapshot `tz` + per-instant `local_offset_ms`, CLI/GUI strict `Tz::from_snapshot` | core DST tests (Rome winter/summer, both transition days' wall clocks, week-split), service client/service agreement test across both transitions, live `TZ=Europe/Rome` snapshot check |
 | §11 Project rename and recolour | `core::update_project`, service `UpdateProject`, CLI `rename`/`recolour`, GUI naming prompt (`n` new / `r` rename) + colour dot | core/service/CLI/GUI tests + e2e (rename, recolour, 5 guards, snapshot asserts) + gui-smoke (prompt paint, keyboard create/rename) |
 | §13 Core free of GUI/IPC/async/clock | `core/` | by construction |
 

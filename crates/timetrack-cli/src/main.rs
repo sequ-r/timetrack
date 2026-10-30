@@ -330,7 +330,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         } => {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
-            let tz = snapshot_tz(&snap);
+            let tz = snapshot_tz(&snap)?;
             let start_ms = parse_when(&start, "start", &tz)?;
             let end_ms = parse_when(&end, "end", &tz)?;
             let e = client.add(&project, &description, start_ms, end_ms).await?;
@@ -366,7 +366,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let snap = client.snapshot().await?;
             let project = pick_project(&snap, project.as_deref())?;
             let ms = parse_duration(&for_)?;
-            let tz = snapshot_tz(&snap);
+            let tz = snapshot_tz(&snap)?;
             let end_ms = parse_when(&ended, "ended", &tz)?;
             let e = client
                 .add_duration_ending(&project, &description, ms, end_ms)
@@ -411,7 +411,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
-            let tz = snapshot_tz(&snap);
+            let tz = snapshot_tz(&snap)?;
             let start_ms = match &start {
                 Some(s) => parse_when(s, "start", &tz)?,
                 None => existing.started_at,
@@ -466,7 +466,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .iter()
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
-            let tz = snapshot_tz(&snap);
+            let tz = snapshot_tz(&snap)?;
             let at_ms = parse_when(&at, "at", &tz)?;
             if at_ms <= existing.started_at || at_ms >= existing.ended_at {
                 anyhow::bail!("split point is outside entry '{id}'");
@@ -609,7 +609,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 // proto sorts as a version refusal -- a version message,
                 // never a wrong file (reuses the ticket-23 wording as-is).
                 let snap = client.snapshot().await?;
-                let tz = snapshot_tz(&snap);
+                let tz = snapshot_tz(&snap)?;
                 let anchor_ms = parse_export_anchor(&at_text, &tz)?;
                 let csv = client.export_csv_at(&scope, anchor_ms).await?;
                 (csv, parsed.period_id(anchor_ms, &tz))
@@ -620,7 +620,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 let period_id = match &out {
                     Some(_) => {
                         let snap = client.snapshot().await?;
-                        parsed.period_id(now_ms(), &snapshot_tz(&snap))
+                        parsed.period_id(now_ms(), &snapshot_tz(&snap)?)
                     }
                     None => String::new(),
                 };
@@ -813,10 +813,14 @@ fn export_file_status(
     timetrack_core::format_export_status(count, scope, period_id, &basename)
 }
 
-/// The snapshot's zone: prefer the name, fall back to the fixed offset for
-/// old services that send no name.
-fn snapshot_tz(snap: &Snapshot) -> timetrack_core::Tz {
-    timetrack_core::Tz::from_snapshot(&snap.tz, snap.local_offset_ms)
+/// The service's zone, from the snapshot's name, strictly (#102).
+///
+/// The CLI never reads its own `TZ`: the service is the zone authority,
+/// and a snapshot without a usable name (an older service) is an error
+/// the user sees, never a fixed-offset guess that could bucket a typed
+/// time differently from the service's totals.
+fn snapshot_tz(snap: &Snapshot) -> Result<timetrack_core::Tz> {
+    timetrack_core::Tz::from_snapshot(&snap.tz).map_err(anyhow::Error::new)
 }
 
 /// Whether a typed merge confirmation counts as "yes".
@@ -875,6 +879,21 @@ mod tests {
         let text = explain(err).to_string();
         assert_eq!(text, "a project named 'Evil  [2J' already exists");
         assert!(!text.chars().any(|c| c.is_control()));
+    }
+
+    #[test]
+    fn a_snapshot_without_a_usable_zone_is_an_error_not_a_guess() {
+        // #102: an old service sends no zone name. The CLI must refuse to
+        // parse typed times against it rather than fall back to the
+        // snapshot's fixed offset (or UTC) and bucket differently from
+        // the service's totals.
+        let mut snap = Snapshot::default();
+        let err = snapshot_tz(&snap).unwrap_err().to_string();
+        assert!(err.contains("did not report a timezone"), "got: {err}");
+        snap.tz = "Europe/Romeo".into();
+        assert!(snapshot_tz(&snap).is_err());
+        snap.tz = "Europe/Rome".into();
+        assert_eq!(snapshot_tz(&snap).unwrap().name(), "Europe/Rome");
     }
 
     #[test]

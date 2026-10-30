@@ -56,10 +56,48 @@ struct Inner {
     store: JsonStore,
     data: Store,
     ids: Counter,
-    /// The local zone, resolved once at startup from `TZ` (or the system
-    /// zone). Offsets are resolved per instant from this, so DST transitions
-    /// bucket correctly (REQUIREMENTS §9).
+    /// The local zone (#102): resolved strictly at startup from `TZ` (or
+    /// the system zone), then re-resolved before every snapshot, mutation
+    /// and export so a system timezone change (travel) is picked up live
+    /// instead of needing a restart. Offsets are resolved per instant
+    /// from this, so DST transitions bucket correctly (REQUIREMENTS §9).
     tz: core::Tz,
+    /// Whether `tz` may be refreshed from the environment. Production
+    /// builds it live; `new_with_tz` pins it so tests stay deterministic.
+    tz_live: bool,
+    /// The last refresh failure already logged, so a zone that becomes
+    /// unusable mid-run is noted once instead of once per snapshot poll.
+    /// The last good zone is kept in that case: startup already proved a
+    /// usable zone exists, and failing every call would lose tracking.
+    tz_refresh_error: Option<String>,
+}
+
+/// Re-resolve the zone from the environment (#102), adopting it when it
+/// changed. `TZ` in the process environment cannot change after launch —
+/// that genuinely needs a restart — but the *system* zone can (the user
+/// travels, `timedatectl` runs), and that is the case this picks up.
+fn refresh_tz(inner: &mut Inner) {
+    if !inner.tz_live {
+        return;
+    }
+    match core::Tz::try_from_env() {
+        Ok(fresh) => {
+            inner.tz_refresh_error = None;
+            if fresh.name() != inner.tz.name() {
+                inner.tz = fresh;
+            }
+        }
+        Err(e) => {
+            let note = e.to_string();
+            if inner.tz_refresh_error.as_deref() != Some(note.as_str()) {
+                eprintln!(
+                    "timetrack-service: keeping timezone {} ({note})",
+                    inner.tz.name()
+                );
+                inner.tz_refresh_error = Some(note);
+            }
+        }
+    }
 }
 
 /// Serialise access to the store.
@@ -69,13 +107,24 @@ pub struct EntryService {
 
 impl EntryService {
     pub fn new(store: JsonStore) -> anyhow::Result<Self> {
-        Self::new_with_tz(store, core::Tz::from_env())
+        // Strict (#102): an unusable `TZ` or system zone stops the service
+        // here with an actionable message, instead of silently running in
+        // UTC and bucketing every typed local time into the wrong day.
+        let tz = core::Tz::try_from_env().map_err(anyhow::Error::new)?;
+        Self::new_inner(store, tz, true)
     }
 
-    /// Build with an explicit zone. The production path is [`EntryService::new`]
-    /// (from the environment); this exists so tests can pin a named zone
-    /// without mutating the process-global `TZ`.
+    /// Build with an explicit, pinned zone. The production path is
+    /// [`EntryService::new`] (from the environment, refreshed live); this
+    /// exists so tests can pin a named zone without mutating the
+    /// process-global `TZ`, and pinning turns the live refresh off so the
+    /// test's zone can never be replaced under it.
+    #[cfg(test)]
     pub fn new_with_tz(store: JsonStore, tz: core::Tz) -> anyhow::Result<Self> {
+        Self::new_inner(store, tz, false)
+    }
+
+    fn new_inner(store: JsonStore, tz: core::Tz, tz_live: bool) -> anyhow::Result<Self> {
         let mut data = store.load()?;
         // A brand-new store has no projects, and with no project there is
         // nothing to attribute time to -- which made the Home tab's quick-add
@@ -98,6 +147,8 @@ impl EntryService {
                 data,
                 ids,
                 tz,
+                tz_live,
+                tz_refresh_error: None,
             }),
         };
         // Persist the seed immediately, so a read-only store surfaces at
@@ -119,7 +170,8 @@ impl EntryService {
 
     /// A consistent view of everything a client needs for one frame.
     pub fn snapshot(&self) -> Snapshot {
-        let g = lock(&self.inner);
+        let mut g = lock(&self.inner);
+        refresh_tz(&mut g);
         let now = now_ms();
         let today = g.tz.day_of(now);
         // One pass for all four aggregates: clients poll snapshots
@@ -165,6 +217,7 @@ impl EntryService {
         f: impl FnOnce(&mut Store, &mut Counter, i64) -> core::RuleResult<T>,
     ) -> Result<T, ServiceError> {
         let mut g = lock(&self.inner);
+        refresh_tz(&mut g);
         let now = now_ms();
         // Destructure so `data` and `ids` are borrowed separately; borrowing
         // two fields of the same struct mutably in one call is rejected.
@@ -363,7 +416,8 @@ impl EntryService {
         if scope != core::ExportScope::All && !core::instant_in_range(anchor_ms) {
             return Err(ServiceError::from(RuleError::InstantOutOfRange(anchor_ms)));
         }
-        let g = lock(&self.inner);
+        let mut g = lock(&self.inner);
+        refresh_tz(&mut g);
         Ok(core::export_csv_at(&g.data, scope, anchor_ms, &g.tz))
     }
 
@@ -386,10 +440,11 @@ fn to_totals_view(t: &core::Totals) -> TotalsView {
     }
 }
 
-// Timezone resolution lives in `timetrack-core::Tz`: `Tz::from_env` reads
-// `TZ` (or the system zone), and offsets are then resolved per instant, so
-// DST transitions bucket correctly. There is deliberately no offset logic
-// left here — one implementation, in the core, so both UIs agree.
+// Timezone resolution lives in `timetrack-core::Tz`: `Tz::try_from_env`
+// reads `TZ` (or the system zone) strictly, `refresh_tz` re-reads it live
+// (#102), and offsets are then resolved per instant, so DST transitions
+// bucket correctly. There is deliberately no offset logic left here — one
+// implementation, in the core, so both UIs agree.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,7 +811,7 @@ mod tests {
         let (svc, _) = service("over24");
         let p = project(&svc);
         let snap0 = svc.snapshot();
-        let tz = core::Tz::from_snapshot(&snap0.tz, snap0.local_offset_ms);
+        let tz = core::Tz::from_snapshot(&snap0.tz).unwrap();
         let today = tz.day_of(now_ms());
         let base = tz.day_start(today);
         // Three overlapping 12h entries, all starting today.
@@ -951,9 +1006,71 @@ mod tests {
     fn snapshot_carries_a_parseable_zone() {
         let (svc, _) = service("tz-name");
         let snap = svc.snapshot();
-        let tz = core::Tz::from_snapshot(&snap.tz, snap.local_offset_ms);
+        let tz = core::Tz::from_snapshot(&snap.tz).unwrap();
         assert_eq!(tz.name(), snap.tz.as_str());
         assert_eq!(tz.offset_at_ms(now_ms()), snap.local_offset_ms);
+    }
+
+    #[test]
+    fn a_pinned_zone_survives_the_live_refresh() {
+        // `new_with_tz` pins (#102): snapshots refresh a live service's
+        // zone from the environment, but a pinned test zone must never be
+        // replaced under the test, whatever the host zone is.
+        let dir = std::env::temp_dir().join("tt-svc-tz-pinned");
+        let _ = std::fs::remove_dir_all(&dir);
+        let svc =
+            EntryService::new_with_tz(JsonStore::new(dir.join("store.json")), core::Tz::utc())
+                .unwrap();
+        assert_eq!(svc.snapshot().tz, "UTC");
+        assert_eq!(svc.snapshot().tz, "UTC");
+    }
+
+    #[test]
+    fn client_parsed_times_and_service_buckets_agree_across_both_dst_transitions() {
+        // #102 acceptance: the client path (snapshot zone strictly
+        // resolved, typed HH:MM through the one core parser) and the
+        // service path (totals/exports bucketed by the service's zone)
+        // must put the same entry in the same local day and week, on
+        // both Rome transition days.
+        let dir = std::env::temp_dir().join("tt-svc-dst-agree");
+        let _ = std::fs::remove_dir_all(&dir);
+        let rome = core::Tz::parse("Europe/Rome").unwrap();
+        let svc = EntryService::new_with_tz(JsonStore::new(dir.join("store.json")), rome.clone())
+            .unwrap();
+        let p = svc.snapshot().projects.first().cloned().unwrap();
+
+        for (day, label) in [
+            ("2026-03-29", "spring_entry"),
+            ("2026-10-25", "autumn_entry"),
+        ] {
+            // What a client does: take the snapshot's zone, parse the
+            // typed wall clocks as of that day.
+            let snap = svc.snapshot();
+            let client_tz = core::Tz::from_snapshot(&snap.tz).unwrap();
+            assert_eq!(client_tz, rome);
+            let now = core::parse_anchor_day(day, "anchor", &client_tz).unwrap();
+            let start = core::parse_moment("00:30", "start", now, &client_tz).unwrap();
+            let end = core::parse_moment("09:30", "end", now, &client_tz).unwrap();
+            svc.add(&p.id, label, start, end).unwrap();
+
+            // The service buckets it into that day's week, renders the
+            // typed wall clocks back, and keeps it out of the prior week.
+            let csv = svc.export_csv_at("week", now).unwrap();
+            assert!(csv.contains(label), "{day} week export:\n{csv}");
+            assert!(
+                csv.contains(&format!("{day}T00:30:00")),
+                "{day} start wall clock:\n{csv}"
+            );
+            assert!(
+                csv.contains(&format!("{day}T09:30:00")),
+                "{day} end wall clock:\n{csv}"
+            );
+            let prior = svc
+                .export_csv_at("week", now - 7 * timetrack_core::MS_PER_DAY)
+                .unwrap();
+            assert!(!prior.contains(label), "{day} prior week:\n{prior}");
+            assert_eq!(rome.day_of(start), rome.day_of(now));
+        }
     }
 
     #[test]
