@@ -14,10 +14,10 @@ path = "src/main.rs"
 [dependencies]
 timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
+zbus = { workspace = true }
 ksni = { workspace = true }
 anyhow = { workspace = true }
 async-io = { workspace = true }
 
 [dev-dependencies]
-zbus = { workspace = true }
 serde_json = { workspace = true }

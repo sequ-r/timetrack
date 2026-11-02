@@ -346,7 +346,7 @@ impl ksni::Tray for TimetrackTray {
     }
 
     fn id(&self) -> String {
-        "org.sequ.timetrack.tray".into()
+        crate::TRAY_NAME.into()
     }
 
     fn title(&self) -> String {

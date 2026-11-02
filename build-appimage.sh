@@ -5,9 +5,9 @@
 #
 # Produces TimeTrack-<arch>.AppImage: one portable file bundling
 # timetrack-gui, timetrack-service, the timetrack CLI and timetrack-tray.
-# It needs no install -- its AppRun starts the bundled service in the
-# background, then the GUI (or the CLI / tray, when invoked as
-# `timetrack` / `timetrack-tray` or with `cli` / `tray`).
+# It needs no install -- its AppRun starts the bundled service and tray
+# in the background, then the GUI (or the CLI / tray in the foreground,
+# when invoked as `timetrack` / `timetrack-tray` or with `cli` / `tray`).
 #
 # Uses linuxdeploy (library bundling) and appimagetool (image assembly),
 # fetched on demand from their continuous releases. Both run with
@@ -107,6 +107,15 @@ install -m0644 data/icons/hicolor/256x256/apps/org.sequ.timetrack.png AppDir/.Di
 # the CLI waits for the service, so no wait is needed here, and the service
 # intentionally outlives the GUI, as with D-Bus activation.
 #
+# The tray starts the same way, next to the service, on the GUI and CLI
+# paths: starting the app is what puts the icon in the tray, with no
+# separate `tray` launch or autostart entry to remember. It is a single
+# instance by the same trick -- it owns `org.sequ.timetrack.tray` for its
+# lifetime and an extra copy exits at once -- so repeated launches never
+# stack icons, and it likewise outlives the GUI (its own Quit row stops
+# it). The `tray` modes still exec it in the foreground instead, for
+# autostart entries and supervisors that expect to hold the process.
+#
 # Uninstall is deleting the AppImage file: nothing is written to the host
 # (no desktop copy, no D-Bus activation file, no systemd unit), so there is
 # nothing that can dangle afterwards. A `timetrack` symlink pointing at the
@@ -120,9 +129,21 @@ start_service() {
         "$HERE/usr/bin/timetrack-service" >/dev/null 2>&1 &
     fi
 }
+start_tray() {
+    if [ -x "$HERE/usr/bin/timetrack-tray" ]; then
+        "$HERE/usr/bin/timetrack-tray" >/dev/null 2>&1 &
+    fi
+}
+# The background pair every client launch ensures: the service that owns
+# the store and the tray icon that shows it is there. Both are single
+# instances by bus-name ownership, so starting an extra copy is a no-op.
+start_background() {
+    start_service
+    start_tray
+}
 case "$(basename "$0")" in
     timetrack|timetrack-cli)
-        start_service
+        start_background
         exec "$HERE/usr/bin/timetrack" "$@"
         ;;
     timetrack-tray)
@@ -132,7 +153,7 @@ case "$(basename "$0")" in
 esac
 if [ "${1:-}" = "cli" ]; then
     shift
-    start_service
+    start_background
     exec "$HERE/usr/bin/timetrack" "$@"
 fi
 if [ "${1:-}" = "tray" ]; then
@@ -140,7 +161,7 @@ if [ "${1:-}" = "tray" ]; then
     start_service
     exec "$HERE/usr/bin/timetrack-tray" "$@"
 fi
-start_service
+start_background
 exec "$HERE/AppRun.wrapped" "$@"
 EOF
 chmod +x AppDir/AppRun
