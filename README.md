@@ -143,13 +143,13 @@ toolkit.
 ## Running
 
 The AppImage is the install. Launch it once, then any client — the image
-starts its bundled service in the background, so there is no service to
-install and no D-Bus activation file to write:
+starts its bundled service and tray in the background, so there is no
+service to install and no D-Bus activation file to write:
 
 ```sh
-./TimeTrack-x86_64.AppImage          # desktop GUI (starts the service too)
+./TimeTrack-x86_64.AppImage          # desktop GUI (starts service + tray too)
 ./TimeTrack-x86_64.AppImage cli      # terminal client, same image
-./TimeTrack-x86_64.AppImage tray &   # system tray, same image
+./TimeTrack-x86_64.AppImage tray &   # tray in the foreground (autostart use)
 ```
 
 For a bare `timetrack` on `PATH`, symlink it to the image — AppRun notices
@@ -195,9 +195,16 @@ service.
 
 ### Running the tray
 
-The tray ships inside the AppImage. Start it like the CLI — after adding it
-to your desktop's startup applications if you want it at login (the image
-itself writes no autostart file for you):
+The tray ships inside the AppImage and starts with the app: launching the
+GUI (or the CLI) starts it in the background next to the service, and it
+stays after the window closes until you pick its `Quit` row. There is only
+ever one: the tray owns `org.sequ.timetrack.tray` on the session bus for
+its lifetime — the same single-instance trick as the service — so starting
+the app again never stacks a second icon, and an extra copy just exits.
+
+For the icon at login, before you have launched anything, add the tray to
+your desktop's startup applications (the image itself writes no autostart
+file for you). The `tray` mode runs it in the foreground for exactly that:
 
 ```sh
 ./TimeTrack-x86_64.AppImage tray &
@@ -216,9 +223,11 @@ install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.local/share/applications/
 install -Dm644 data/org.sequ.timetrack.tray.desktop ~/.config/autostart/org.sequ.timetrack.tray.desktop
 ```
 
-Bus-name ownership is unchanged by all of this: the tray connects anonymously
-and never owns `org.sequ.timetrack`, so it can neither steal the service's
-name nor keep a stale service alive — it only reads.
+Service bus-name ownership is unchanged by all of this: the tray connects
+to the service anonymously and never owns `org.sequ.timetrack`, so it can
+neither steal the service's name nor keep a stale service alive — it only
+reads. The one name it does own is its own, `org.sequ.timetrack.tray`,
+held purely so a second launch exits instead of stacking icons.
 
 ### Quick-add without a tray (stock GNOME)
 
@@ -342,11 +351,11 @@ form is open its keys are text, not commands.
 TimeTrack ships as a single portable file bundling `timetrack-gui`,
 `timetrack-service`, the `timetrack` CLI and `timetrack-tray`, built with linuxdeploy +
 appimagetool (fetched on demand). It needs no install and no service
-setup: its AppRun starts the bundled service in the background, then the
-GUI — or the CLI, when the image is invoked as `timetrack` (a symlink) or
-with `cli` as the first argument. If a service is already running (a
-second copy of the AppImage), the extra copy fails to own the bus name
-and exits, and the client talks to whichever holds it.
+setup: its AppRun starts the bundled service and tray in the background,
+then the GUI — or the CLI, when the image is invoked as `timetrack` (a
+symlink) or with `cli` as the first argument. If a service (or the tray)
+is already running (a second copy of the AppImage), the extra copy fails
+to own its bus name and exits, and the client talks to whichever holds it.
 
 ```sh
 ./build-appimage.sh            # produces TimeTrack-<arch>.AppImage

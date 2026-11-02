@@ -64,6 +64,16 @@ use state::tooltip_text;
 /// noticing that the service has gone away.
 const POLL: Duration = Duration::from_secs(60);
 
+/// The well-known name the tray owns for its whole lifetime, making it
+/// a single instance the same way the service is one: AppRun starts a
+/// tray next to the service on every app launch, so a name the second
+/// copy cannot also own is what keeps repeated launches from stacking
+/// tray icons. It is deliberately *not* the service's `BUS_NAME` --
+/// the tray still connects to the service anonymously and can neither
+/// steal its name nor keep a stale service alive. It matches the SNI
+/// `id()` in `item`, pinned together by the identity test.
+pub(crate) const TRAY_NAME: &str = "org.sequ.timetrack.tray";
+
 /// Take a lock without unwrapping it (#51).
 ///
 /// A poisoned lock still holds its data: the panic that poisoned it
@@ -81,7 +91,46 @@ fn main() -> anyhow::Result<()> {
     async_io::block_on(run())
 }
 
+/// Claim the single-instance name on its own connection, held for the
+/// process's whole run.
+///
+/// `Some` holds the connection that owns `TRAY_NAME`; dropping it (on
+/// quit, or on death) releases the name, exactly like the service.
+/// `None` means a tray is already running -- the designed outcome of a
+/// repeated launch, not an error -- so the caller exits successfully
+/// without ever registering an item. `DoNotQueue` is load-bearing:
+/// without it the daemon queues the request behind the running tray
+/// and this copy would sail on and register a second icon, only to
+/// inherit the name when the first quits.
+async fn claim_single_instance() -> anyhow::Result<Option<zbus::Connection>> {
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| anyhow::anyhow!("could not connect to the session bus: {e}"))?;
+    use zbus::fdo::{RequestNameFlags, RequestNameReply};
+    match conn
+        .request_name_with_flags(TRAY_NAME, RequestNameFlags::DoNotQueue.into())
+        .await
+    {
+        Ok(RequestNameReply::PrimaryOwner) | Ok(RequestNameReply::AlreadyOwner) => Ok(Some(conn)),
+        Ok(reply) => {
+            println!("timetrack-tray: already running ({reply:?}); exiting");
+            Ok(None)
+        }
+        Err(zbus::Error::NameTaken) => {
+            println!("timetrack-tray: already running; exiting");
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("could not claim {TRAY_NAME}: {e}")),
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
+    // One tray per session, claimed before the item registers so a
+    // duplicate launch never even flashes a second icon. Held in
+    // `_instance` until `run` returns (Quit), which releases the name.
+    let Some(_instance) = claim_single_instance().await? else {
+        return Ok(());
+    };
     // `assume_sni_available` keeps the item alive when no watcher or host
     // exists yet (headless test bus, desktop still starting, GNOME without
     // an extension): the failure is routed to `watcher_offline` instead of
@@ -107,7 +156,7 @@ async fn run() -> anyhow::Result<()> {
     .spawn()
     .await
     .map_err(|e| anyhow::anyhow!("could not register tray item: {e}"))?;
-    println!("timetrack-tray: registered org.sequ.timetrack.tray");
+    println!("timetrack-tray: registered {TRAY_NAME}");
 
     let mut last_state: Option<ConnState> = None;
     let mut last_total_ms: Option<i64> = None;
