@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::{OwnedVariant, Variant};
 
 /// A private session bus, mirroring `scripts/e2e.sh`: hermetic, no host
 /// activation, so a stale binary can never answer instead of the test.
@@ -103,16 +103,13 @@ pub fn point_at_private_bus(address: &str) {
 pub async fn serve_watcher(address: &str) -> (zbus::Connection, Arc<Mutex<Vec<String>>>) {
     let items: Arc<Mutex<Vec<String>>> = Arc::default();
     let conn = zbus::connection::Builder::address(address)
-        .expect("private bus address must parse")
         .name("org.kde.StatusNotifierWatcher")
-        .expect("watcher name must be valid")
         .serve_at(
             "/StatusNotifierWatcher",
             Watcher {
                 items: items.clone(),
             },
         )
-        .expect("watcher path must be valid")
         .build()
         .await
         .expect("could not serve the test watcher");
@@ -142,20 +139,20 @@ pub async fn menu_proxy<'a>(conn: &'a zbus::Connection, service: &'a str) -> zbu
 }
 
 /// Whether a menu item's properties carry the wanted label.
-pub fn label_is(props: &HashMap<String, OwnedValue>, want: &str) -> bool {
+pub fn label_is(props: &HashMap<String, OwnedVariant>, want: &str) -> bool {
     props.get("label").is_some_and(|v| {
-        let as_value: Value = v.clone().into();
-        as_value == Value::new(want)
+        let as_value: Variant = v.clone().into();
+        as_value == Variant::new(want)
     })
 }
 
 /// Whether a menu item is clickable. ksni serves only non-default dbusmenu
 /// properties, and the default is enabled -- so a missing `enabled` means
 /// enabled, and only an explicit false disables.
-pub fn enabled_is(props: &HashMap<String, OwnedValue>) -> bool {
+pub fn enabled_is(props: &HashMap<String, OwnedVariant>) -> bool {
     props.get("enabled").is_none_or(|v| {
-        let as_value: Value = v.clone().into();
-        as_value != Value::Bool(false)
+        let as_value: Variant = v.clone().into();
+        as_value != Variant::Bool(false)
     })
 }
 
@@ -182,7 +179,7 @@ pub async fn wait_for_row(
             )
             .await
             .expect("the menu must answer GetGroupProperties");
-        let props: Vec<(i32, HashMap<String, OwnedValue>)> = reply
+        let props: Vec<(i32, HashMap<String, OwnedVariant>)> = reply
             .body()
             .deserialize()
             .expect("menu properties must decode");
@@ -214,7 +211,9 @@ pub async fn click_when_ready(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let id = wait_for_row(menu, want, enabled_only, remaining).await;
-        let data: OwnedValue = Value::new("").try_into().expect("empty data must convert");
+        let data: OwnedVariant = Variant::new("")
+            .try_into()
+            .expect("empty data must convert");
         match menu
             .call_method("Event", &(id, "clicked".to_string(), data, 0u32))
             .await
