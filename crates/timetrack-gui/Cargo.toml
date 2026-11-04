@@ -32,6 +32,12 @@ gpui = { workspace = true }
 anyhow = { workspace = true }
 async-io = { workspace = true }
 # System save dialog via the desktop portal. Same
-# backend as gpui itself: `async-std` selects zbus' async-io backend, never
-# tokio (see the workspace manifest for why tokio is load-bearing absent).
-ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
+# backend as gpui itself: `async-io` selects zbus' async-io backend, never
+# tokio (see the workspace manifest for why tokio is load-bearing absent;
+# ashpd renamed this feature from `async-std` in 0.12).
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "file_chooser"] }
+# ashpd 0.13's `Uri` is a plain string wrapper where 0.11's carried
+# `url::Url::to_file_path`, so turning the portal's chosen file URI into a
+# local path (percent-decoding, host rules) is this crate's job now. `url`
+# 2.5.8 is already in the lockfile under gpui, so this adds no package.
+url = "2"
