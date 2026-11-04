@@ -168,12 +168,10 @@ fn begin_selection(caret: &mut Caret, extend: bool) {
 /// extending it.
 pub(crate) fn move_left(text: &str, caret: &mut Caret, extend: bool) {
     caret.clamp(text);
-    if !extend {
-        if let Some(range) = selection_range(caret) {
-            caret.pos = range.start;
-            caret.anchor = None;
-            return;
-        }
+    if !extend && let Some(range) = selection_range(caret) {
+        caret.pos = range.start;
+        caret.anchor = None;
+        return;
     }
     begin_selection(caret, extend);
     caret.pos = prev_boundary(text, caret.pos);
@@ -185,12 +183,10 @@ pub(crate) fn move_left(text: &str, caret: &mut Caret, extend: bool) {
 /// One character right, the mirror of [`move_left`].
 pub(crate) fn move_right(text: &str, caret: &mut Caret, extend: bool) {
     caret.clamp(text);
-    if !extend {
-        if let Some(range) = selection_range(caret) {
-            caret.pos = range.end;
-            caret.anchor = None;
-            return;
-        }
+    if !extend && let Some(range) = selection_range(caret) {
+        caret.pos = range.end;
+        caret.anchor = None;
+        return;
     }
     begin_selection(caret, extend);
     caret.pos = next_boundary(text, caret.pos);

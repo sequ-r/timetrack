@@ -1,6 +1,7 @@
 # Rust / Cargo
 /target/
 **/*.rs.bk
+/coverage-html/
 
 # AppImage
 /AppDir/

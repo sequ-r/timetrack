@@ -68,7 +68,7 @@ directory.
 
 ## Building
 
-Requires Rust 1.85 or newer (the crates are edition 2024).
+Requires Rust 1.99 or newer (the crates are edition 2024).
 
 ```sh
 cargo build --release
@@ -93,9 +93,9 @@ cargo llvm-cov report --html --output-dir coverage-html   # browsable per-line r
 ```
 
 CI runs the same commands in the non-blocking `coverage` job and uploads the
-HTML report as a run artifact. Baseline (2026-10-28): 68.6% lines overall —
-core 96.3%, service 84.5%, update 90.5%, tray 76.6%, proto 68.0%, cli 51.2%,
-gui 46.1% (the gpui render modules are exercised by the smoke check, not by
+HTML report as a run artifact. Baseline (2026-11-04): 63.9% lines overall —
+core 95.7%, service 73.2%, update 90.5%, tray 76.0%, proto 65.8%, cli 53.9%,
+gui 40.9% (the gpui render modules are exercised by the smoke check, not by
 unit tests, so they read 0% here).
 
 The `portal-stub` feature compiles in the save-dialog stub the GUI smoke

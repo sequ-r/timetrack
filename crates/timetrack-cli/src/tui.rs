@@ -1423,13 +1423,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, client: Client)
             app.apply(reply);
         }
 
-        if event::poll(POLL)? {
-            if let Event::Key(key) = event::read()? {
-                // Windows/GTK emit both press and release; acting on both would
-                // double every command.
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
-                }
+        if event::poll(POLL)?
+            && let Event::Key(key) = event::read()?
+        {
+            // Windows/GTK emit both press and release; acting on both would
+            // double every command.
+            if key.kind == KeyEventKind::Press {
+                app.on_key(key);
             }
         }
     }

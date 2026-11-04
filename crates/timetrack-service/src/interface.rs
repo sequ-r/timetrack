@@ -262,10 +262,10 @@ impl EntryService {
                 // journal, so a checkpoint failure must not fail it (that
                 // would roll memory back from disk, the #100 divergence):
                 // note it and retry on the next mutation.
-                if store.journal_len() > core::JOURNAL_CHECKPOINT_BYTES {
-                    if let Err(e) = store.save(data) {
-                        eprintln!("timetrack-service: checkpoint failed, journal kept ({e})");
-                    }
+                if store.journal_len() > core::JOURNAL_CHECKPOINT_BYTES
+                    && let Err(e) = store.save(data)
+                {
+                    eprintln!("timetrack-service: checkpoint failed, journal kept ({e})");
                 }
                 Ok(value)
             }

@@ -686,10 +686,10 @@ impl TimetrackView {
                 };
                 let selected = selected.to_string();
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
-                if ev.keystroke.key == "x" {
-                    if let Some((text, caret)) = self.focused_text_mut() {
-                        self::textline::delete_selection(text, caret);
-                    }
+                if ev.keystroke.key == "x"
+                    && let Some((text, caret)) = self.focused_text_mut()
+                {
+                    self::textline::delete_selection(text, caret);
                 }
                 true
             }
@@ -857,19 +857,19 @@ impl TimetrackView {
                 // Printable text, and only that: with control, alt or the
                 // platform modifier held the keystroke is a shortcut, not
                 // input, and key_char of a special key must not leak in.
-                if let Some(ch) = printable_char(ev) {
-                    if let Some(dlg) = self.dialog.as_mut() {
-                        // The project field cycles instead of taking text:
-                        // `h`/`l`, the project keys everywhere else (#104).
-                        if dlg.field == self::dialogs::entry::DialogField::Project {
-                            match ch {
-                                "h" => dlg.cycle_project(-1),
-                                "l" => dlg.cycle_project(1),
-                                _ => {}
-                            }
-                        } else {
-                            dlg.type_text(ch);
+                if let Some(ch) = printable_char(ev)
+                    && let Some(dlg) = self.dialog.as_mut()
+                {
+                    // The project field cycles instead of taking text:
+                    // `h`/`l`, the project keys everywhere else (#104).
+                    if dlg.field == self::dialogs::entry::DialogField::Project {
+                        match ch {
+                            "h" => dlg.cycle_project(-1),
+                            "l" => dlg.cycle_project(1),
+                            _ => {}
                         }
+                    } else {
+                        dlg.type_text(ch);
                     }
                 }
             }
@@ -1002,11 +1002,11 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the other
                 // prompts, so shortcuts never leak into the name.
-                if let Some(ch) = printable_char(ev) {
-                    if let Some(prompt) = self.project_prompt.as_mut() {
-                        self::textline::insert_text(&mut prompt.name, &mut prompt.caret, ch);
-                        prompt.error = None;
-                    }
+                if let Some(ch) = printable_char(ev)
+                    && let Some(prompt) = self.project_prompt.as_mut()
+                {
+                    self::textline::insert_text(&mut prompt.name, &mut prompt.caret, ch);
+                    prompt.error = None;
                 }
             }
         }
@@ -1079,11 +1079,11 @@ impl TimetrackView {
                 }
             }
             _ => {
-                if let Some(ch) = printable_char(ev) {
-                    if let Some(prompt) = self.recolour_prompt.as_mut() {
-                        prompt.text.push_str(ch);
-                        prompt.error = None;
-                    }
+                if let Some(ch) = printable_char(ev)
+                    && let Some(prompt) = self.recolour_prompt.as_mut()
+                {
+                    prompt.text.push_str(ch);
+                    prompt.error = None;
                 }
             }
         }
@@ -1220,11 +1220,11 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the dialog, so
                 // shortcuts and special keys never leak into the moment.
-                if let Some(ch) = printable_char(ev) {
-                    if let Some(prompt) = self.split_prompt.as_mut() {
-                        self::textline::insert_text(&mut prompt.at, &mut prompt.caret, ch);
-                        prompt.error = None;
-                    }
+                if let Some(ch) = printable_char(ev)
+                    && let Some(prompt) = self.split_prompt.as_mut()
+                {
+                    self::textline::insert_text(&mut prompt.at, &mut prompt.caret, ch);
+                    prompt.error = None;
                 }
             }
         }
