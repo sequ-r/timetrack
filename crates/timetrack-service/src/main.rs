@@ -588,10 +588,10 @@ async fn run() -> anyhow::Result<()> {
     // Both interfaces on the one object through the transition (#110,
     // ADR 0012): typed for new clients, JSON for older ones, one core
     // under both.
-    let _dbus = zbus::connection::Builder::session()?
-        .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, EntryIface(Arc::clone(&service)))?
-        .serve_at(OBJECT_PATH, Entry2Iface(service))?
+    let _dbus = zbus::connection::Builder::session()
+        .name(BUS_NAME)
+        .serve_at(OBJECT_PATH, EntryIface(Arc::clone(&service)))
+        .serve_at(OBJECT_PATH, Entry2Iface(service))
         .build()
         .await?;
 

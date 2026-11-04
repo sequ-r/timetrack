@@ -88,16 +88,13 @@ fn tray_registers_with_watcher_and_exposes_icon_tooltip() {
 
         let items: Arc<Mutex<Vec<String>>> = Arc::default();
         let conn = zbus::connection::Builder::address(address.as_str())
-            .expect("private bus address must parse")
             .name("org.kde.StatusNotifierWatcher")
-            .expect("watcher name must be valid")
             .serve_at(
                 "/StatusNotifierWatcher",
                 Watcher {
                     items: items.clone(),
                 },
             )
-            .expect("watcher path must be valid")
             .build()
             .await
             .expect("could not serve the test watcher");
@@ -170,23 +167,20 @@ fn tray_registers_with_watcher_and_exposes_icon_tooltip() {
 
         // `ToolTip` has no Deserialize impl, so decode the struct shape:
         // (icon-name, pixmap, title, description).
-        let tip: zbus::zvariant::OwnedValue = proxy.get_property("ToolTip").await.unwrap();
-        let tip: zbus::zvariant::Value = tip.into();
-        let zbus::zvariant::Value::Structure(tip) = tip else {
+        let tip: zbus::OwnedVariant = proxy.get_property("ToolTip").await.unwrap();
+        let tip: zbus::Variant = tip.into();
+        let zbus::Variant::Structure(tip) = tip else {
             panic!("ToolTip is not a struct: {tip:?}");
         };
         let fields = tip.fields();
         assert_eq!(fields.len(), 4, "unexpected ToolTip shape");
-        assert_eq!(
-            fields[0],
-            zbus::zvariant::Value::new("org.sequ.timetrack-symbolic")
-        );
-        assert_eq!(fields[2], zbus::zvariant::Value::new("TimeTrack"));
+        assert_eq!(fields[0], zbus::Variant::new("org.sequ.timetrack-symbolic"));
+        assert_eq!(fields[2], zbus::Variant::new("TimeTrack"));
         // No service runs on this bus, so the icon is flat with the shared
         // start-service hint (tray-9, #13) rather than live totals.
         assert_eq!(
             fields[3],
-            zbus::zvariant::Value::new(timetrack_proto::no_service_hint())
+            zbus::Variant::new(timetrack_proto::no_service_hint())
         );
     });
 }

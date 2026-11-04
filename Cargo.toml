@@ -24,30 +24,26 @@ timetrack-update = { path = "crates/timetrack-update" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# The "async-io" backend, NOT "tokio", and this is load-bearing.
+# Our crates are on zbus 6; gpui and ashpd still pull zbus 5, so the two
+# majors coexist in the tree and meet only on the wire. Feature choices
+# here no longer reach gpui's copy, which keeps its own "async-io" backend
+# (the zbus 5 arrangement this comment used to describe).
 #
-# With zbus' tokio backend, `Transport::connect` calls
-# `tokio::task::spawn_blocking`, which panics with "there is no reactor running"
-# unless the calling thread is inside a tokio runtime.
+# zbus 6 has no backend feature to pick: a connection runs on zruntime
+# (`default-rt`), making progress on threads inside its `block_on` and on
+# a helper thread otherwise. That is what lets the service, the CLI and
+# the tray keep driving zbus futures from `async_io::block_on` (see their
+# main.rs) and the GUI from its own threads, exactly as under zbus 5's
+# connect-from-any-thread backend.
 #
-# gpui itself calls zbus -- its Linux backend goes through ashpd for portals,
-# from gpui's own executor threads, which have no tokio context and which we do
-# not control. So enabling "tokio" here breaks gpui's startup, not just our own
-# code. ashpd already selects the "async-io" backend, so this matches what gpui
-# expects; the blocking/async-io backend connects from any thread.
-#
-# Consequence: the service and CLI must also stop relying on
-# `#[tokio::main]`, since zbus no longer needs a tokio runtime. They use
-# `async_io::block_on` instead -- see their main.rs.
-#
-# There is deliberately **no tokio in this workspace at all**, not even as an
-# unused entry here. The one call site that reached for it --
-# `timetrack-proto`'s `wait_for_service` -- panicked with "there is no reactor
-# running" whenever the session bus was absent, because it slept on
-# `tokio::time` inside a program driven by `async_io::block_on`. Adding tokio
-# back now has to be a deliberate edit to a crate's manifest, which is the
-# point.
-zbus = { version = "5", default-features = false, features = ["async-io"] }
+# There is still deliberately **no tokio in this workspace at all**, and
+# neither zbus' `tokio` feature nor a `#[tokio::main]` may appear. The one
+# call site that reached for it -- `timetrack-proto`'s `wait_for_service`
+# -- panicked with "there is no reactor running" whenever the session bus
+# was absent, because it slept on `tokio::time` inside a program driven by
+# `async_io::block_on`. Adding tokio back now has to be a deliberate edit
+# to a crate's manifest, which is the point.
+zbus = { version = "6", default-features = false, features = ["default-rt", "proxy", "service"] }
 async-io = "2"
 # The `StreamExt`/`race` helpers for zbus signal streams (#103). Already in
 # the tree as zbus' own dependency; naming it as ours is what lets

@@ -108,7 +108,7 @@ async fn claim_single_instance() -> anyhow::Result<Option<zbus::Connection>> {
         .map_err(|e| anyhow::anyhow!("could not connect to the session bus: {e}"))?;
     use zbus::fdo::{RequestNameFlags, RequestNameReply};
     match conn
-        .request_name_with_flags(TRAY_NAME, RequestNameFlags::DoNotQueue.into())
+        .request_name_with_flags(TRAY_NAME, RequestNameFlags::DO_NOT_QUEUE)
         .await
     {
         Ok(RequestNameReply::PrimaryOwner) | Ok(RequestNameReply::AlreadyOwner) => Ok(Some(conn)),

@@ -500,7 +500,7 @@ impl zbus::DBusError for WireError {
     }
 
     fn create_reply(&self, call: &zbus::message::Header<'_>) -> zbus::Result<zbus::Message> {
-        let builder = zbus::Message::error(call, self.name())?;
+        let builder = zbus::Message::error(call, self.name());
         match self {
             WireError::BlankProjectName | WireError::NegativeDuration | WireError::LastProject => {
                 builder.build(&())
@@ -709,7 +709,6 @@ pub async fn desktop_notify(summary: &str, body: &str) -> Result<(), ClientError
     let unavailable =
         |e: zbus::Error| ClientError::Transport(format!("notification server unavailable: {e}"));
     let conn = zbus::connection::Builder::session()
-        .map_err(unavailable)?
         .build()
         .await
         .map_err(unavailable)?;
@@ -721,7 +720,7 @@ pub async fn desktop_notify(summary: &str, body: &str) -> Result<(), ClientError
     )
     .await
     .map_err(unavailable)?;
-    let hints: std::collections::HashMap<String, zbus::zvariant::Value<'_>> =
+    let hints: std::collections::HashMap<String, zbus::Variant<'_>> =
         std::collections::HashMap::new();
     proxy
         .call_method(
@@ -850,7 +849,6 @@ impl Client {
         // This connects to the bus, it does not reach the service: a missing
         // service surfaces at the first method call, as `NoService`.
         let conn = zbus::connection::Builder::session()
-            .map_err(ClientError::from_bus)?
             // The timeout lives on the connection, so every method inherits
             // it -- there is no per-call timeout to forget.
             .method_timeout(CALL_TIMEOUT)
@@ -1455,8 +1453,8 @@ mod tests {
         }
         let json_len = serde_json::to_string(&snap).unwrap().len();
         let snap2 = Snapshot2::from(&snap);
-        let ctx = zbus::zvariant::serialized::Context::new_dbus(zbus::zvariant::Endian::Little, 0);
-        let typed = zbus::zvariant::to_bytes(ctx, &snap2).unwrap();
+        let ctx = zbus::wire::serialized::Context::new(zbus::wire::Endian::Little, 0);
+        let typed = zbus::wire::to_bytes(ctx, &snap2).unwrap();
         let typed_len = typed.len();
         // And it comes back identical.
         let back: Snapshot2 = typed.deserialize().unwrap().0;

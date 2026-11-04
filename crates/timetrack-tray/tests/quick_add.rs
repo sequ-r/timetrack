@@ -296,11 +296,8 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         let store_path = dir.join("store.json");
         let fake = Arc::new(FakeService::new(store_path.clone()));
         let _service_conn = zbus::connection::Builder::address(address.as_str())
-            .expect("private bus address must parse")
             .name(BUS_NAME)
-            .expect("service name must be valid")
             .serve_at(OBJECT_PATH, FakeIface(fake.clone()))
-            .expect("service path must be valid")
             .build()
             .await
             .expect("could not serve the fake service");
