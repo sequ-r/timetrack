@@ -16,6 +16,18 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # Held at 0.2.189 in the lockfile: 0.2.190 removed `ENOATTR` on
+      # Linux, which xattr 0.2.3 in gpui's tree still references (see the
+      # note by the gpui dependency in the root Cargo.toml). Lift this
+      # when gpui's tree moves off xattr 0.2.3.
+      - dependency-name: "libc"
+      # Deliberately 0.10 in timetrack-update: it is already in the tree
+      # under gpui dependents, and the API used there is the same in 0.11
+      # (see that crate's manifest). Ignore the 0.11 line only, so a
+      # future 0.12 still arrives for its own reading.
+      - dependency-name: "sha2"
+        versions: [">= 0.11.0, < 0.12.0"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
