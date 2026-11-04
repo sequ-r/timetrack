@@ -131,10 +131,10 @@ pub fn parse_moment(text: &str, what: &str, now_ms: i64, tz: &Tz) -> ParseResult
             .ok_or_else(overflow);
     }
     // A bare number too big for `i64` is "too large", not a bad shape.
-    if let Err(e) = text.parse::<i64>() {
-        if is_int_overflow(&e) {
-            return Err(overflow());
-        }
+    if let Err(e) = text.parse::<i64>()
+        && is_int_overflow(&e)
+    {
+        return Err(overflow());
     }
 
     let (h, m) = text.split_once(':').ok_or_else(|| ParseError::BadShape {
