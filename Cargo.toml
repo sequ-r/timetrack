@@ -54,8 +54,8 @@ async-io = "2"
 # `timetrack-proto` drive a `SignalStream` without client crates each
 # having to learn a futures crate.
 futures-lite = "2"
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 anyhow = "1"
 
 # Upstream gpui, as published from Zed. The community fork (gpui-ce) was only
