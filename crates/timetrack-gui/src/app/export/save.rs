@@ -166,9 +166,15 @@ pub(crate) async fn portal_save_file(current_name: &str) -> PortalOutcome {
     let Some(uri) = files.uris().first() else {
         return PortalOutcome::Cancelled;
     };
-    match uri.to_file_path() {
-        Ok(path) => PortalOutcome::Granted(path.to_string_lossy().into_owned()),
-        Err(_) => PortalOutcome::Unavailable,
+    // ashpd 0.13 hands back a string URI; parsing it as a file URI (and
+    // refusing anything that is not a local path) is what `url` does here,
+    // exactly as ashpd 0.11's `Uri::to_file_path` did on our behalf.
+    let path = url::Url::parse(uri.as_str())
+        .ok()
+        .and_then(|parsed| parsed.to_file_path().ok());
+    match path {
+        Some(path) => PortalOutcome::Granted(path.to_string_lossy().into_owned()),
+        None => PortalOutcome::Unavailable,
     }
 }
 
