@@ -10,7 +10,7 @@
 # when invoked as `timetrack` / `timetrack-tray` or with `cli` / `tray`).
 #
 # Uses linuxdeploy (library bundling) and appimagetool (image assembly),
-# fetched on demand from their continuous releases. Both run with
+# fetched on demand from pinned, checksummed releases. Both run with
 # --appimage-extract-and-run so no FUSE mount is needed to build.
 set -eu
 
@@ -25,11 +25,26 @@ esac
 APPIMAGE="TimeTrack-$ARCH.AppImage"
 LINUXDEPLOY="linuxdeploy-$ARCH.AppImage"
 APPIMAGETOOL="appimagetool-$ARCH.AppImage"
-LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/$LINUXDEPLOY"
-# appimagetool is pinned: its `continuous` build changed validation on
-# 2026-10-29 and silently broke every release (#135). Bumping the tool is
-# a deliberate edit here, verified by a release dry-run.
+# Both tools are pinned to versioned releases, and every fetched copy is
+# checked against the SHA256 sums below. appimagetool's `continuous` build
+# changed validation on 2026-10-29 and silently broke every release (#135);
+# linuxdeploy tracked `continuous` the same way until now. Bumping a tool
+# is a deliberate edit here -- URL and sums together -- verified by a
+# release dry-run. A copy already on disk whose sum does not match is
+# re-fetched, so a stale binary left over from an earlier pin is never
+# silently reused.
+LINUXDEPLOY_URL="https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/$LINUXDEPLOY"
 APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/$APPIMAGETOOL"
+case "$ARCH" in
+    x86_64)
+        LINUXDEPLOY_SHA256="c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
+        APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+        ;;
+    aarch64)
+        LINUXDEPLOY_SHA256="620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff"
+        APPIMAGETOOL_SHA256="f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"
+        ;;
+esac
 
 # Update information, embedded by appimagetool (`-u` below). It tells
 # AppImageUpdate where to look: the latest GitHub release's zsync file for
@@ -41,15 +56,22 @@ APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9
 # page directly.
 UPDATE_INFO="gh-releases-zsync|sequ-r|timetrack|latest|TimeTrack-*$ARCH.AppImage.zsync"
 
-for pair in "$LINUXDEPLOY $LINUXDEPLOY_URL" "$APPIMAGETOOL $APPIMAGETOOL_URL"; do
-    # shellcheck disable=SC2086
-    set -- $pair
-    if [ ! -x "$1" ]; then
-        echo "fetching $1 ..."
-        curl -fL -o "$1" "$2"
-        chmod +x "$1"
+fetch_tool() {
+    # $1 file, $2 url, $3 sha256
+    if [ -x "$1" ] && printf '%s  %s\n' "$3" "$1" | sha256sum -c --status -; then
+        return 0
     fi
-done
+    echo "fetching $1 ..."
+    curl -fL -o "$1" "$2"
+    chmod +x "$1"
+    if ! printf '%s  %s\n' "$3" "$1" | sha256sum -c --status -; then
+        echo "checksum mismatch for $1 (expected $3)" >&2
+        exit 1
+    fi
+}
+
+fetch_tool "$LINUXDEPLOY" "$LINUXDEPLOY_URL" "$LINUXDEPLOY_SHA256"
+fetch_tool "$APPIMAGETOOL" "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA256"
 
 cargo build --release --locked --package timetrack-gui --package timetrack-service --package timetrack-cli --package timetrack-tray
 
@@ -84,8 +106,12 @@ install -m0644 data/icons/hicolor/symbolic/apps/org.sequ.timetrack-symbolic.svg 
     AppDir/usr/share/icons/hicolor/symbolic/apps/
 
 # Bundle the linked libraries and install the desktop file, icon and
-# generated AppRun into AppDir.
-"./$LINUXDEPLOY" --appimage-extract-and-run --appdir AppDir \
+# generated AppRun into AppDir. NO_STRIP: the release profile already
+# strips our binaries, and the pinned linuxdeploy's bundled strip predates
+# RELR relocations, which current distro libraries carry (`.relr.dyn`) --
+# asking it to strip those files fails the build. Skipping its strip step
+# only leaves the bundled libraries as the distro shipped them.
+NO_STRIP=1 "./$LINUXDEPLOY" --appimage-extract-and-run --appdir AppDir \
     -e AppDir/usr/bin/timetrack-gui \
     -e AppDir/usr/bin/timetrack-service \
     -e AppDir/usr/bin/timetrack \
