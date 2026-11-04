@@ -272,7 +272,7 @@ dependencies = [
  "getrandom 0.4.3",
  "serde",
  "serde_repr",
- "zbus",
+ "zbus 5.19.0",
 ]
 
 [[package]]
