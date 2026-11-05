@@ -24,3 +24,9 @@ would share a concurrency group with the direct CI run on that same push
 and cancel it (or be cancelled by it) on every merge. The group's key
 therefore carries the workflow name -- the caller's, inside a called
 workflow -- so direct and release-called runs cancel only their own kind.
+
+The push trigger is now limited to the files that can reach the image
+(`crates/**`, `Cargo.toml`, `Cargo.lock`, `build-appimage.sh`, `data/**`,
+`scripts/mint-version.sh`): a push touching none of those runs no release
+and mints no version, while `ci.yml` still checks it. `workflow_dispatch`
+is unaffected, so pipeline changes are verified with a dry run.

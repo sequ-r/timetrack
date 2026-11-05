@@ -4,4 +4,4 @@
 
 Exactly one job publishes, and it waits for the build. Two publishers each generate the release notes and each write their own `SHA256SUMS`, which is how v0.1.0 shipped notes printed twice and a checksum file naming one of the two tarballs; the publish job downloads the build, writes one `SHA256SUMS` over every file, and is the only caller of the release action. Both workflows get their system packages from `.github/actions/setup`, so the list gpui needs lives in one place rather than in every job.
 
-Since 0007, runs mint their own version per run and the tag trigger is gone: pushing to `main` releases, and a manual `v*` tag push releases nothing.
+Since 0007, runs mint their own version per run and the tag trigger is gone: pushing to `main` releases, and a manual `v*` tag push releases nothing. Since the trigger was limited to app paths, only pushes touching the app release; anything else runs `ci.yml` but mints no version.

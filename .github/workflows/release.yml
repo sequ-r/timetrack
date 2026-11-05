@@ -19,10 +19,22 @@ name: release
 # `dry_run` on by default: the artifacts land as run artifacts and no tag
 # or release is created, which is how the packaging path can be checked
 # without cutting a version. Real releases cut from `main` only.
+#
+# The push trigger is limited to the files that can reach the image: only
+# those need a new tag. Anything else -- docs, the workflows themselves,
+# the test rigs -- is still checked by `ci.yml` on the same push, but
+# mints no version. A pipeline change is verified with a dispatch dry run.
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build-appimage.sh'
+      - 'data/**'
+      - 'scripts/mint-version.sh'
   workflow_dispatch:
     inputs:
       dry_run:

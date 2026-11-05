@@ -14,6 +14,20 @@ it occupy".
 The data lives in a **service**, not in either front end, so closing the GUI or
 the terminal never loses anything, and both can be open at once.
 
+## Download
+
+The AppImage is the install: one portable file, no dependencies, no setup.
+Take it from [the latest release](https://github.com/sequ-r/timetrack/releases/latest)
+(`TimeTrack-x86_64.AppImage`, next to its `.zsync` and `SHA256SUMS`):
+
+```sh
+chmod +x TimeTrack-x86_64.AppImage
+./TimeTrack-x86_64.AppImage
+```
+
+See [Running](#running) for the terminal and tray modes, and
+[Updates](#updates) for how the image updates itself in place.
+
 ## Architecture
 
 ```
@@ -108,10 +122,12 @@ CI runs those same commands on every pull request and on `main`
 (`.github/workflows/ci.yml`: rustfmt, clippy, `cargo test --workspace`, then the
 service rig and the GUI smoke check, each job on its own so a red run names the
 one that failed). A failed smoke check uploads the screenshots and logs it took
-(`TT_SMOKE_ARTIFACTS`) as a run artifact. Every push to `main` then runs
-`release.yml`, which calls that workflow first and only afterwards mints the
-run's version, builds the AppImage from it, tags the
-commit and publishes the release. The version is the workspace manifest
+(`TT_SMOKE_ARTIFACTS`) as a run artifact. A push to `main` that touches the
+app (`crates/`, the manifests, the lockfile, `build-appimage.sh`, `data/`,
+`scripts/mint-version.sh`) then runs `release.yml`, which calls that workflow
+first and only afterwards mints the run's version, builds the AppImage from
+it, tags the commit and publishes the release. Anything else runs the checks
+but mints no version. The version is the workspace manifest
 bumped past the latest tag -- ordinary runs only ever move the patch, so to
 ship a minor or major, bump `version` in the root `Cargo.toml` yourself and
 the pipeline takes it as-is. Dispatching `release.yml` by hand runs the same
@@ -426,212 +442,43 @@ plainly and refuses it; move the file aside to start fresh.
 shows up to twenty rows, oldest first, in exactly the order the file
 carries them — enough to check the scope, not enough to read the file.
 
-## Development
+## Contributing
 
-This section merges the former `PLAN.md` and `TODO.md`, both derived from
-`REQUIREMENTS.md`. `REQUIREMENTS.md` remains the agreed specification
-(§15 tracks the same gap from the specification's side); what follows is
-the build order, the history and the traps worth remembering.
+Issues live on [GitHub](https://github.com/sequ-r/timetrack/issues); the
+[`gh` CLI](https://cli.github.com/) is how to work with them. A good issue
+states what you saw, what you expected, and how to reproduce it. Triage
+moves through five labels: `needs-triage`, `needs-info`,
+`ready-for-agent` / `ready-for-human`, `wontfix`.
 
-The ordering rule was **core before service, service before UI**, each
-increment leaving the app working and independently verifiable. The core
-holds the rules and has no I/O, so it can be tested exhaustively and
-cheaply. The service aggregates so both UIs agree. The UIs came last
-because they are where requirements are cheapest to change. All four
-increments are now built.
+Work happens on a branch named `<kind>/<what>` (`fix/…`, `feat/…`,
+`chore/…`) and lands through a pull request against `main`. One PR, one
+change; keep it small enough to review in one sitting.
 
-### Increment 1 — core model and rules (`timetrack-core`)
+`REQUIREMENTS.md` is the agreed specification: read it before adding
+behaviour, and flag any contradiction instead of silently overriding it.
+Use the words in `GLOSSARY.md` (entry, project, export, … ― never
+interval, tag, report) and read the `docs/adr/` notes touching your area;
+their decisions stand unless explicitly reopened.
 
-- **Model** (`model.rs`): `Entry { id, project_id, description,
-  started_at, ended_at: i64, source, note }` with `ended_at` non-optional
-  (the timer is gone, so `duration_ms()` takes no `now`), `Project { id,
-  name, colour, archived }`, `EntrySource { Manual, QuickAdd }`, and a
-  version field on `Store` for future migrations to branch on.
-- **Rules** (`rules.rs`): `create_entry` (arbitrary interval, overlap
-  allowed), `quick_add` (5/15/30/60 ending at now, a new entry each
-  time), `set_times` (move either endpoint, reversible, never deletes),
-  `set_project`, `set_text`, `delete_entry`, and `split` / `merge`.
-  Merge takes the union of the intervals, so merging overlapping
-  entries shrinks the summed total. The only validation is that an
-  entry may not end before it starts; overlap is never an error.
-- **Aggregation** (`aggregate.rs`): sums of durations per project and
-  overall over ISO weeks (Monday start) and calendar months in local
-  time. Timezone conversion happens here and nowhere else. A day over
-  24h of summed time is flagged, never rejected.
-- **Storage** (`storage.rs`): atomic saves (sibling temp file, `fsync`,
-  rename), so a crash mid-write leaves the previous good file. A
-  corrupt or too-new store is an error, never a silent reset.
+Before opening the PR, run what CI runs (see "Building" above): rustfmt,
+clippy with `-D warnings`, the workspace tests, and the e2e / GUI rigs if
+you touched their area. Sign your commits.
 
-The rules take an explicit timestamp and stay deterministic, which is
-how the overlap, merge and week-boundary edge cases are pinned down.
-Four bugs were found this way that each looked fine in review:
-`local_day_of` had the offset sign inverted; `month_of` and
-`iso_week_of` returned 1970 for a 2024 date; `quick_add` delegated to a
-helper that hardcoded `EntrySource::Manual`, making every quick-add
-un-undoable; and `split_entry` wrote its first half to a temporary that
-was never stored.
+## Repository rules
 
-### Increment 2 — service (`timetrack-service`)
+`main` is protected: no force-pushes, no deletions, signed commits, and
+green checks before a merge. `.github/workflows/ci.yml` is the single
+definition of green — rustfmt, clippy, `cargo test --workspace`, the
+service end-to-end rig and the headless GUI smoke check. The coverage and
+audit jobs are informational and never block.
 
-The service stores the model with no `running` concept and no
-start/stop/cancel methods or `AlreadyRunning` / `NotRunning` errors: the
-interfaces are `org.sequ.timetrack.Entries2` (typed structs and named
-errors) and the legacy JSON `org.sequ.timetrack.Entries` it supersedes,
-dual-served through the transition (ADR 0012), with D-Bus methods for entry
-CRUD, projects and split/merge. `Snapshot` carries the week, month and
-all-time aggregates plus the over-24h day list, so both UIs read the
-same totals. Two details worth knowing: a genuinely empty store seeds
-one `General` project (otherwise every quick-add was inert until the
-user made a project, and an archived-only store is never re-seeded
-over), and the service holds exactly one clock read per call and is the
-one timezone authority (resolved strictly, refreshed live — see
-"Timezone" above), so every `ended_at` traces to a single instant per
-call.
-
-Note for the test rig: `scripts/e2e.sh` drives a real service over a
-private bus with an explicit bus config, because a plain
-`dbus-daemon --session` reads `standard_session_servicedirs` and
-auto-activates whatever service is installed on the host — a stale
-binary can then win the name and look exactly like a test failure.
-
-### Increment 3 — GUI (`timetrack-gui`)
-
-The Home tab leads with the week total at 72px (sized explicitly; the
-largest step in gpui's scale was too small), quick-add buttons, undo,
-and per-project week totals sorted longest first. The manual-entry
-dialog (`a` new, prefilled with end = now; `e` edit, where an empty
-time keeps the current endpoint) covers the two explicit entry
-methods with one form; its spellings are shared with the CLI in
-`core/src/parse.rs`.
-
-Two gpui traps, both easy to regress: `Entity::update` never repaints
-on its own — only `cx.notify()` schedules a frame — so every mutation
-site notifies, and the poll loop notifies only when it drained a real
-change instead of repainting several times a second. And key events
-dispatch along the focused node's ancestor path, so the root element
-needs an id and a `FocusHandle` with focus on the first frame, or the
-keyboard is dead while click handlers (such as the tabs) still work.
-The headless rig in `gui-smoke.sh` adds two traps of its own, covered
-under "Building" above: Xvfb needs `setxkbmap` before any keysym
-resolves, and with no window manager the pointer must be over the
-window (PointerRoot focus) for a keystroke to arrive at all.
-
-The GUI originally used **gpui-ce**, the community fork, because the
-published `gpui` crate then carried no platform backend. Upstream
-0.2.2 ships the Linux backends behind its default features, so
-`gpui = "0.2.2"` from crates.io replaced both git dependencies. Exactly one call site
-changed — `FocusHandle::focus(window, cx)` lost its `cx` argument —
-plus an `image` pin that only existed for the fork's Wayland backend.
-The lockfile moved the other way: the fork was *ahead* of upstream on
-several UI dependencies (wgpu 29, cosmic-text 0.19 against blade-graphics
-and cosmic-text 0.14), so those came back down to upstream's pins.
-Nothing here depends on either; the GUI uses boxes, text, colour and
-click handlers only.
-
-### Increment 4 — CLI (`timetrack-cli`)
-
-One subcommand per entry method (see "The terminal client" above). The
-three removal operations stay three separate subcommands —
-`shorten`, `undo`, `delete` — because they are three different things
-to do to an entry, and collapsing them would hide the distinction the
-specification is precise about.
-
-### Completed checklist
-
-The former `TODO.md` (from `REQUIREMENTS.md` §15, the plan's remaining
-work and a code-health survey of 2026-10-05) is fully done. Recorded
-here so the decisions and their tests stay findable; current behaviour
-is described under "What works today" above.
-
-*Spec gaps (2026-10-05/06):*
-
-1. **CSV export end-to-end** — `core/src/export.rs`, service `ExportCsv`,
-   CLI `timetrack export --scope week|month|all [--out FILE]`, GUI
-   Export tab. Header row, ISO-8601 local timestamps, duration as
-   `HH:MM:SS` plus minutes, `source` column.
-2. **GUI manual-entry dialog** — `a` / `e` with the shared spellings in
-   `core/src/parse.rs` and the `SetText` D-Bus method; landed together
-   with the `cx.notify()` refresh fix described above.
-3. **Per-instant timezone lookup** — `core/src/tz.rs` (`Tz` over
-   `chrono-tz`, fixed-point `day_start`); aggregation, rules, export
-   and parsing all take `&Tz`, the service resolves it strictly and
-   refreshes it live (`Tz::try_from_env`; #102) and snapshots carry the
-   zone name for clients (`Tz::from_snapshot`). Before this, named zones such as
-   `Europe/Rome` fell back to UTC and mis-bucketed near DST and week
-   boundaries; DST transition and week-split tests now pin it down.
-
-*Correctness and data safety (2026-10-06):*
-
-4. **Persist-failure path** — a failed save now returns the error and
-   keeps the in-memory state (it previously reloaded with
-   `unwrap_or_default()`, silently resetting to empty); the next
-   successful save heals a transient failure.
-5. **Projects totals agreement** — the snapshot carries a
-   service-computed all-time `TotalsView` (`core::all_totals`), so the
-   Projects tab no longer recomputes all-time totals from the
-   recent-entries window while the week came from the service.
-6. **Typed D-Bus errors** — `proto::ServiceError`
-   (`Rule` / `UnknownExportScope` / `Storage` / `Other`) travels as
-   JSON in the error body and `proto::ClientError`
-   (`Service` / `NoService` / `VersionMismatch` / `Transport`) triages
-   by D-Bus error name, so the GUI tells "no service" from "wrong
-   service" from a validation failure without parsing strings. The
-   user-visible wordings stayed byte-identical.
-
-*Reachable features and polish (2026-10-06):*
-
-7. **Split/merge in the GUI and CLI** — GUI `s` / `m`, CLI
-   `split ID --at MOMENT` and `merge IDS... [--yes]`, with
-   `merge_shrink_ms` / `format_merge_delta` shared from the core so
-   both UIs state the shrink identically.
-8. **Project naming** — `core::update_project` (with a
-   `BlankProjectName` guard), D-Bus `UpdateProject` (`""` / `-1` keep
-   sentinels, since D-Bus has no `Option`), CLI `rename` / `recolour`
-   (strict `RRGGBB`), and the GUI naming prompt (`n` / `r`) that
-   replaced invented `Project N` names.
-9. **CLI parity** — `set-text`, `set-project` and `unarchive`
-   subcommands, including a new `SetProject` service path that the
-   original checklist scope had missed (no such method existed).
-10. **Tab shortcuts and proportional bars** — `Tab` / `Shift+Tab`
-    cycles the three tabs (the entry dialog keeps `Tab` for its
-    fields); per-project week rows draw a bar proportional to the
-    longest row.
-11. **Confirmations** — delete and merge ask first (merge states the
-    shrink amount), and archiving is reversible via un-archive.
-
-*Engineering hygiene:*
-
-12. **Clippy and formatting gated in CI** — the workspace is clean
-    under `cargo clippy --workspace -- -D warnings` and
-    `cargo fmt --check`, and CI enforces both.
-13. **E2e / GUI-smoke coverage** — `scripts/e2e.sh` and
-    `scripts/gui-smoke.sh` cover split/merge, the `set_*` guards,
-    month navigation, export, undo/delete, tabs and total read-back,
-    plus service DST and empty-store tests (see "Building").
-
-### Deferred, deliberately
-
-- **Drag-to-trim** for adjusting entry times.
-- **A dedicated entry-list tab** — editing lives behind the per-project
-  rows until it needs more room.
-
-### Risks worth remembering
-
-- **Timezone handling in aggregation** is the most likely source of
-  off-by-one bugs, particularly around DST and month boundaries, which
-  is why the ISO-week rule lives in exactly one place. Per-instant
-  lookup (item 3 above) fixed the known case; the residual risk is
-  zones with midnight transitions and skipped `HH:MM` inputs on
-  spring-forward days, which are mapped arithmetically rather than
-  rejected.
-- **Merge reducing the total** looks like a bug to anyone who has not
-  read the confirmation text. Both UIs state the delta, worded by the
-  shared `rules.rs::format_merge_delta` so they cannot drift.
-- **A stale service binary outliving an interface rename** cost the
-  most time in an early round: a GUI speaking `.Entries` against a
-  service still answering to `.Timer` looks like a dead app, not a
-  version mismatch. The GUI now names the problem; see "The service
-  needs no install" above for the fix.
+Releases cut from `main` only, and only when the push touches the app
+itself (see "Building" above for the path list). Each release mints its
+own version: the workspace manifest bumped past the latest tag,
+patch-only unless minor or major was raised in the root `Cargo.toml` by
+hand. The tag is pushed after the builds pass, so a failed run leaves
+nothing behind — and nothing is ever committed back: version bumps live
+only in the built artifacts.
 
 ## Licence
 
