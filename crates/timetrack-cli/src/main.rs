@@ -7,10 +7,12 @@
 
 //! The TimeTrack terminal client.
 //!
-//! Two modes in one binary: a one-shot command surface for scripts and shell
-//! aliases (`timetrack quick -f 30`), and a full ratatui TUI (`timetrack`, or
-//! `timetrack tui`). Both are pure clients -- the store lives in the service,
-//! so closing the terminal never loses anything.
+//! One-shot commands only (§18): each invocation does one thing, prints
+//! one result, and exits -- `timetrack quick -m 15` between two commands
+//! on some other project. Bare `timetrack` prints `status`, the
+//! between-commands glance. There is no TUI; interactive editing is the
+//! GUI's job. The store lives in the service, so closing the terminal
+//! never loses anything.
 //!
 //! # The four entry methods
 //!
@@ -43,7 +45,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::time::Duration;
-use timetrack_cli::tui;
 use timetrack_proto::{Client, ClientError, ProjectView, Snapshot, no_service_hint};
 
 /// How long to wait for the service to appear before giving up.
@@ -56,18 +57,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     about = "TimeTrack terminal client",
     long_about = "Control the TimeTrack service from the terminal.\n\n\
                   The service owns the store and does all the aggregation; this \
-                  is a client, so quitting the TUI never loses tracked time."
+                  is a client, so closing the terminal never loses tracked time. \
+                  With no subcommand, prints the status (this week's total first)."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
 
+impl Cli {
+    /// The command to run: bare `timetrack` is `status` (§18), the
+    /// between-commands glance -- week total first, like the GUI hero.
+    fn command_or_status(self) -> Command {
+        self.command.unwrap_or(Command::Status { json: false })
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Open the full terminal UI (the default when no subcommand is given).
-    Tui,
-
     // --- the four add methods ---
     /// Method 1: record an explicit start and end.
     Add {
@@ -226,25 +233,111 @@ enum Command {
         /// `all` without warning.
         #[arg(long, allow_hyphen_values = true)]
         at: Option<String>,
+        /// First local day of a custom range (`YYYY-MM-DD`), with `--to`
+        /// (#133). A range replaces `--scope`/`--at`.
+        #[arg(long, allow_hyphen_values = true)]
+        from: Option<String>,
+        /// Last local day of a custom range, inclusive.
+        #[arg(long, allow_hyphen_values = true)]
+        to: Option<String>,
         /// Write to this file instead of stdout.
         #[arg(short, long)]
         out: Option<std::path::PathBuf>,
     },
 
     // --- reading ---
+    /// Print the service snapshot as JSON (projects, entries, totals,
+    /// timezone): the scriptable whole picture.
+    Snapshot,
+
     /// Print this week, this month and the all-time total.
-    Status,
+    Status {
+        /// Print JSON for scripts instead of the human totals.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// List tracked entries, most recent first.
     List {
         /// Show at most this many entries.
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
+        /// Print a JSON array for scripts instead of the human list.
+        #[arg(long)]
+        json: bool,
+        /// Only entries whose description, project name, or note
+        /// contains this text (case-insensitive). Totals are unaffected:
+        /// this narrows the list, never the sums (#131).
+        #[arg(long)]
+        search: Option<String>,
+    },
+
+    /// Import a TimeTrack CSV export (#132): projects match by name
+    /// (missing ones are created), rows already present are skipped, so
+    /// importing the same file twice changes nothing the second time.
+    Import {
+        /// The export file to read.
+        file: std::path::PathBuf,
+        /// Report what would be imported, changing nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    // --- external sources (§19, socket-only) ---
+    /// Register an external calendar: a local `.ics` file, an
+    /// `http(s)://` URL serving one, or a CalDAV collection URL
+    /// (`--kind caldav`; password via TIMETRACK_CALDAV_PASSWORD in the
+    /// service environment). Read-only either way.
+    SourceAdd {
+        /// File path, or URL when it starts with `http://`/`https://`.
+        locator: String,
+        /// Source kind: `ics_file`, `ics_url`, or `caldav`. Inferred
+        /// from the locator when omitted (`.ics` URL or file path).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Project its suggestions confirm into (id or name).
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Display label; defaults to the file or URL's last part.
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+
+    /// List registered external sources.
+    Sources,
+
+    /// Fetch one source (or all) now and store new suggestions.
+    /// Fetching creates no entries — `confirm` does that.
+    Refresh {
+        /// Source id (from `sources`); omitted refreshes all.
+        id: Option<String>,
+    },
+
+    /// List pending suggestions from external sources.
+    Suggestions {
+        /// Print a JSON array for scripts instead of the human list.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Turn a suggestion into a real entry.
+    Confirm {
+        /// Suggestion id (from `suggestions`).
+        id: String,
+        /// Project override (id or name); default is the source's map.
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Dismiss a suggestion; it will not be offered again.
+    Dismiss {
+        /// Suggestion id (from `suggestions`).
+        id: String,
     },
 }
 
-/// zbus uses the async-io backend (see the workspace Cargo.toml), so the
-/// runtime is `async_io`, not tokio.
+/// The client is driven by `async_io` — this workspace has no tokio
+/// anywhere (see the workspace Cargo.toml).
 fn main() -> Result<()> {
     async_io::block_on(run())
 }
@@ -252,17 +345,11 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // The TUI is interactive and wants the terminal to itself.
-    if matches!(cli.command, None | Some(Command::Tui)) {
-        return tui::run().await;
-    }
-
-    // `wait_for_service` waits for the service to answer, not merely for a
-    // bus to exist, and gives up with the shared guidance -- so a missing
-    // service says what to do about it rather than naming a D-Bus error the
-    // user cannot act on.
+    // `wait_for_service` waits for the service to answer on its socket
+    // (spawning it once if nothing does), and gives up with the shared
+    // guidance -- so a missing service says what to do about it.
     let client = Client::wait_for_service(CONNECT_TIMEOUT).await?;
-    dispatch(client, cli.command.expect("non-TUI command above"))
+    dispatch(client, cli.command_or_status())
         .await
         .map_err(explain)
 }
@@ -340,8 +427,6 @@ fn quick_add_ms(minutes: i64) -> Option<i64> {
 
 async fn dispatch(client: Client, command: Command) -> Result<()> {
     match command {
-        Command::Tui => unreachable!("handled above"),
-
         Command::Add {
             project,
             description,
@@ -623,11 +708,232 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             println!("deleted project {} ({})", disp(&existing.name), existing.id);
         }
 
-        Command::Status => print_status(&client.snapshot().await?),
+        Command::Snapshot => {
+            let snap = client.snapshot().await?;
+            println!(
+                "{}",
+                serde_json::to_string(&snap).expect("snapshots are always serializable")
+            );
+        }
 
-        Command::List { limit } => print_list(&client.snapshot().await?, limit),
+        Command::Status { json } => {
+            let snap = client.snapshot().await?;
+            if json {
+                println!("{}", status_json(&snap));
+            } else {
+                print_status(&snap);
+            }
+        }
 
-        Command::Export { scope, at, out } => {
+        Command::List {
+            limit,
+            json,
+            search,
+        } => {
+            let snap = client.snapshot().await?;
+            if json {
+                println!("{}", list_json(&snap, limit, search.as_deref()));
+            } else {
+                print_list(&snap, limit, search.as_deref());
+            }
+        }
+
+        Command::Import { file, dry_run } => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("could not read {}: {e}", file.display()))?;
+            let snap = client.snapshot().await?;
+            let tz = snapshot_tz(&snap)?;
+            let rows = timetrack_core::parse_export_csv(&text, &tz).map_err(anyhow::Error::new)?;
+            let plan = plan_import(&snap, &rows);
+            let mut notes_dropped = 0usize;
+            if dry_run {
+                println!(
+                    "would import {} entries ({} skipped as already present, {} new project(s))",
+                    plan.to_add.len(),
+                    plan.skipped,
+                    plan.new_projects.len()
+                );
+            } else {
+                // Project name (lowercased) -> id, seeded from the
+                // snapshot and extended as missing projects are created.
+                let mut by_name: std::collections::HashMap<String, String> = snap
+                    .projects
+                    .iter()
+                    .map(|p| (p.name.to_lowercase(), p.id.clone()))
+                    .collect();
+                for name in &plan.new_projects {
+                    let created = client.add_project(name).await?;
+                    by_name.insert(name.to_lowercase(), created.id);
+                }
+                for (project, row) in &plan.to_add {
+                    let project_id = &by_name[&project.to_lowercase()];
+                    let created = client
+                        .add(project_id, &row.description, row.started_at, row.ended_at)
+                        .await?;
+                    if let Some(note) = &row.note
+                        && client.set_note(&created.id, Some(note)).await.is_err()
+                    {
+                        notes_dropped += 1;
+                    }
+                }
+                println!(
+                    "imported {} entries ({} skipped as already present, {} project(s) created)",
+                    plan.to_add.len(),
+                    plan.skipped,
+                    plan.new_projects.len()
+                );
+            }
+            if notes_dropped > 0 {
+                println!(
+                    "note: {notes_dropped} note(s) could not be restored (notes need a socket-speaking service)"
+                );
+            }
+        }
+
+        Command::SourceAdd {
+            locator,
+            kind,
+            project,
+            label,
+        } => {
+            let inferred = if locator.starts_with("http://") || locator.starts_with("https://") {
+                "ics_url"
+            } else {
+                "ics_file"
+            };
+            let kind = kind.as_deref().unwrap_or(inferred);
+            let project_id = match &project {
+                Some(wanted) => {
+                    let snap = client.snapshot().await?;
+                    Some(find_project(&snap, wanted)?.id.clone())
+                }
+                None => None,
+            };
+            let src = client
+                .add_source(kind, &locator, project_id.as_deref(), &label)
+                .await?;
+            println!(
+                "added source {} ({}) {}",
+                disp(&src.label),
+                src.kind,
+                src.id
+            );
+        }
+
+        Command::Sources => {
+            let sources = client.sources().await?;
+            if sources.is_empty() {
+                println!("no external sources yet (add one with: timetrack source-add <file.ics>)");
+            }
+            for s in sources {
+                println!(
+                    "{}  {:<8}  {}  {}",
+                    s.id,
+                    s.kind,
+                    disp(&s.label),
+                    disp(&s.locator)
+                );
+            }
+        }
+
+        Command::Refresh { id } => {
+            let tally = client.refresh_source(id.as_deref()).await?;
+            println!(
+                "fetched {} item(s): {} new suggestion(s), {} skipped",
+                tally.fetched, tally.inserted, tally.skipped
+            );
+        }
+
+        Command::Suggestions { json } => {
+            let suggestions = client.suggestions().await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&suggestions)
+                        .expect("suggestion views are always serializable")
+                );
+            } else if suggestions.is_empty() {
+                println!("no pending suggestions (try: timetrack refresh)");
+            } else {
+                let snap = client.snapshot().await?;
+                let tz = snapshot_tz(&snap)?;
+                for s in suggestions {
+                    println!(
+                        "{}  {}  {:>10}  {}",
+                        s.id,
+                        timetrack_core::format_local_iso8601(s.started_at, &tz),
+                        timetrack_core::format_duration(s.ended_at - s.started_at),
+                        disp(&s.title)
+                    );
+                }
+            }
+        }
+
+        Command::Confirm { id, project } => {
+            let project_id = match &project {
+                Some(wanted) => {
+                    let snap = client.snapshot().await?;
+                    Some(find_project(&snap, wanted)?.id.clone())
+                }
+                None => None,
+            };
+            let e = client
+                .confirm_suggestion(&id, project_id.as_deref())
+                .await?;
+            println!(
+                "confirmed {} ({})",
+                timetrack_core::format_duration(e.duration_ms()),
+                e.id
+            );
+        }
+
+        Command::Dismiss { id } => {
+            client.dismiss_suggestion(&id).await?;
+            println!("dismissed {id}");
+        }
+
+        Command::Export {
+            scope,
+            at,
+            from,
+            to,
+            out,
+        } if from.is_some() || to.is_some() => {
+            // A custom range (#133) is its own addressing scheme, like
+            // the anchor was (ADR 0001): both days or neither, and never
+            // combined with a week/month scope that it would contradict.
+            let (Some(from_text), Some(to_text)) = (&from, &to) else {
+                return Err(anyhow::anyhow!("a custom range needs both --from and --to"));
+            };
+            if scope != "all" || at.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--from/--to cannot combine with --scope or --at"
+                ));
+            }
+            let snap = client.snapshot().await?;
+            let tz = snapshot_tz(&snap)?;
+            let from_ms = parse_export_anchor(from_text, &tz)?;
+            let to_ms = parse_export_anchor(to_text, &tz)?;
+            let csv = client.export_csv_range(from_ms, to_ms).await?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, &csv)?;
+                    let count = csv.lines().count().saturating_sub(1);
+                    let basename = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    println!(
+                        "exported {count} entries ({}..{}) to {basename}",
+                        timetrack_core::anchor_day_string(from_ms, &tz),
+                        timetrack_core::anchor_day_string(to_ms, &tz)
+                    );
+                }
+                None => print!("{csv}"),
+            }
+        }
+
+        Command::Export { scope, at, out, .. } => {
             // Scope first, so a typo is refused before touching the bus.
             let parsed = parse_export_scope(&scope)?;
             // The file status needs the period id, which needs the snapshot
@@ -701,12 +1007,48 @@ fn print_status(s: &Snapshot) {
     }
 }
 
-fn print_list(s: &Snapshot, limit: usize) {
-    if s.entries.is_empty() {
-        println!("no entries yet");
+/// The entries a `--search` keeps (#131): description, project name, or
+/// note containing the needle, case-insensitively. Client-side over the
+/// snapshot, so totals and exports are never narrowed — only this list.
+fn filtered_entries<'a>(
+    s: &'a Snapshot,
+    search: Option<&str>,
+) -> Vec<&'a timetrack_proto::EntryView> {
+    let Some(needle) = search.map(|q| q.to_lowercase()) else {
+        return s.entries.iter().collect();
+    };
+    let project_name = |id: &str| {
+        s.projects
+            .iter()
+            .find(|p| p.id == id)
+            .map_or("", |p| p.name.as_str())
+    };
+    s.entries
+        .iter()
+        .filter(|e| {
+            e.description.to_lowercase().contains(&needle)
+                || project_name(&e.project_id).to_lowercase().contains(&needle)
+                || e.note
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains(&needle))
+        })
+        .collect()
+}
+
+fn print_list(s: &Snapshot, limit: usize, search: Option<&str>) {
+    let entries = filtered_entries(s, search);
+    if entries.is_empty() {
+        println!(
+            "{}",
+            if search.is_some() {
+                "no entries match"
+            } else {
+                "no entries yet"
+            }
+        );
         return;
     }
-    for e in s.entries.iter().take(limit) {
+    for e in entries.into_iter().take(limit) {
         let marker = if e.source == timetrack_proto::EntrySource::QuickAdd {
             "+"
         } else {
@@ -718,6 +1060,103 @@ fn print_list(s: &Snapshot, limit: usize) {
             e.id,
             disp(e.label())
         );
+    }
+}
+
+/// The `status --json` document (§18): the same totals `print_status`
+/// shows, as one stable object a script can read -- week first, like the
+/// human output and the GUI hero.
+fn status_json(s: &Snapshot) -> String {
+    serde_json::json!({
+        "week": s.week,
+        "month": s.month,
+        "total_ms": s.total_ms,
+        "over_24h_days": s.over_24h_days,
+    })
+    .to_string()
+}
+
+/// The `list --json` document (§18): at most `limit` entries, most
+/// recent first, in the wire's own field spellings.
+fn list_json(s: &Snapshot, limit: usize, search: Option<&str>) -> String {
+    let entries: Vec<&timetrack_proto::EntryView> = filtered_entries(s, search)
+        .into_iter()
+        .take(limit)
+        .collect();
+    serde_json::to_string(&entries).expect("entry views are always serializable")
+}
+
+/// What an import would do (#132), decided purely over a snapshot so it
+/// is testable without a service: which projects must be created
+/// (matched by name, case-insensitively), which rows are new, and how
+/// many were skipped as already present — where "present" is same
+/// project, same interval, same description, and a row repeated inside
+/// the file counts once.
+struct ImportPlan {
+    new_projects: Vec<String>,
+    to_add: Vec<(String, timetrack_core::ImportedEntry)>,
+    skipped: usize,
+}
+
+fn plan_import(snap: &Snapshot, rows: &[timetrack_core::ImportedEntry]) -> ImportPlan {
+    use std::collections::HashSet;
+    let name_of = |id: &str| -> String {
+        snap.projects
+            .iter()
+            .find(|p| p.id == id)
+            .map_or_else(|| id.to_lowercase(), |p| p.name.to_lowercase())
+    };
+    // The export's precision is whole seconds, so dedupe at whole
+    // seconds on both sides: an entry re-imported from its own export
+    // must be recognised even though its stored milliseconds were
+    // never in the file.
+    fn whole_seconds(ms: i64) -> i64 {
+        ms.div_euclid(1_000) * 1_000
+    }
+    let mut present: HashSet<(String, i64, i64, String)> = snap
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                name_of(&e.project_id),
+                whole_seconds(e.started_at),
+                whole_seconds(e.ended_at),
+                e.description.clone(),
+            )
+        })
+        .collect();
+    let known: HashSet<String> = snap
+        .projects
+        .iter()
+        .map(|p| p.name.to_lowercase())
+        .collect();
+    let mut new_projects: Vec<String> = Vec::new();
+    let mut to_add = Vec::new();
+    let mut skipped = 0;
+    for row in rows {
+        let key = (
+            row.project.to_lowercase(),
+            whole_seconds(row.started_at),
+            whole_seconds(row.ended_at),
+            row.description.clone(),
+        );
+        if !present.insert(key) {
+            skipped += 1;
+            continue;
+        }
+        if !known.contains(&row.project.to_lowercase())
+            && !new_projects
+                .iter()
+                .any(|n: &String| n.to_lowercase() == row.project.to_lowercase())
+        {
+            new_projects.push(row.project.clone());
+        }
+        to_add.push((row.project.clone(), row.clone()));
+    }
+    ImportPlan {
+        new_projects,
+        to_add,
+        skipped,
     }
 }
 
@@ -1168,7 +1607,7 @@ mod tests {
         ])
         .expect("export args must parse");
         match cli.command {
-            Some(Command::Export { scope, at, out }) => {
+            Some(Command::Export { scope, at, out, .. }) => {
                 assert_eq!(scope, "week");
                 assert_eq!(at.as_deref(), Some("2026-10-12"));
                 assert!(out.is_none());
@@ -1187,7 +1626,7 @@ mod tests {
         ])
         .expect("export --out must parse");
         match cli.command {
-            Some(Command::Export { scope, at, out }) => {
+            Some(Command::Export { scope, at, out, .. }) => {
                 assert_eq!(scope, "month");
                 assert_eq!(at.as_deref(), Some("2026-09-15"));
                 assert_eq!(
@@ -1320,5 +1759,188 @@ mod tests {
             ),
             "exported 0 entries (month 2026-09) to timetrack-export-month-2026-09.csv"
         );
+    }
+
+    #[test]
+    fn bare_timetrack_defaults_to_status_and_tui_is_gone() {
+        // §18: the terminal client is one-shot only. Bare `timetrack` is
+        // the between-commands glance (status), and `tui` refuses.
+        let cli = Cli::try_parse_from(["timetrack"]).expect("bare timetrack parses");
+        assert!(matches!(
+            cli.command_or_status(),
+            Command::Status { json: false }
+        ));
+        assert!(Cli::try_parse_from(["timetrack", "tui"]).is_err());
+        use clap::CommandFactory;
+        assert!(
+            Cli::command()
+                .get_subcommands()
+                .all(|c| c.get_name() != "tui"),
+            "no tui subcommand may remain"
+        );
+    }
+
+    #[test]
+    fn status_and_list_accept_json_flags() {
+        let cli = Cli::try_parse_from(["timetrack", "status", "--json"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Status { json: true })));
+        let cli = Cli::try_parse_from(["timetrack", "list", "--json", "-l", "3"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::List {
+                limit: 3,
+                json: true,
+                search: None
+            })
+        ));
+    }
+
+    #[test]
+    fn status_json_carries_week_month_and_all_time_totals() {
+        let mut snap = Snapshot::default();
+        snap.week.total_ms = 3_600_000;
+        snap.week.entry_count = 2;
+        snap.month.total_ms = 7_200_000;
+        snap.total_ms = 10_800_000;
+        let v: serde_json::Value = serde_json::from_str(&status_json(&snap)).unwrap();
+        assert_eq!(v["week"]["total_ms"], 3_600_000);
+        assert_eq!(v["week"]["entry_count"], 2);
+        assert_eq!(v["month"]["total_ms"], 7_200_000);
+        assert_eq!(v["total_ms"], 10_800_000);
+    }
+
+    #[test]
+    fn search_filters_by_description_project_and_note_case_insensitively() {
+        // #131: client-side over the snapshot; totals stay unfiltered
+        // because only the list rendering narrows.
+        let mut snap = Snapshot::default();
+        snap.projects.push(timetrack_proto::ProjectView {
+            id: "p1".into(),
+            name: "Deep Work".into(),
+            colour: None,
+            archived: false,
+        });
+        for (id, desc, note) in [
+            ("e0", "Review PR", None),
+            ("e1", "groceries", Some("weekly")),
+            ("e2", "misc", None),
+        ] {
+            snap.entries.push(timetrack_proto::EntryView {
+                id: id.into(),
+                project_id: "p1".into(),
+                description: desc.into(),
+                started_at: 0,
+                ended_at: 60_000,
+                source: timetrack_proto::EntrySource::Manual,
+                note: note.map(str::to_string),
+            });
+        }
+        let ids = |q: &str| -> Vec<String> {
+            filtered_entries(&snap, Some(q))
+                .iter()
+                .map(|e| e.id.clone())
+                .collect()
+        };
+        assert_eq!(ids("review"), ["e0"]);
+        assert_eq!(ids("DEEP"), ["e0", "e1", "e2"], "project name matches");
+        assert_eq!(ids("Weekly"), ["e1"], "note matches");
+        assert!(ids("absent").is_empty());
+        assert_eq!(filtered_entries(&snap, None).len(), 3);
+        let cli = Cli::try_parse_from(["timetrack", "list", "--search", "review"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::List {
+                search: Some(ref s),
+                ..
+            }) if s == "review"
+        ));
+    }
+
+    #[test]
+    fn import_plans_only_missing_entries_and_projects() {
+        // #132: match projects by name, skip rows already present (same
+        // project, interval and description), including repeats inside
+        // the file itself.
+        let mut snap = Snapshot::default();
+        snap.projects.push(timetrack_proto::ProjectView {
+            id: "p1".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        snap.entries.push(timetrack_proto::EntryView {
+            id: "e1".into(),
+            project_id: "p1".into(),
+            description: "kept".into(),
+            // Sub-second parts the export never carried: dedupe must
+            // still recognise this entry in its own export.
+            started_at: 1_500,
+            ended_at: 61_500,
+            source: timetrack_proto::EntrySource::Manual,
+            note: None,
+        });
+        let row = |project: &str, desc: &str, a: i64, b: i64| timetrack_core::ImportedEntry {
+            project: project.into(),
+            description: desc.into(),
+            started_at: a,
+            ended_at: b,
+            source: timetrack_core::EntrySource::Manual,
+            note: None,
+        };
+        let rows = vec![
+            row("work", "kept", 1_000, 61_000), // already there (case aside)
+            row("Work", "new", 2_000, 62_000),
+            row("Work", "new", 2_000, 62_000), // repeat inside the file
+            row("Home", "x", 3_000, 63_000),
+        ];
+        let plan = plan_import(&snap, &rows);
+        assert_eq!(plan.new_projects, ["Home"]);
+        assert_eq!(plan.skipped, 2);
+        assert_eq!(plan.to_add.len(), 2);
+        assert_eq!(plan.to_add[0].1.description, "new");
+        assert_eq!(plan.to_add[1].0, "Home");
+        let cli = Cli::try_parse_from(["timetrack", "import", "old.csv", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Import { dry_run: true, .. })
+        ));
+    }
+
+    #[test]
+    fn source_commands_parse() {
+        let cli =
+            Cli::try_parse_from(["timetrack", "source-add", "cal.ics", "-p", "Work"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::SourceAdd { .. })));
+        let cli = Cli::try_parse_from(["timetrack", "confirm", "sg-1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Confirm { ref id, .. }) if id == "sg-1"
+        ));
+        let cli = Cli::try_parse_from(["timetrack", "suggestions", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Suggestions { json: true })
+        ));
+    }
+
+    #[test]
+    fn list_json_respects_the_limit_and_names_entries() {
+        let mut snap = Snapshot::default();
+        for i in 0..3 {
+            snap.entries.push(timetrack_proto::EntryView {
+                id: format!("e{i}"),
+                project_id: "p1".into(),
+                description: format!("task {i}"),
+                started_at: i * 60_000,
+                ended_at: i * 60_000 + 30_000,
+                source: timetrack_proto::EntrySource::Manual,
+                note: None,
+            });
+        }
+        let v: serde_json::Value = serde_json::from_str(&list_json(&snap, 2, None)).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+        assert_eq!(v[0]["id"], "e0");
+        assert_eq!(v[0]["description"], "task 0");
+        assert_eq!(v[1]["id"], "e1");
     }
 }

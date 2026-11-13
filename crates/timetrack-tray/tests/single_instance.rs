@@ -11,10 +11,12 @@ use common::ChildGuard;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn spawn_tray(address: &str) -> ChildGuard {
+fn spawn_tray(address: &str, dir: &std::path::Path) -> ChildGuard {
     ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_timetrack-tray"))
             .env("DBUS_SESSION_BUS_ADDRESS", address)
+            // §16: never the developer's real service socket (see common).
+            .env("TIMETRACK_SOCKET", dir.join("tt.sock"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -30,12 +32,12 @@ fn second_tray_exits_and_only_one_item_registers() {
         let address = common::start_private_bus(&dir);
         let (_conn, items) = common::serve_watcher(&address).await;
 
-        let mut first = spawn_tray(&address);
+        let mut first = spawn_tray(&address, &dir);
         common::wait_for_registration(&items).await;
 
         // The second copy must leave on its own, successfully: the name
         // is taken, and that is the designed outcome, not an error.
-        let mut second = spawn_tray(&address);
+        let mut second = spawn_tray(&address, &dir);
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if let Some(status) = second

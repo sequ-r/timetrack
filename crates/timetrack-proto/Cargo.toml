@@ -16,3 +16,8 @@ zbus = { workspace = true }
 async-io = { workspace = true }
 futures-lite = { workspace = true }
 anyhow = { workspace = true }
+
+# Windows named pipes behind the same socket contract (§16). Sync API
+# only: no async features, so no tokio enters through here either.
+[target.'cfg(windows)'.dependencies]
+interprocess = { version = "2", default-features = false }

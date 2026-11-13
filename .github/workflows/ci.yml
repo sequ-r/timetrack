@@ -32,9 +32,6 @@ env:
   # workspace needs them -- without them the build fails, which reads as a
   # broken test rather than as a missing -dev package (README, "Building").
   GUI_LIBS: libxkbcommon-dev libxkbcommon-x11-dev libfreetype-dev libfontconfig-dev
-  # The e2e rig drives a real service on a private session bus and reads
-  # aggregate snapshots back through gdbus.
-  RIG_TOOLS: dbus libglib2.0-bin
   # gui-smoke drives the real GUI on a headless X server, so it needs: Xvfb
   # itself; xdpyinfo to wait for it; setxkbmap, because an Xvfb server has no
   # keymap and every keysym lookup would otherwise return 0; ImageMagick to
@@ -145,14 +142,12 @@ jobs:
       - run: cargo audit
 
   e2e:
-    name: e2e (service on a private bus)
+    name: e2e (service on a private socket)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-        with:
-          apt-packages: ${{ env.RIG_TOOLS }}
       # The rig drives the release binaries, which is how the README tells a
       # person to run them. Neither the CLI nor the service pulls in gpui, so
       # this build is a fraction of the GUI one.
@@ -190,3 +185,46 @@ jobs:
           name: gui-smoke-failure
           path: ${{ runner.temp }}/gui-smoke-artifacts
           if-no-files-found: ignore
+
+  cross:
+    name: cross (${{ matrix.os }})
+    # §16 step 5: the portable stack -- core, store, proto, service, CLI --
+    # must build and pass its tests on Windows and macOS natively (bundled
+    # SQLite needs each runner's own C toolchain, which is exactly what a
+    # cross-compile from Linux cannot prove). The GUI and tray stay
+    # Linux-only for now, so they are deliberately absent here; their
+    # per-OS ports are separate work, not a silent skip.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: >-
+          cargo test --locked
+          --package timetrack-core --package timetrack-store
+          --package timetrack-proto --package timetrack-service
+          --package timetrack-cli
+      # Per-OS packaging, v1 (§16): the portable stack as raw binaries.
+      # Installers/app bundles wait for the GUI/tray ports; the AppImage
+      # remains the Linux install (ADR 0008 as scoped by ADR 0013).
+      - run: >-
+          cargo build --release --locked
+          --package timetrack-cli --package timetrack-service
+      - uses: actions/upload-artifact@v7
+        if: matrix.os == 'windows-latest'
+        with:
+          name: timetrack-windows
+          path: |
+            target/release/timetrack.exe
+            target/release/timetrack-service.exe
+      - uses: actions/upload-artifact@v7
+        if: matrix.os == 'macos-latest'
+        with:
+          name: timetrack-macos
+          path: |
+            target/release/timetrack
+            target/release/timetrack-service

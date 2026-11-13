@@ -148,6 +148,19 @@ pub(crate) async fn portal_save_file(current_name: &str) -> PortalOutcome {
     if let Some(outcome) = stubbed_outcome(current_name) {
         return outcome;
     }
+    platform_portal_save_file(current_name).await
+}
+
+/// Freedesktop portals are the Linux system dialog (§16): other
+/// desktops take the direct home-directory fallback below until
+/// their native dialog lands, which is what Unavailable requests.
+#[cfg(not(target_os = "linux"))]
+async fn platform_portal_save_file(_current_name: &str) -> PortalOutcome {
+    PortalOutcome::Unavailable
+}
+
+#[cfg(target_os = "linux")]
+async fn platform_portal_save_file(current_name: &str) -> PortalOutcome {
     let request = ashpd::desktop::file_chooser::SelectedFiles::save_file()
         .title("Save export")
         .current_name(current_name)

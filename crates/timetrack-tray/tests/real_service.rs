@@ -82,7 +82,7 @@ fn tray_round_trips_against_the_real_service() {
     async_io::block_on(async {
         let dir = std::env::temp_dir().join(format!("timetrack-tray-real-{}", std::process::id()));
         let address = common::start_private_bus(&dir);
-        common::point_at_private_bus(&address);
+        common::point_at_private_bus(&address, &dir);
         let (conn, items) = common::serve_watcher(&address).await;
 
         // A fresh store: the service seeds `General` itself, which is what
@@ -107,16 +107,28 @@ fn tray_round_trips_against_the_real_service() {
                 .expect("could not spawn timetrack-service"),
         );
 
+        // §16: the rig pointed TIMETRACK_SOCKET at the service's private
+        // socket (common::point_at_private_bus), so this whole round
+        // trip -- snapshots, menu clicks, Changed below -- speaks the
+        // socket, with the bus carrying only the tray menu. Connecting
+        // is just naming the socket now; wait_for_service below proves
+        // the bind by snapshot.
         let client = Client::connect()
             .await
-            .expect("must connect to the private bus");
+            .expect("must connect toward the private socket");
         // The seed, through the real wire: one unarchived General, no time.
         let snap = wait_for_service(&client, Duration::from_secs(15)).await;
         assert_eq!(snap.projects.len(), 1);
         assert_eq!(snap.projects[0].name, "General");
         assert!(!snap.projects[0].archived);
         assert!(snap.entries.is_empty());
-        assert!(store_path.exists(), "the service must persist its seed");
+        // §17: the seed persists to the SQLite database beside the legacy
+        // store path the service was given; no JSON store is created.
+        assert!(
+            dir.join("store.db").exists(),
+            "the service must persist its seed to store.db"
+        );
+        assert!(!store_path.exists(), "no JSON store is created any more");
 
         let tray_log = std::fs::File::create(dir.join("tray.log")).unwrap();
         let _tray = ChildGuard(

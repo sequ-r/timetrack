@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end check for the manual time-tracking service.
 #
-# Runs a real service on a private session bus and drives it with the real CLI,
-# so this exercises the same path a user takes.
+# Runs a real service on a private socket (no session bus at all, #129)
+# and drives it with the real CLI, so this exercises the same path a user takes.
 #
 # Two design choices keep this from being flaky:
 #
@@ -59,34 +59,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== starting a private bus and the service =="
-# A hermetic bus. `--session` reads standard_session_servicedirs, which
-# includes ~/.local/share/dbus-1/services -- so a plain private bus
-# auto-activates whatever host service is installed there, and that binary can
-# win the name before ours does. A config with no service directories keeps
-# this test talking only to the binary under test.
-BUS_CONF=$WORK/bus.conf
-cat >"$BUS_CONF" <<'XML'
-<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:tmpdir=/tmp</listen>
-  <policy context="default">
-    <allow send_destination="*" eavesdrop="true"/>
-    <allow eavesdrop="true"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>
-XML
-
-# `--fork` prints the address on stdout and then daemonises, so this returns
-# immediately. (Asking for --print-pid as well makes it print two lines, and
-# the address is no longer the only thing captured.)
-DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --config-file="$BUS_CONF" --print-address --fork) || {
-  echo "could not start a private bus"; exit 1; }
-export DBUS_SESSION_BUS_ADDRESS
-[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && { echo "empty bus address"; exit 1; }
+echo "== starting the service on a private socket =="
+# §16 hermeticity: the service socket is pointed into the rig, so the
+# service binds it and every CLI below speaks only to the rig. Without
+# this the rig could reach (and mutate) a real running service. No
+# session bus is involved at all any more (#129) -- explicitly unsetting
+# its address proves the point on every run.
+unset DBUS_SESSION_BUS_ADDRESS
+export TIMETRACK_SOCKET="$WORK/tt.sock"
 
 # TZ pins the service's offset, so day bucketing is deterministic.
 TZ=UTC "$SVC" "$STORE" >"$WORK/svc.log" 2>&1 &
@@ -131,6 +111,21 @@ PROBE=$(id_of "$out")
 check "both probe entries removed" "0" "$(listed)"
 
 echo
+echo "== CLI-only surface: bare is status, --json, no tui =="
+# §18/ADR 0016: bare `timetrack` is the between-commands glance -- the same
+# first line as `status` (week total first, the hero rule in text) -- and it
+# exits at once instead of opening a UI.
+check "bare timetrack prints the status" "$("$CLI" status)" "$("$CLI")"
+case "$("$CLI" | head -1)" in "this week:"*) ok "bare output starts with the week total";; *) bad "bare output starts with the week total" "$("$CLI" | head -1)";; esac
+out=$("$CLI" status --json)
+contains "status --json carries the week total" '"total_ms":0' "$out"
+contains "status --json names the week" '"week"' "$out"
+out=$("$CLI" list --json)
+check "list --json of an empty store is an empty array" "[]" "$out"
+"$CLI" tui >/dev/null 2>&1 \
+  && bad "the tui subcommand is gone" "exit 0" || ok "the tui subcommand is gone"
+
+echo
 echo "== the last project cannot be deleted =="
 # The service seeds one project, so right now it is the last one and the core
 # refuses to delete it. This runs before any other project exists, so the
@@ -156,10 +151,7 @@ out=$("$CLI" rename p4 Renamed)
 contains "rename reports old and new" "renamed RenameMe to Renamed (p4)" "$out"
 out=$("$CLI" recolour p4 2ea043)
 contains "recolour reports the colour" "recoloured Renamed (p4) to #2ea043" "$out"
-SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries.Snapshot \
-  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+SNAP_JSON=$("$CLI" snapshot)
 if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
 import json, sys
 snap = json.load(sys.stdin)
@@ -229,10 +221,7 @@ out=$("$CLI" archive "p3")
 contains "archived" "archived" "$out"
 out=$("$CLI" unarchive "p3")
 contains "unarchived" "unarchived Home (p3)" "$out"
-SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries.Snapshot \
-  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+SNAP_JSON=$("$CLI" snapshot)
 if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
 import json, sys
 snap = json.load(sys.stdin)
@@ -450,10 +439,7 @@ SVC_PID=$!
 wait_for_service || { echo "service did not come back on Europe/Rome"; cat "$WORK/svc.log"; exit 1; }
 check "all-time total survived the timezone restart" "$before_all" "$(total)"
 check "every entry survived the timezone restart" "$before_n" "$(listed)"
-SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries.Snapshot \
-  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+SNAP_JSON=$("$CLI" snapshot)
 if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
 import json, sys
 snap = json.load(sys.stdin)
@@ -504,8 +490,12 @@ check "all-time unchanged by archiving" "$before_all" "$(total)"
 
 echo
 echo "== the store is authoritative and versioned =="
-check "store format is the current version" '"version": 1' "$(sed -nE 's/^[[:space:]]*//p' "$STORE" | grep -m1 version | tr -d ',')"
-check "no stopwatch state in the store" "0" "$(grep -cE '"(running|duration_ms)"' "$STORE")"
+# §17: the service arg still names store.json, but the data lives in the
+# SQLite database beside it -- and a fresh rig never creates a JSON store.
+# (Schema versioning itself is pinned by timetrack-store's unit tests.)
+[ -f "$WORK/store.db" ] && ok "the SQLite database sits beside the store path" || bad "the SQLite database sits beside the store path" "no $WORK/store.db"
+check "the database is a SQLite file" "SQLite format 3" "$(head -c 15 "$WORK/store.db")"
+[ ! -e "$STORE" ] && ok "no JSON store is created any more" || bad "no JSON store is created any more" "$STORE exists"
 
 echo
 echo "== CSV export writes a file with the spec columns =="
@@ -601,10 +591,7 @@ for i in $(seq 1 15); do
   "$CLI" add -p Work -S -600 -E -540 -d "bulk work $i" >/dev/null; created=$((created+1))
   "$CLI" add -p Home -S -300 -E -270 -d "bulk home $i" >/dev/null; created=$((created+1))
 done
-SNAP_JSON=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries.Snapshot \
-  | python3 -c 'import sys, ast; print(ast.literal_eval(sys.stdin.read().strip())[0])')
+SNAP_JSON=$("$CLI" snapshot)
 if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
 import json, sys
 snap = json.load(sys.stdin)
@@ -625,44 +612,18 @@ else
   bad "all-time aggregates agree with the entries" "could not parse the snapshot"
 fi
 
-echo
-echo "== the D-Bus surface is the new one =="
-INTRO=$(gdbus introspect --session --dest org.sequ.timetrack --object-path /org/sequ/timetrack 2>/dev/null)
-check "interface is the new one" "org.sequ.timetrack.Entries" \
-  "$(printf '%s' "$INTRO" | grep -o 'org\.sequ\.timetrack\.[A-Za-z]*' | sort -u | head -1)"
-printf '%s' "$INTRO" | grep -qE '\b(Start|Stop|Cancel)\b' \
-  && bad "stopwatch methods are gone" "Start/Stop/Cancel still exposed" \
-  || ok "stopwatch methods are gone"
-for m in Add AddDuration AddDurationEnding QuickAdd SetTimes SetText SetProject UndoQuickAdd DeleteEntry Split Merge AddProject UpdateProject SetArchived DeleteProject ExportCsv ExportCsvAt; do
-  printf '%s' "$INTRO" | grep -q "$m" && ok "$m is exposed" || bad "$m is exposed" "not found"
-done
-# #103: clients refresh on this instead of polling.
-printf '%s' "$INTRO" | grep -q "Changed" && ok "Changed signal is exposed" || bad "Changed signal is exposed" "not found"
+# Every mutation above landed in the one database beside the store path.
+[ -f "$WORK/store.db" ] && ok "mutations persisted to the database" || bad "mutations persisted to the database" "no $WORK/store.db"
 
 echo
-echo "== the typed interface (Entries2, #110) =="
-printf '%s' "$INTRO" | grep -q "org.sequ.timetrack.Entries2" && ok "Entries2 is exposed beside Entries" || bad "Entries2 is exposed beside Entries" "not found"
-API_V=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries2.ApiVersion 2>/dev/null)
-check "ApiVersion reports 2" "(uint32 2,)" "$API_V"
-# A typed QuickAdd replies with a struct, not a JSON string.
-TYPED_ADD=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries2.QuickAdd "p1" 900000 2>/dev/null)
-contains "typed QuickAdd returns the entry struct" "'QuickAdd'" "$TYPED_ADD"
-case "$TYPED_ADD" in
-  *'{"'* ) bad "typed reply is not JSON-in-string" "looked like JSON: $TYPED_ADD" ;;
-  * ) ok "typed reply is not JSON-in-string" ;;
-esac
-created=$((created+1))
-# Refusals arrive as named typed errors, variant preserved.
-DUP_ERR=$(gdbus call --session --dest org.sequ.timetrack \
-  --object-path /org/sequ/timetrack \
-  --method org.sequ.timetrack.Entries2.AddProject "General" 2>&1)
-contains "duplicate project is a named typed error" "org.sequ.timetrack.Error.DuplicateProject" "$DUP_ERR"
-# The journal rode along with every mutation above, beside the checkpoint.
-[ -f "$STORE.journal" ] && ok "the journal sits beside the checkpoint" || bad "the journal sits beside the checkpoint" "no $STORE.journal"
+echo "== the socket transport needs no bus =="
+# The dual-serve point (§16/ADR 0013): with no session bus address at
+# all, the CLI still reaches the service -- over the rig socket alone.
+[ -S "$WORK/tt.sock" ] && ok "the service socket sits in the rig" || bad "the service socket sits in the rig" "no $WORK/tt.sock"
+out=$(env -u DBUS_SESSION_BUS_ADDRESS "$CLI" status)
+contains "status answers over the socket with no bus" "this week:" "$out"
+out=$(env -u DBUS_SESSION_BUS_ADDRESS "$CLI" status --json)
+contains "JSON status answers over the socket with no bus" '"week"' "$out"
 
 echo
 echo "== old/new export compat =="
@@ -688,7 +649,78 @@ else
 fi
 
 echo
+echo "== search and import (#131, #132) =="
+out=$("$CLI" list --search "zzznomatch")
+check "search with no match says so" "no entries match" "$out"
+# Re-importing our own export must be a no-op dry run: every row is
+# already present at the export's whole-second precision.
+"$CLI" export --scope all --out "$WORK/reimport.csv" >/dev/null
+out=$("$CLI" import "$WORK/reimport.csv" --dry-run)
+contains "re-importing our own export imports nothing" "would import 0 entries" "$out"
+cat >"$WORK/incoming.csv" <<'CSV'
+id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note
+x1,Imported,from file,2026-01-05T10:00:00,2026-01-05T11:00:00,01:00:00,60,manual,
+CSV
+out=$("$CLI" import "$WORK/incoming.csv")
+contains "a foreign row imports" "imported 1 entries" "$out"
+contains "its project was created" "1 project(s) created" "$out"
+out=$("$CLI" list --search "from file")
+contains "the imported entry is searchable" "from file" "$out"
+out=$("$CLI" import "$WORK/incoming.csv")
+contains "importing it again skips it" "imported 0 entries" "$out"
+created=$((created+1))
+
+echo
+echo "== external .ics suggestions (#19) =="
+# Near-term dates: refresh only suggests the recent past and near
+# future, so the fixture is built around today, not a fixed date.
+EV_DAY=$(date -u +%Y%m%d)
+cat >"$WORK/cal.ics" <<ICS
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:ev-e2e@x
+SUMMARY:Calendar review
+DTSTART:${EV_DAY}T100000Z
+DTEND:${EV_DAY}T110000Z
+END:VEVENT
+BEGIN:VEVENT
+UID:ev-skip@x
+SUMMARY:Dismissed meet
+DTSTART:${EV_DAY}T120000Z
+DTEND:${EV_DAY}T123000Z
+END:VEVENT
+END:VCALENDAR
+ICS
+out=$("$CLI" source-add "$WORK/cal.ics")
+contains "source registers" "added source cal.ics (ics_file)" "$out"
+out=$("$CLI" refresh)
+contains "refresh fetches both items" "fetched 2 item(s): 2 new suggestion(s), 0 skipped" "$out"
+check "fetching created no entries" "0" "$("$CLI" list --json --search "Calendar review" | grep -o '"id"' | wc -l | tr -d ' ')"
+out=$("$CLI" refresh)
+contains "a second refresh inserts nothing" "0 new suggestion(s)" "$out"
+SG1=$("$CLI" suggestions | sed -n '1p' | cut -d' ' -f1)
+SG2=$("$CLI" suggestions | sed -n '2p' | cut -d' ' -f1)
+out=$("$CLI" confirm "$SG1")
+contains "confirm creates the entry" "confirmed 01:00:00" "$out"
+created=$((created+1))
+out=$("$CLI" export --scope all | grep "Calendar review")
+contains "the confirmed entry exports as external" "external" "$out"
+out=$("$CLI" dismiss "$SG2")
+contains "dismiss answers" "dismissed $SG2" "$out"
+out=$("$CLI" suggestions)
+check "no suggestions remain pending" "no pending suggestions (try: timetrack refresh)" "$out"
+
+echo
+echo "== custom date-range export (#133) =="
+out=$("$CLI" export --from 2026-01-05 --to 2026-01-05)
+contains "the single-day range holds its entry" "from file" "$out"
+out=$("$CLI" export --from 2026-01-06 --to 2026-01-06)
+check "the next day holds none of it" "id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note" "$out"
+out=$("$CLI" export --from 2026-01-05 2>&1)
+contains "a range needs both ends" "needs both --from and --to" "$out"
+
+echo
 echo "======================================"
 printf 'passed %d, failed %d\n' "$pass" "$fail"
-[ "$fail" -eq 0 ] || { echo; echo "--- store ---"; cat "$STORE"; echo; echo "--- service log ---"; cat "$WORK/svc.log"; }
+[ "$fail" -eq 0 ] || { echo; echo "--- work dir ---"; ls -la "$WORK"; echo; echo "--- service log ---"; cat "$WORK/svc.log"; }
 exit $((fail > 0))

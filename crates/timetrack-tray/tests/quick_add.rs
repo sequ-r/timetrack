@@ -3,29 +3,29 @@
 //! a bucket to the project in the service store, removes it again, and
 //! deletes with confirmation.
 //!
-//! A private bus hosts a minimal watcher (as in `watcher.rs`) plus a fake
-//! timetrack service backed by a real `JsonStore` through the real core
-//! rules -- the same `Snapshot`/`QuickAdd`/`UndoQuickAdd`/`DeleteEntry` wire
-//! the real service speaks. (`real_service.rs` runs the same round-trips
-//! against the real service binary.) The real tray binary runs against that
-//! bus; the test clicks `+15m` over D-Bus (`com.canonical.dbusmenu` `Event`,
-//! the same call a desktop host makes), asserts a 15-minute `QuickAdd` entry
-//! lands for the seeded project, undoes it, quick-adds `+30m`, cancels its
-//! delete (the entry stays), then confirms and asserts it is gone.
-//!
-//! The fake service also remembers which bus connection each call arrived
-//! on: a menu click must travel over the connection the tray already holds
-//! (#50), not over a fresh one.
+//! A private bus hosts a minimal watcher (as in `watcher.rs`) for the
+//! tray *menu*; the service itself is a fake on the local socket (§16),
+//! backed by a real `JsonStore` through the real core rules -- the same
+//! `Snapshot`/`QuickAdd`/`UndoQuickAdd`/`DeleteEntry` contract the real
+//! service speaks. (`real_service.rs` runs the same round-trips against
+//! the real service binary.) The real tray binary runs against that
+//! pair; the test clicks `+15m` over D-Bus (`com.canonical.dbusmenu`
+//! `Event`, the same call a desktop host makes), asserts a 15-minute
+//! `QuickAdd` entry lands for the seeded project, undoes it, quick-adds
+//! `+30m`, cancels its delete (the entry stays), then confirms and
+//! asserts it is gone.
 
 mod common;
 
 use common::ChildGuard;
-use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use timetrack_proto::{BUS_NAME, Client, EntrySource, OBJECT_PATH};
-use zbus::interface;
+use timetrack_proto::socket::{
+    ConnStream, Frame, Listener, Request, Response, SOCKET_API_VERSION, read_frame, socket_path,
+    write_frame,
+};
+use timetrack_proto::{Client, EntrySource, ServiceError};
 
 /// The fake service's state: a real store file through the real core rules,
 /// so a quick-add that lands here went through the same validation and
@@ -34,13 +34,16 @@ struct FakeInner {
     store: timetrack_core::JsonStore,
     data: timetrack_core::Store,
     ids: timetrack_core::Counter,
-    /// The bus connections each method was called over: the unique name of
-    /// the caller, per method (#50).
-    callers: HashMap<String, HashSet<String>>,
 }
 
 struct FakeService {
     inner: Mutex<FakeInner>,
+    /// Method names in call order, so the test can tell the tray's
+    /// clicks really reached this fake over the socket.
+    calls: Mutex<Vec<String>>,
+    /// `Changed` subscription senders, notified after each mutation
+    /// like the real service's funnel.
+    changed: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
 }
 
 impl FakeService {
@@ -59,12 +62,9 @@ impl FakeService {
         }
         let ids = timetrack_core::Counter::continuing(&data);
         let svc = Self {
-            inner: Mutex::new(FakeInner {
-                store,
-                data,
-                ids,
-                callers: HashMap::new(),
-            }),
+            inner: Mutex::new(FakeInner { store, data, ids }),
+            calls: Mutex::new(Vec::new()),
+            changed: Mutex::new(Vec::new()),
         };
         {
             let g = svc.inner.lock().unwrap();
@@ -73,28 +73,35 @@ impl FakeService {
         svc
     }
 
-    /// Remember which bus connection a call arrived on, so the test can
-    /// tell a reused connection from a fresh one (#50).
-    fn record_caller(&self, method: &str, header: &zbus::message::Header<'_>) {
-        let Some(sender) = header.sender() else {
-            return;
-        };
-        let mut g = self.inner.lock().unwrap();
-        g.callers
-            .entry(method.to_string())
-            .or_default()
-            .insert(sender.as_str().to_string());
+    fn record(&self, method: &str) {
+        self.calls.lock().unwrap().push(method.to_string());
     }
 
-    /// The bus connections a method was called over.
-    fn callers(&self, method: &str) -> HashSet<String> {
-        let g = self.inner.lock().unwrap();
-        g.callers.get(method).cloned().unwrap_or_default()
+    fn calls(&self, method: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| *m == method)
+            .count()
+    }
+
+    fn notify_changed(&self) {
+        self.changed
+            .lock()
+            .unwrap()
+            .retain(|tx| tx.send(()).is_ok());
+    }
+
+    fn subscribe(&self) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.changed.lock().unwrap().push(tx);
+        rx
     }
 
     /// Everything the tray's poll loop reads: projects plus this week's
     /// per-project totals from the service aggregates, never re-summed.
-    fn snapshot_json(&self) -> String {
+    fn snapshot(&self) -> timetrack_proto::Snapshot {
         let g = self.inner.lock().unwrap();
         let now = now_ms();
         let tz = timetrack_core::Tz::utc();
@@ -102,7 +109,7 @@ impl FakeService {
         let week = timetrack_core::week_totals(&g.data, today, &tz);
         let month = timetrack_core::month_totals(&g.data, today, &tz);
         let all = timetrack_core::all_totals(&g.data);
-        let snap = timetrack_proto::Snapshot {
+        timetrack_proto::Snapshot {
             projects: g
                 .data
                 .projects
@@ -122,84 +129,54 @@ impl FakeService {
             over_24h_days: Vec::new(),
             local_offset_ms: 0,
             tz: "UTC".into(),
-        };
-        serde_json::to_string(&snap).expect("the snapshot is serializable")
-    }
-
-    /// Method 4 through the real rule, persisted before acknowledging -- the
-    /// same ordering the real service guarantees. Refusals travel typed, as
-    /// on the real wire.
-    fn quick_add_json(&self, project_id: &str, duration_ms: i64) -> zbus::fdo::Result<String> {
-        let mut g = self.inner.lock().unwrap();
-        let now = now_ms();
-        let FakeInner {
-            data, ids, store, ..
-        } = &mut *g;
-        match timetrack_core::quick_add(data, ids, project_id, duration_ms, now) {
-            Ok(entry) => {
-                if let Err(e) = store.save(data) {
-                    return Err(zbus::fdo::Error::Failed(
-                        timetrack_proto::ServiceError::Storage(e.to_string()).to_failed_body(),
-                    ));
-                }
-                serde_json::to_string(&timetrack_proto::entry_to_view(&entry))
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
-            }
-            Err(rule) => Err(zbus::fdo::Error::Failed(
-                timetrack_proto::ServiceError::from(rule).to_failed_body(),
-            )),
         }
     }
 
-    /// Undo through the real rule, like the service: only a quick-add may
-    /// go; anything else is a typed refusal, never a silent delete.
-    fn undo_quick_add_unit(&self, entry_id: &str) -> zbus::fdo::Result<()> {
+    fn quick_add(
+        &self,
+        project_id: &str,
+        duration_ms: i64,
+    ) -> Result<timetrack_proto::EntryView, ServiceError> {
+        let mut g = self.inner.lock().unwrap();
+        let now = now_ms();
+        let FakeInner { data, ids, store } = &mut *g;
+        let entry = timetrack_core::quick_add(data, ids, project_id, duration_ms, now)?;
+        store
+            .save(data)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        Ok(timetrack_proto::entry_to_view(&entry))
+    }
+
+    fn undo_quick_add(&self, entry_id: &str) -> Result<(), ServiceError> {
         let mut g = self.inner.lock().unwrap();
         let FakeInner { data, store, .. } = &mut *g;
-        let refused = |rule: timetrack_core::RuleError| {
-            zbus::fdo::Error::Failed(timetrack_proto::ServiceError::from(rule).to_failed_body())
-        };
         let (id, source) = data
             .get(entry_id)
             .map(|e| (e.id.clone(), e.source))
             .ok_or_else(|| {
-                refused(timetrack_core::RuleError::UnknownEntry(
+                ServiceError::from(timetrack_core::RuleError::UnknownEntry(
                     entry_id.to_string(),
                 ))
             })?;
         if source != timetrack_core::EntrySource::QuickAdd {
-            return Err(refused(timetrack_core::RuleError::NotQuickAdd(id)));
+            return Err(ServiceError::from(timetrack_core::RuleError::NotQuickAdd(
+                id,
+            )));
         }
-        timetrack_core::delete_entry(data, &id).map_err(refused)?;
-        if let Err(e) = store.save(data) {
-            return Err(zbus::fdo::Error::Failed(
-                timetrack_proto::ServiceError::Storage(e.to_string()).to_failed_body(),
-            ));
-        }
+        timetrack_core::delete_entry(data, &id)?;
+        store
+            .save(data)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    /// Explicit deletion, like the service: no source check, just remove.
-    /// Never reached via shorten -- the tray has no shorten row at all.
-    fn delete_entry_unit(&self, entry_id: &str) -> zbus::fdo::Result<()> {
+    fn delete_entry(&self, entry_id: &str) -> Result<(), ServiceError> {
         let mut g = self.inner.lock().unwrap();
         let FakeInner { data, store, .. } = &mut *g;
-        let id = data.get(entry_id).map(|e| e.id.clone()).ok_or_else(|| {
-            zbus::fdo::Error::Failed(
-                timetrack_proto::ServiceError::from(timetrack_core::RuleError::UnknownEntry(
-                    entry_id.to_string(),
-                ))
-                .to_failed_body(),
-            )
-        })?;
-        timetrack_core::delete_entry(data, &id).map_err(|rule| {
-            zbus::fdo::Error::Failed(timetrack_proto::ServiceError::from(rule).to_failed_body())
-        })?;
-        if let Err(e) = store.save(data) {
-            return Err(zbus::fdo::Error::Failed(
-                timetrack_proto::ServiceError::Storage(e.to_string()).to_failed_body(),
-            ));
-        }
+        timetrack_core::delete_entry(data, entry_id)?;
+        store
+            .save(data)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
         Ok(())
     }
 }
@@ -219,67 +196,77 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-struct FakeIface(Arc<FakeService>);
-
-#[interface(name = "org.sequ.timetrack.Entries")]
-impl FakeIface {
-    /// Mirrors the real service's announcement (#103): the tray refreshes
-    /// on this signal now, so a fake that never emits it would leave the
-    /// menu stale until the fallback poll — testing a wire the real
-    /// service no longer speaks.
-    #[zbus(signal)]
-    async fn changed(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
-
-    #[zbus(name = "Snapshot")]
-    fn snapshot(&self, #[zbus(header)] header: zbus::message::Header<'_>) -> String {
-        self.0.record_caller("Snapshot", &header);
-        self.0.snapshot_json()
+/// Serve the fake on the rig socket (the path `TIMETRACK_SOCKET`
+/// names, set by `common::point_at_private_bus`): the same frames the
+/// real service answers, over per-call connections plus subscriptions.
+fn serve_fake(fake: Arc<FakeService>) {
+    let path = socket_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-
-    #[zbus(name = "QuickAdd")]
-    async fn quick_add(
-        &self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        project_id: &str,
-        duration_ms: i64,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> zbus::fdo::Result<String> {
-        self.0.record_caller("QuickAdd", &header);
-        let out = self.0.quick_add_json(project_id, duration_ms);
-        if out.is_ok() {
-            let _ = Self::changed(&emitter).await;
+    let _ = std::fs::remove_file(&path);
+    let listener = Listener::bind(&path).expect("fake service must bind its socket");
+    std::thread::spawn(move || {
+        loop {
+            let Ok(stream) = listener.accept() else {
+                continue;
+            };
+            let fake = Arc::clone(&fake);
+            std::thread::spawn(move || handle_fake_conn(stream, fake));
         }
-        out
+    });
+}
+
+fn handle_fake_conn(mut stream: ConnStream, fake: Arc<FakeService>) {
+    let Ok(Some(Frame::Request(request))) = read_frame(&mut stream) else {
+        return;
+    };
+    if request == Request::SubscribeChanged {
+        let rx = fake.subscribe();
+        if write_frame(&mut stream, &Frame::Reply(Ok(Response::Subscribed))).is_err() {
+            return;
+        }
+        while rx.recv().is_ok() {
+            if write_frame(&mut stream, &Frame::Changed).is_err() {
+                return;
+            }
+        }
+        return;
     }
-
-    #[zbus(name = "UndoQuickAdd")]
-    async fn undo_quick_add(
-        &self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        entry_id: &str,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> zbus::fdo::Result<()> {
-        self.0.record_caller("UndoQuickAdd", &header);
-        let out = self.0.undo_quick_add_unit(entry_id);
-        if out.is_ok() {
-            let _ = Self::changed(&emitter).await;
-        }
-        out
-    }
-
-    #[zbus(name = "DeleteEntry")]
-    async fn delete_entry(
-        &self,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
-        entry_id: &str,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-    ) -> zbus::fdo::Result<()> {
-        self.0.record_caller("DeleteEntry", &header);
-        let out = self.0.delete_entry_unit(entry_id);
-        if out.is_ok() {
-            let _ = Self::changed(&emitter).await;
-        }
-        out
+    let (name, reply): (&str, Result<Response, ServiceError>) = match &request {
+        Request::ApiVersion => ("ApiVersion", Ok(Response::ApiVersion(SOCKET_API_VERSION))),
+        Request::Snapshot => (
+            "Snapshot",
+            Ok(Response::Snapshot(Box::new(fake.snapshot()))),
+        ),
+        Request::QuickAdd {
+            project_id,
+            duration_ms,
+        } => (
+            "QuickAdd",
+            fake.quick_add(project_id, *duration_ms)
+                .map(|e| Response::Entry(Box::new(e))),
+        ),
+        Request::UndoQuickAdd { id } => (
+            "UndoQuickAdd",
+            fake.undo_quick_add(id).map(|()| Response::Unit),
+        ),
+        Request::DeleteEntry { id } => (
+            "DeleteEntry",
+            fake.delete_entry(id).map(|()| Response::Unit),
+        ),
+        other => (
+            "other",
+            Err(ServiceError::Other(format!(
+                "the fake service does not speak {other:?}"
+            ))),
+        ),
+    };
+    fake.record(name);
+    let mutated = reply.is_ok() && !matches!(name, "ApiVersion" | "Snapshot");
+    let _ = write_frame(&mut stream, &Frame::Reply(reply));
+    if mutated {
+        fake.notify_changed();
     }
 }
 
@@ -289,18 +276,13 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         let dir =
             std::env::temp_dir().join(format!("timetrack-tray-quickadd-{}", std::process::id()));
         let address = common::start_private_bus(&dir);
-        common::point_at_private_bus(&address);
+        common::point_at_private_bus(&address, &dir);
 
         let (conn, items) = common::serve_watcher(&address).await;
 
         let store_path = dir.join("store.json");
         let fake = Arc::new(FakeService::new(store_path.clone()));
-        let _service_conn = zbus::connection::Builder::address(address.as_str())
-            .name(BUS_NAME)
-            .serve_at(OBJECT_PATH, FakeIface(fake.clone()))
-            .build()
-            .await
-            .expect("could not serve the fake service");
+        serve_fake(Arc::clone(&fake));
 
         let tray_log = std::fs::File::create(dir.join("tray.log")).unwrap();
         let _tray = ChildGuard(
@@ -360,23 +342,14 @@ fn tray_menu_quick_add_undo_and_delete_round_trip() {
         }
         assert!(store_path.exists(), "the store file must have been written");
 
-        // #50: the click reached the service over the connection the tray
-        // already had -- the same bus connection its poll loop uses, not a
-        // fresh one per click. The test's own client also polls the
-        // service, so the quick-add caller must be one of the callers the
-        // snapshots came from.
-        let quick_add_callers = fake.callers("QuickAdd");
+        // The click reached this fake exactly once as a QuickAdd, over
+        // the socket (one connection per call is the transport's shape
+        // now, so connection identity -- the old bus-era #50 assertion
+        // -- is replaced by the call count itself).
         assert_eq!(
-            quick_add_callers.len(),
+            fake.calls("QuickAdd"),
             1,
-            "one click must travel over one connection, not a new one each time: \
-             {quick_add_callers:?}"
-        );
-        let snapshot_callers = fake.callers("Snapshot");
-        assert!(
-            quick_add_callers.is_subset(&snapshot_callers),
-            "the click must reuse the tray's connection \
-             (quick-add from {quick_add_callers:?}, snapshots from {snapshot_callers:?})"
+            "one click must make exactly one quick-add call"
         );
 
         // Tray-6 (#10): the submenu now offers an enabled undo row (the

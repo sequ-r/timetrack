@@ -305,9 +305,32 @@ pub fn escape_field(s: &str) -> String {
 /// first, local wall-clock stamps without offset, readable duration plus
 /// minutes, source column, minimal quoting.
 pub fn export_csv_at(store: &Store, scope: ExportScope, anchor_ms: i64, tz: &Tz) -> String {
+    render_rows(store, entries_in_scope_at(store, scope, anchor_ms, tz), tz)
+}
+
+/// Render the store between two *local days*, inclusive at both ends,
+/// oldest first — the custom-range export (#133). Each entry buckets
+/// by its `started_at` local day, exactly as the scoped exports do
+/// (ADR 0002), so an overnight entry appears once, in its start day.
+/// `from_ms`/`to_ms` are instants anywhere inside the first/last day.
+pub fn export_csv_between(store: &Store, from_ms: i64, to_ms: i64, tz: &Tz) -> String {
+    let (from_day, to_day) = (tz.day_of(from_ms), tz.day_of(to_ms));
+    let mut entries: Vec<&crate::Entry> = store
+        .entries
+        .iter()
+        .filter(|e| {
+            let d = tz.day_of(e.started_at);
+            d >= from_day && d <= to_day
+        })
+        .collect();
+    entries.sort_by_key(|e| e.started_at);
+    render_rows(store, entries, tz)
+}
+
+fn render_rows(store: &Store, entries: Vec<&crate::Entry>, tz: &Tz) -> String {
     let mut out = String::from(CSV_HEADER);
     out.push('\n');
-    for e in entries_in_scope_at(store, scope, anchor_ms, tz) {
+    for e in entries {
         let project = store
             .project(&e.project_id)
             .map(|p| p.name.as_str())
@@ -315,6 +338,7 @@ pub fn export_csv_at(store: &Store, scope: ExportScope, anchor_ms: i64, tz: &Tz)
         let source = match e.source {
             crate::EntrySource::Manual => "manual",
             crate::EntrySource::QuickAdd => "quick_add",
+            crate::EntrySource::External => "external",
         };
         let minutes = (e.duration_ms() / 60_000).to_string();
         let note = e.note.as_deref().unwrap_or("");
@@ -342,6 +366,167 @@ pub fn export_csv_at(store: &Store, scope: ExportScope, anchor_ms: i64, tz: &Tz)
 /// explicit anchor.
 pub fn export_csv(store: &Store, scope: ExportScope, now_ms: i64, tz: &Tz) -> String {
     export_csv_at(store, scope, now_ms, tz)
+}
+
+/// One row of a parsed TimeTrack export (#132): everything needed to
+/// recreate the entry under a fresh id, with the project still named
+/// (projects are matched by name at import time, never by the file's
+/// old ids).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedEntry {
+    pub project: String,
+    pub description: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub source: crate::EntrySource,
+    pub note: Option<String>,
+}
+
+/// Why an export file could not be parsed back.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ImportError {
+    #[error("not a TimeTrack export: header must be exactly `{CSV_HEADER}`")]
+    BadHeader,
+    #[error("row {line}: {reason}")]
+    Row { line: usize, reason: String },
+}
+
+/// Parse a TimeTrack CSV export back into entries (#132).
+///
+/// Deliberately only our own format: the header must match byte for
+/// byte, foreign CSVs are a §12 non-goal. Local timestamps resolve in
+/// `tz` through the shared parsers (ADR 0009), and a formula-neutralized
+/// leading `'` (see [`neutralize_formula`]) is removed so a re-import
+/// recreates the original text. Idempotency is the caller's job (it
+/// owns the snapshot to dedupe against); this only reads the file.
+pub fn parse_export_csv(text: &str, tz: &Tz) -> Result<Vec<ImportedEntry>, ImportError> {
+    let records = parse_csv_records(text);
+    let Some((header, _)) = records.first() else {
+        return Err(ImportError::BadHeader);
+    };
+    if header.join(",") != CSV_HEADER {
+        return Err(ImportError::BadHeader);
+    }
+    let mut out = Vec::new();
+    for (fields, line) in &records[1..] {
+        if fields.len() == 1 && fields[0].is_empty() {
+            continue; // a trailing blank line is not a row
+        }
+        let row = |reason: String| ImportError::Row {
+            line: *line,
+            reason,
+        };
+        if fields.len() != 9 {
+            return Err(row(format!("expected 9 fields, got {}", fields.len())));
+        }
+        let started_at = parse_local_iso8601(&fields[3], tz)
+            .map_err(|r| row(format!("started_at '{}': {r}", fields[3])))?;
+        let ended_at = parse_local_iso8601(&fields[4], tz)
+            .map_err(|r| row(format!("ended_at '{}': {r}", fields[4])))?;
+        let source = match fields[7].as_str() {
+            "manual" => crate::EntrySource::Manual,
+            "quick_add" => crate::EntrySource::QuickAdd,
+            "external" => crate::EntrySource::External,
+            other => return Err(row(format!("unknown source '{other}'"))),
+        };
+        out.push(ImportedEntry {
+            project: unneutralize_formula(&fields[1]),
+            description: unneutralize_formula(&fields[2]),
+            started_at,
+            ended_at,
+            source,
+            note: (!fields[8].is_empty()).then(|| unneutralize_formula(&fields[8])),
+        });
+    }
+    Ok(out)
+}
+
+/// `2026-09-29T14:00:00` in `tz` back to an instant, via the shared
+/// day and moment parsers so DST wall clocks resolve exactly as typed
+/// input does (ADR 0009).
+fn parse_local_iso8601(text: &str, tz: &Tz) -> Result<i64, String> {
+    let (day, time) = text
+        .split_once('T')
+        .ok_or_else(|| "expected YYYY-MM-DDTHH:MM:SS".to_string())?;
+    let mut parts = time.split(':');
+    let (Some(hh), Some(mm), Some(ss)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("expected HH:MM:SS".to_string());
+    };
+    let secs: i64 = ss
+        .parse()
+        .map_err(|_| format!("seconds '{ss}' is not a number"))?;
+    if !(0..60).contains(&secs) {
+        return Err(format!("seconds '{ss}' out of range"));
+    }
+    let midday = crate::parse_anchor_day(day, "timestamp day", tz).map_err(|e| e.to_string())?;
+    let at = crate::parse_moment(&format!("{hh}:{mm}"), "timestamp time", midday, tz)
+        .map_err(|e| e.to_string())?;
+    Ok(at + secs * 1_000)
+}
+
+/// The inverse of [`neutralize_formula`]: one leading `'` before a
+/// formula character was ours; anything else is the user's text.
+fn unneutralize_formula(s: &str) -> String {
+    match s.strip_prefix('\'') {
+        Some(rest)
+            if rest
+                .trim_start_matches([' ', '\t', '\r'])
+                .starts_with(['=', '+', '-', '@']) =>
+        {
+            rest.to_string()
+        }
+        _ => s.to_string(),
+    }
+}
+
+/// Split CSV text into records of fields, each with its 1-based
+/// starting line. RFC 4180 quoting: a quoted field may hold commas,
+/// doubled quotes, and newlines.
+fn parse_csv_records(text: &str) -> Vec<(Vec<String>, usize)> {
+    let mut records = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut chars = text.chars().peekable();
+    let mut in_quotes = false;
+    let mut line = 1usize;
+    let mut record_line = 1usize;
+    let mut dirty = false; // anything seen for the current record
+    while let Some(c) = chars.next() {
+        dirty = true;
+        if in_quotes {
+            match c {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                '"' => in_quotes = false,
+                '\n' => {
+                    line += 1;
+                    field.push(c);
+                }
+                _ => field.push(c),
+            }
+            continue;
+        }
+        match c {
+            '"' if field.is_empty() => in_quotes = true,
+            ',' => fields.push(std::mem::take(&mut field)),
+            '\r' => {}
+            '\n' => {
+                fields.push(std::mem::take(&mut field));
+                records.push((std::mem::take(&mut fields), record_line));
+                line += 1;
+                record_line = line;
+                dirty = false;
+            }
+            _ => field.push(c),
+        }
+    }
+    if dirty || !field.is_empty() || !fields.is_empty() {
+        fields.push(field);
+        records.push((fields, record_line));
+    }
+    records
 }
 
 #[cfg(test)]
@@ -847,5 +1032,64 @@ mod tests {
         assert_eq!(lines.len(), 3, "header plus one row per entry:\n{csv}");
         assert!(lines[1].contains("e_early"), "oldest first, got:\n{csv}");
         assert!(lines[2].contains("e_late"), "got:\n{csv}");
+    }
+
+    #[test]
+    fn a_custom_range_keeps_its_boundary_days_by_start() {
+        // #133: 5 Oct 10:00 -> 12:00 and an overnight 22:00 -> next-day
+        // 02:00, from anchored_store's shape: the range 5th..5th keeps
+        // both (started-at wins, ADR 0002), 6th..6th keeps neither.
+        let s = anchored_store(&[
+            ("e_day", 1_791_194_400_000, 1_791_201_600_000),
+            ("e_night", 1_791_237_600_000, 1_791_252_000_000),
+        ]);
+        let fifth = 1_791_194_400_000;
+        let csv = export_csv_between(&s, fifth, fifth, &utc());
+        assert!(csv.contains("e_day"), "{csv}");
+        assert!(
+            csv.contains("e_night"),
+            "overnight counts on its start day: {csv}"
+        );
+        let sixth = fifth + 86_400_000;
+        let csv = export_csv_between(&s, sixth, sixth, &utc());
+        assert_eq!(csv.lines().count(), 1, "header only: {csv}");
+    }
+
+    #[test]
+    fn an_export_parses_back_to_the_same_entries() {
+        // #132: our own CSV is the one import format. The round trip
+        // must preserve project name, description (commas and quotes
+        // included), instants, source, and note -- and un-neutralize a
+        // formula-looking project name.
+        let s = anchored_store(&[("e1", 1_791_194_400_000, 1_791_201_600_000)]);
+        let csv = export_csv_at(&s, ExportScope::All, 0, &utc());
+        let parsed = parse_export_csv(&csv, &utc()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].started_at, 1_791_194_400_000);
+        assert_eq!(parsed[0].ended_at, 1_791_201_600_000);
+        assert_eq!(parsed[0].source, EntrySource::Manual);
+
+        let header = CSV_HEADER;
+        let tricky = format!(
+            "{header}\n\
+             e9,\"=SUM(A1:A2)\",\"said \"\"hi, there\"\"\",2026-10-05T10:00:00,2026-10-05T12:00:00,02:00:00,120,quick_add,a note\n"
+        );
+        let parsed = parse_export_csv(&tricky, &utc()).unwrap();
+        assert_eq!(parsed[0].project, "=SUM(A1:A2)");
+        assert_eq!(parsed[0].description, "said \"hi, there\"");
+        assert_eq!(parsed[0].source, EntrySource::QuickAdd);
+        assert_eq!(parsed[0].note.as_deref(), Some("a note"));
+    }
+
+    #[test]
+    fn import_refuses_a_foreign_header_and_bad_rows() {
+        let err = parse_export_csv("a,b,c\n1,2,3\n", &utc()).unwrap_err();
+        assert!(err.to_string().contains("header"), "{err}");
+        let bad_row = format!(
+            "{CSV_HEADER}\ne1,Work,x,not-a-time,2026-10-05T12:00:00,02:00:00,120,manual,\n"
+        );
+        let err = parse_export_csv(&bad_row, &utc()).unwrap_err();
+        assert!(err.to_string().contains("row 2"), "{err}");
+        assert!(err.to_string().contains("not-a-time"), "{err}");
     }
 }

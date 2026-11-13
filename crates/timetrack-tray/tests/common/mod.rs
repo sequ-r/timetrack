@@ -91,11 +91,19 @@ pub fn start_private_bus(dir: &std::path::Path) -> String {
 
 /// Point this process (and, by inheritance, spawned children) at the private
 /// bus. See the module docs for why this is safe here.
-pub fn point_at_private_bus(address: &str) {
+///
+/// Since §16 the proto `Client` probes the service *socket* before the
+/// bus, so the socket must be pointed into the rig too — otherwise a
+/// developer's real running service would answer these tests (and be
+/// mutated by them). Inside `dir` it names the rig service's socket in
+/// the real-service test and a never-created file against the
+/// bus-only fake, where the probe misses and the bus answers.
+pub fn point_at_private_bus(address: &str, dir: &std::path::Path) {
     // The proto `Client` connects to the session bus, so both the test
     // process and the tray/service children must see the private one.
     unsafe {
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address);
+        std::env::set_var("TIMETRACK_SOCKET", dir.join("tt.sock"));
     }
 }
 

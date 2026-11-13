@@ -21,6 +21,8 @@ pub enum EntrySource {
     Manual,
     /// A single tap on one of the Home tab's quick-add buttons.
     QuickAdd,
+    /// Confirmed from a fetched external event or task (§19).
+    External,
 }
 
 /// A single tracked interval.

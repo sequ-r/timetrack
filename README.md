@@ -32,23 +32,24 @@ See [Running](#running) for the terminal and tray modes, and
 
 ```
   timetrack-gui (AppImage)          timetrack (CLI, in the AppImage)        timetrack-tray (in the AppImage)
-  gpui 0.2.2, 3 tabs               ratatui TUI + one-shot commands     SNI item: week-total tooltip,
+  gpui 0.2.2, 3 tabs               one-shot commands only (§18)      SNI item: week-total tooltip,
                                                                             per-project quick-add/undo/delete
         |                                  |                                   |
-        +--- D-Bus: org.sequ.timetrack.Entries2 (typed) --+
+        +--- local socket (typed contract, §16) --+
                            |
-              timetrack-service  (started by the AppImage)
+              timetrack-service  (started by the AppImage, or auto-spawned by a client)
               owns the store; does all aggregation
                            |
-                  ~/.local/share/timetrack/store.json
+                  ~/.local/share/timetrack/store.db (SQLite)
 ```
 
 | Crate | Role |
 |---|---|
-| `timetrack-core` | Model, rules, aggregation, atomic checkpoint-plus-journal JSON storage. No GUI, IPC, async, **or clock**. |
-| `timetrack-proto` | The D-Bus contract and a client. All front ends depend on this. |
-| `timetrack-service` | D-Bus server. Owns the store, resolves the clock and timezone, persists on every change. |
-| `timetrack-cli` | Terminal client: a ratatui TUI plus one-shot subcommands. |
+| `timetrack-core` | Model, rules, aggregation (and the legacy JSON reader the one-time import uses). No GUI, IPC, async, **or clock**. |
+| `timetrack-store` | Embedded SQLite persistence (§17/ADR 0014): schema migrations, the JSON auto-import, sync metadata/tombstones. Only the service depends on it. |
+| `timetrack-proto` | The wire contract and a client: the local-socket transport (§16). All front ends depend on this. |
+| `timetrack-service` | Socket server. Owns the store, resolves the clock and timezone, persists on every change. |
+| `timetrack-cli` | Terminal client: one-shot subcommands only (the TUI was removed in the v2 rework). |
 | `timetrack-gui` | Desktop client, built on gpui (upstream, from crates.io). Ships as the AppImage. |
 | `timetrack-tray` | Host-only tray item (StatusNotifierItem): service presence, week total, per-project menu. |
 | `timetrack-update` | AppImage self-update check against GitHub releases; used by the GUI. |
@@ -173,27 +174,29 @@ the name it was called by and runs the CLI instead of the GUI:
 
 ```sh
 ln -s /path/to/TimeTrack-x86_64.AppImage ~/.local/bin/timetrack
-timetrack                            # TUI
-timetrack quick -m 15                # or a one-shot command
-timetrack status
+timetrack                            # status: this week's total first
+timetrack quick -m 15                # a one-shot command
+timetrack status --json              # the same totals, for scripts
 ```
 
 Uninstall is deleting the AppImage file (and the symlink, if you made
 one): the image writes nothing to the host — no desktop copy, no D-Bus
 activation file, no systemd unit — so there is nothing left that can
 dangle. Your tracked time lives outside the image at
-`~/.local/share/timetrack/store.json` and is untouched by this. Changes
-land first in a small append-only sibling, `store.json.journal`, and are
-folded into `store.json` periodically: back up (or move) **both** files
-together, since the newest changes may live only in the journal.
+`~/.local/share/timetrack/store.db` (SQLite, §17) and is untouched by
+this. To back up or move it, stop the service first and copy `store.db`
+plus its `store.db-wal` sibling together. Upgrading from the JSON era
+needs nothing: the first start imports `store.json` (plus its journal)
+into the database and leaves both files untouched as your backup.
 
 Host `cargo build` binaries are a development fallback only (see
 "Building" above): they need a service on the bus exactly like the tests
 do, and they never take part in an install.
 
-The TUI: `1`-`4` quick-add, `a` 30 minutes, `u` undo, `d` delete, `j`/`k` move,
-`h`/`l` change project, `q` quit. Projects are created from the command line
-(`timetrack project "Work"`), since the TUI has no text field yet.
+The CLI is one-shot only (§18): `timetrack quick -m 15` between other
+terminal work, `timetrack status` for the glance, `timetrack project
+"Work"` to create a project. There is no TUI any more — interactive
+editing is the GUI's job.
 
 The tray lists one submenu per unarchived project with its week total:
 `+5m`…`+60m` quick-add rows, an `Undo quick-add` row (enabled only while this
@@ -268,21 +271,17 @@ tray on GNOME:
 ### The service needs no install
 
 The AppImage bundles the service and starts it in the background when the
-app launches, so the session bus always finds one. There is no D-Bus
-activation file and no systemd unit to install — and after deleting the
-image there is none left behind to go stale, either.
+app launches; a client that finds nothing on the service socket spawns
+the bundled service itself. There is no systemd unit and no activation
+file to install — and after deleting the image there is none left
+behind to go stale, either.
 
-**After upgrading, relaunch the image.** The interface was renamed from
-`org.sequ.timetrack.Timer` to `org.sequ.timetrack.Entries` when the timer was
-cut. A stale service binary keeps answering to the old name and the GUI reports
-`UnknownInterface`. It now says so explicitly rather than claiming the service is
-merely absent, because the two need different fixes:
-
-> The GUI and the service are different versions. Reinstall whichever one is
-> older so both speak `org.sequ.timetrack.Entries`.
-
-With one artifact carrying both, that means: quit the old image (and its
-leftover service, which exits with the session) and launch the new one.
+**After upgrading, relaunch the image.** The service speaks one socket
+protocol now (the D-Bus interfaces it used to dual-serve are retired,
+ADR 0017), so quit the old image — and its leftover service, which
+exits with the session — and launch the new one. A stale pre-socket
+service simply never answers on the socket and the clients report it
+as not running.
 
 ### Timezone
 
@@ -344,23 +343,15 @@ The asymmetry is deliberate: `shorten` can never delete anything, and `undo`
 **refuses** an entry it did not create, so it cannot lose hand-entered time by
 accident.
 
-### The TUI
+### No TUI
 
-Running `timetrack` with no subcommand opens the TUI. Beyond quick-add
-(`1`-`4`), a 30-minute entry (`a`), undo (`u`) and delete (`d` twice):
-
-- `e` records a hand-entered entry for the selected project — start and
-  end in the same `-90` / `09:30` spellings as the one-shot commands
-  (empty end means now), plus a description.
-- `p` creates a project and selects it, so a fresh store is usable
-  without leaving the TUI.
-- `7` / `8` export the week or month containing a day you type
-  (prefilled with today), and `9` exports everything; each writes the
-  same `timetrack-export-….csv` file name the GUI uses, in the
-  directory the TUI was started from.
-
-`Tab`/`Enter` move through a form's fields and `Esc` cancels it; while a
-form is open its keys are text, not commands.
+Running `timetrack` with no subcommand prints the status and exits:
+this week's total first, then the month and all-time totals. The
+full-screen TUI was removed in the v2 rework (§18, ADR 0016) — the
+terminal client is for one-shot commands between other work, and every
+former TUI action is a subcommand above (`add`, `quick`, `undo`,
+`project`, `export`, …). `status --json` and `list --json` print the
+same data as JSON for scripts and status bars.
 
 ## AppImage
 
@@ -370,8 +361,8 @@ appimagetool (fetched on demand). It needs no install and no service
 setup: its AppRun starts the bundled service and tray in the background,
 then the GUI — or the CLI, when the image is invoked as `timetrack` (a
 symlink) or with `cli` as the first argument. If a service (or the tray)
-is already running (a second copy of the AppImage), the extra copy fails
-to own its bus name and exits, and the client talks to whichever holds it.
+is already running (a second copy of the AppImage), the extra copy finds
+the socket (or its tray name) owned and exits; clients talk to the owner.
 
 ```sh
 ./build-appimage.sh            # produces TimeTrack-<arch>.AppImage
@@ -429,10 +420,11 @@ icon). See "Quick-add without a tray (stock GNOME)" above.
 
 **A corrupt or newer store is refused, not repaired.** The service will
 not start rather than start empty, because starting empty would look like
-your tracked time had vanished. The files are at
-`~/.local/share/timetrack/store.json` plus its `store.json.journal`
-sibling; move both aside to start fresh. A file written by a newer
-TimeTrack is refused the same way, and says so.
+your tracked time had vanished. The store is
+`~/.local/share/timetrack/store.db` (with its `-wal` sibling while the
+service runs); move it aside to start fresh. A database written by a
+newer TimeTrack is refused the same way, and says so. A pre-SQLite
+`store.json` found beside it is only ever read by the one-time import.
 
 **A store from the stopwatch era cannot be migrated.** That format has no
 projects, so there is nothing to migrate it onto. The service says so
