@@ -23,16 +23,27 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use timetrack_proto::{Client, EntrySource};
 
-/// A workspace binary built for the same profile as this test: the test
-/// executable lives in `<profile>/deps/`, so its grandparent is `<profile>/`,
-/// next to every built binary.
+/// A workspace binary built for the same profile as this test.
+///
+/// Cargo does not promise one fixed path for test executables: older layouts
+/// put them under `<profile>/deps/`, while newer CI layouts put them under
+/// `<profile>/build/<package>-<hash>/out/`. Walk up from this executable and
+/// use the first ancestor that actually contains the requested built binary.
 fn workspace_bin(name: &str) -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("test executable path must be known");
-    let profile = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("test executable must live in <profile>/deps");
-    profile.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+
+    for ancestor in exe.ancestors().skip(1) {
+        let candidate = ancestor.join(&file_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    // Preserve a useful path in the assertion if the service was not built.
+    exe.parent()
+        .expect("test executable must have a parent directory")
+        .join(file_name)
 }
 
 /// Wait until the real service answers snapshots on the private bus.
