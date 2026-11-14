@@ -143,6 +143,10 @@ XML
 DBUS_SESSION_BUS_ADDRESS=$(dbus-daemon --config-file="$BUS_CONF" --print-address --fork) ||
   { echo "could not start a private bus"; exit 2; }
 export DBUS_SESSION_BUS_ADDRESS
+# §16 hermeticity (mirrors e2e.sh): clients probe the service socket before
+# the bus, so point it into the rig -- the rig service binds it, and the
+# GUI/CLI can never reach (or be refused by) a real running service.
+export TIMETRACK_SOCKET="$WORK/tt.sock"
 
 TZ=UTC "$SVC" "$STORE" >"$WORK/svc.log" 2>&1 &
 SVC_PID=$!

@@ -15,7 +15,7 @@ thiserror = { workspace = true }
 # dedicated std::thread (like the export save), never from a gpui future -- and
 # rustls, never tokio: this workspace has deliberately no tokio anywhere (see
 # the workspace manifest for why it is load-bearing absent).
-ureq = "3"
+ureq = { workspace = true }
 # Verify downloads against the release's SHA256SUMS before they may replace
 # the running image. 0.10, not the also-locked 0.11: 0.10.9 is already in the
 # tree under two dependents, 0.11.0 under one, and the API used here is the

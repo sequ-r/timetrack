@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use super::super::TimetrackView;
-use super::super::{service::Action, theme};
+use super::super::{display_tz, service::Action, theme};
 use gpui::prelude::*;
 use gpui::{Animation, AnimationExt as _, ElementId, IntoElement, div, ease_out_quint, px, rgba};
 use timetrack_core::QUICK_ADD_MS;
@@ -113,6 +113,7 @@ impl TimetrackView {
             .child(hero)
             .child(warning)
             .child(self.render_quick_add())
+            .child(self.render_suggestions())
             .child(self.render_week_by_project())
             .child(self.render_entries())
             .into_any_element()
@@ -169,6 +170,133 @@ impl TimetrackView {
                 .text_color(rgba(theme::ROW_TEXT))
                 .child(format!("→ {project_name}")),
         )
+    }
+
+    /// Pending external suggestions (§19): fetched calendar items the
+    /// user has not decided yet. Hidden entirely when there are none,
+    /// so a service without sources leaves Home exactly as it was.
+    /// Confirm lands on the source's mapped project (service-side),
+    /// dismiss is permanent across refreshes.
+    fn render_suggestions(&self) -> impl IntoElement {
+        if self.suggestions.is_empty() {
+            return div().into_any_element();
+        }
+        let tz = display_tz(&self.snapshot);
+        let mut list = div().flex().flex_col();
+        for (i, s) in self.suggestions.iter().enumerate() {
+            let add_id = s.id.clone();
+            let skip_id = s.id.clone();
+            // gpui: `self` here is the `Render` receiver (the view),
+            // and `self.entity` is view state (see app.rs::render).
+            let entity_add = self.entity.clone();
+            let entity_skip = self.entity.clone();
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(150.))
+                            .text_sm()
+                            .text_color(rgba(theme::ROW_TEXT))
+                            .child(timetrack_core::format_local_iso8601(s.started_at, &tz)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(90.))
+                            .text_color(rgba(theme::ACCENT))
+                            .child(timetrack_core::format_duration(s.ended_at - s.started_at)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_color(rgba(theme::BODY_TEXT))
+                            .child(timetrack_core::sanitize_display(&s.title)),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::from(("suggest-add", i as u64)))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgba(theme::ACTION))
+                            .text_color(rgba(theme::SELECTED_TEXT))
+                            .cursor_pointer()
+                            .child("add")
+                            .on_click(move |_ev, _window, cx| {
+                                if let Some(entity) = entity_add.clone() {
+                                    let id = add_id.clone();
+                                    entity.update(cx, |view, cx| {
+                                        view.send(Action::ConfirmSuggestion(id));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::from(("suggest-skip", i as u64)))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::BODY_TEXT))
+                            .cursor_pointer()
+                            .child("skip")
+                            .on_click(move |_ev, _window, cx| {
+                                if let Some(entity) = entity_skip.clone() {
+                                    let id = skip_id.clone();
+                                    entity.update(cx, |view, cx| {
+                                        view.send(Action::DismissSuggestion(id));
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    ),
+            );
+        }
+        let entity = self.entity.clone();
+        div()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_6()
+                    .pt_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgba(theme::MUTED_TEXT))
+                            .child("FROM YOUR CALENDARS"),
+                    )
+                    .child(
+                        div()
+                            .id("suggestions-refresh")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_sm()
+                            .text_color(rgba(theme::ACCENT))
+                            .cursor_pointer()
+                            .child("refresh")
+                            .on_click(move |_ev, _window, cx| {
+                                if let Some(entity) = entity.clone() {
+                                    entity.update(cx, |view, cx| {
+                                        view.send(Action::RefreshSources);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    ),
+            )
+            .child(div().px_6().child(list))
+            .into_any_element()
     }
 
     /// This week's time per project, longest first.

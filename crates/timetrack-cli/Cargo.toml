@@ -5,11 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TimeTrack terminal client: a ratatui TUI plus one-shot commands"
-
-[lib]
-name = "timetrack_cli"
-path = "src/lib.rs"
+description = "TimeTrack terminal client: one-shot commands only (no TUI, REQUIREMENTS §18)"
 
 [[bin]]
 name = "timetrack"
@@ -18,9 +14,7 @@ path = "src/main.rs"
 [dependencies]
 timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
-zbus = { workspace = true }
+serde_json = { workspace = true }
 async-io = { workspace = true }
-ratatui = { workspace = true }
-crossterm = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }

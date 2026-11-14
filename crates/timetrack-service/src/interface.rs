@@ -9,9 +9,9 @@
 //!
 //! All state lives behind a single `Mutex<Inner>`, and every mutating method
 //! persists before it returns. That ordering matters: a client that is told
-//! "added" must be able to rely on the entry surviving a crash. Since #103
-//! the persisted form is a synced journal append of the mutation's diff
-//! (with periodic checkpoints), not a rewrite of the whole store.
+//! "added" must be able to rely on the entry surviving a crash. Since §17
+//! the persisted form is one SQLite transaction holding the mutation's diff
+//! (`timetrack-store`), not a rewrite of the whole store.
 //!
 //! # This layer holds no rules
 //!
@@ -39,10 +39,11 @@ fn lock(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 }
 
 use timetrack_core as core;
-use timetrack_core::{Counter, EntrySource, JsonStore, RuleError, Store};
+use timetrack_core::{Counter, EntrySource, RuleError, Store};
 use timetrack_proto::{
     self as protocol, EntryView, ProjectView, ServiceError, Snapshot, TotalsView,
 };
+use timetrack_store::SqliteStore;
 
 /// The current time, in milliseconds since the Unix epoch.
 fn now_ms() -> i64 {
@@ -55,7 +56,7 @@ fn now_ms() -> i64 {
 }
 
 struct Inner {
-    store: JsonStore,
+    store: SqliteStore,
     data: Store,
     ids: Counter,
     /// The local zone (#102): resolved strictly at startup from `TZ` (or
@@ -105,10 +106,16 @@ fn refresh_tz(inner: &mut Inner) {
 /// Serialise access to the store.
 pub struct EntryService {
     inner: Mutex<Inner>,
+    /// `Changed` subscribers on the socket transport (§16). The D-Bus
+    /// signal is emitted by the interface wrappers in `main.rs`; socket
+    /// subscribers are notified here, in the mutation funnel, so a
+    /// mutation arriving over *either* transport wakes subscribers on
+    /// both. Dead receivers are dropped on the next notify.
+    changed: Mutex<Vec<std::sync::mpsc::Sender<()>>>,
 }
 
 impl EntryService {
-    pub fn new(store: JsonStore) -> anyhow::Result<Self> {
+    pub fn new(store: SqliteStore) -> anyhow::Result<Self> {
         // Strict (#102): an unusable `TZ` or system zone stops the service
         // here with an actionable message, instead of silently running in
         // UTC and bucketing every typed local time into the wrong day.
@@ -122,11 +129,11 @@ impl EntryService {
     /// process-global `TZ`, and pinning turns the live refresh off so the
     /// test's zone can never be replaced under it.
     #[cfg(test)]
-    pub fn new_with_tz(store: JsonStore, tz: core::Tz) -> anyhow::Result<Self> {
+    pub fn new_with_tz(store: SqliteStore, tz: core::Tz) -> anyhow::Result<Self> {
         Self::new_inner(store, tz, false)
     }
 
-    fn new_inner(store: JsonStore, tz: core::Tz, tz_live: bool) -> anyhow::Result<Self> {
+    fn new_inner(store: SqliteStore, tz: core::Tz, tz_live: bool) -> anyhow::Result<Self> {
         let mut data = store.load()?;
         // A brand-new store has no projects, and with no project there is
         // nothing to attribute time to -- which made the Home tab's quick-add
@@ -152,6 +159,7 @@ impl EntryService {
                 tz_live,
                 tz_refresh_error: None,
             }),
+            changed: Mutex::new(Vec::new()),
         };
         // Persist the seed immediately, so a read-only store surfaces at
         // startup rather than on the user's first tap -- but only when there
@@ -163,11 +171,32 @@ impl EntryService {
         Ok(service)
     }
 
+    /// Subscribe to persisted mutations (the socket transport's
+    /// `Changed`, §16). Each successful mutation sends one `()` here;
+    /// coalescing by the reader is fine, as on the bus.
+    pub fn subscribe_changed(&self) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tx);
+        rx
+    }
+
+    fn notify_changed(&self) {
+        self.changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|tx| tx.send(()).is_ok());
+    }
+
     /// Write the current state out. Used by the mutation funnel and by
     /// startup, so both go through the same path.
     fn persist(&self) -> anyhow::Result<()> {
         let g = lock(&self.inner);
-        g.store.save(&g.data).map_err(anyhow::Error::from)
+        g.store
+            .save_all(&g.data, now_ms())
+            .map_err(anyhow::Error::from)
     }
 
     /// A consistent view of everything a client needs for one frame.
@@ -227,46 +256,28 @@ impl EntryService {
             data, ids, store, ..
         } = &mut *g;
         // Mutate a working copy and swap it in only once it is on disk, so
-        // a failed append (or a rule refusal after a partial mutation)
-        // leaves memory holding exactly what the files hold (#100). The
-        // copy is the one full-store clone a mutation pays for: mutating
-        // in place needed the same clone kept aside for the rollback, and
-        // the working copy doubles as the "after" side of the journal
-        // diff (#103).
+        // a failed persist (or a rule refusal after a partial mutation)
+        // leaves memory holding exactly what the database holds (#100).
+        // The copy is the one full-store clone a mutation pays for:
+        // mutating in place needed the same clone kept aside for the
+        // rollback, and the working copy doubles as the "after" side of
+        // the diff the store applies.
         let mut next_data = data.clone();
         let mut next_ids = ids.clone();
         match f(&mut next_data, &mut next_ids, now) {
             Ok(value) => {
                 // Persist before acknowledging -- and before the new
-                // state becomes visible to snapshots. Since #103 the
-                // persisted form is one journal line holding this
-                // mutation's diff, synced by `append`, so a tap no longer
-                // rewrites (or re-syncs) the whole history.
+                // state becomes visible to snapshots. The persisted form
+                // is one SQLite transaction holding this mutation's diff
+                // (§17), so a tap stays proportional to the change.
                 let record = core::Journal::between(data, &next_data);
-                // A journal with no checkpoint under it cannot be
-                // replayed into the full store, so a checkpoint that has
-                // gone missing (deleted while the service ran) heals with
-                // a whole-store save instead of an append.
-                let persisted = if store.path().exists() {
-                    store.append(&record)
-                } else {
-                    store.save(&next_data)
-                };
-                if let Err(e) = persisted {
+                if let Err(e) = store.apply(&record, now) {
                     return Err(ServiceError::Storage(e.to_string()));
                 }
                 *data = next_data;
                 *ids = next_ids;
-                // Fold the journal into the checkpoint once it outgrows
-                // its budget. The mutation is already durable in the
-                // journal, so a checkpoint failure must not fail it (that
-                // would roll memory back from disk, the #100 divergence):
-                // note it and retry on the next mutation.
-                if store.journal_len() > core::JOURNAL_CHECKPOINT_BYTES
-                    && let Err(e) = store.save(data)
-                {
-                    eprintln!("timetrack-service: checkpoint failed, journal kept ({e})");
-                }
+                drop(g);
+                self.notify_changed();
                 Ok(value)
             }
             Err(rule) => Err(ServiceError::from(rule)),
@@ -456,6 +467,305 @@ impl EntryService {
     pub fn export_csv(&self, scope: &str) -> Result<String, ServiceError> {
         self.export_csv_at(scope, now_ms())
     }
+
+    /// CSV export between two local days, inclusive (#133). The days
+    /// are bucketed here with the service zone, as every scoped export.
+    pub fn export_csv_range(&self, from_ms: i64, to_ms: i64) -> Result<String, ServiceError> {
+        for instant in [from_ms, to_ms] {
+            if !core::instant_in_range(instant) {
+                return Err(ServiceError::from(RuleError::InstantOutOfRange(instant)));
+            }
+        }
+        let mut g = lock(&self.inner);
+        refresh_tz(&mut g);
+        if g.tz.day_of(from_ms) > g.tz.day_of(to_ms) {
+            return Err(ServiceError::Other(
+                "the range ends before it starts".into(),
+            ));
+        }
+        Ok(core::export_csv_between(&g.data, from_ms, to_ms, &g.tz))
+    }
+
+    // --- external sources (§19) ---
+    //
+    // Fetched read-only in the service, cached as suggestions in the
+    // store, and turned into entries only on confirm. Nothing here
+    // writes back to a source, ever.
+
+    pub fn add_source(
+        &self,
+        kind: &str,
+        locator: &str,
+        project_id: Option<&str>,
+        label: &str,
+    ) -> Result<protocol::SourceView, ServiceError> {
+        if kind != "ics_file" && kind != "ics_url" && kind != "caldav" {
+            return Err(ServiceError::Other(format!(
+                "unknown source kind '{kind}' (use ics_file, ics_url, or caldav)"
+            )));
+        }
+        if kind == "caldav" {
+            crate::caldav::split_userinfo(locator).map_err(ServiceError::Other)?;
+        }
+        if locator.trim().is_empty() {
+            return Err(ServiceError::Other(
+                "a source needs a file path or URL".into(),
+            ));
+        }
+        let g = lock(&self.inner);
+        if let Some(pid) = project_id
+            && g.data.project(pid).is_none()
+        {
+            return Err(ServiceError::from(RuleError::UnknownProject(
+                pid.to_string(),
+            )));
+        }
+        let label = if label.trim().is_empty() {
+            locator.rsplit('/').next().unwrap_or(locator)
+        } else {
+            label
+        };
+        let src = g
+            .store
+            .add_source(kind, locator, project_id, label, now_ms())
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        Ok(source_view(src))
+    }
+
+    pub fn sources(&self) -> Result<Vec<protocol::SourceView>, ServiceError> {
+        let g = lock(&self.inner);
+        Ok(g.store
+            .sources()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .into_iter()
+            .map(source_view)
+            .collect())
+    }
+
+    /// Fetch one source (or all), parse, and store new suggestions.
+    /// Fetching never creates entries and never writes back.
+    pub fn refresh_source(&self, id: Option<&str>) -> Result<protocol::RefreshView, ServiceError> {
+        let (tz, targets) = {
+            let mut g = lock(&self.inner);
+            refresh_tz(&mut g);
+            let all = g
+                .store
+                .sources()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let targets: Vec<_> = match id {
+                Some(want) => {
+                    let found: Vec<_> = all.into_iter().filter(|s| s.id == want).collect();
+                    if found.is_empty() {
+                        return Err(ServiceError::Other(format!(
+                            "no external source with id '{want}'"
+                        )));
+                    }
+                    found
+                }
+                None => all,
+            };
+            (g.tz.clone(), targets)
+        };
+        let mut total = protocol::RefreshView::default();
+        // Suggestions are actionable near-term: expand recurrences a
+        // month back (just-missed meetings still get logged) and a
+        // quarter ahead, nothing further in either direction.
+        let now = now_ms();
+        let (from_ms, until_ms) = (now - 31 * 86_400_000, now + 93 * 86_400_000);
+        for src in &targets {
+            for text in fetch_source_texts(src)? {
+                let parsed =
+                    core::parse_ics_in_window(&text, &tz, from_ms, until_ms).map_err(|_| {
+                        ServiceError::Other(format!("{} is not an iCalendar file", src.locator))
+                    })?;
+                total.fetched += parsed.items.len();
+                total.skipped += parsed.skipped;
+                let g = lock(&self.inner);
+                total.inserted += g
+                    .store
+                    .upsert_suggestions(&src.id, &parsed.items, now_ms())
+                    .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn suggestions(&self) -> Result<Vec<protocol::SuggestionView>, ServiceError> {
+        let g = lock(&self.inner);
+        Ok(g.store
+            .suggestions(true)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .into_iter()
+            .map(suggestion_view)
+            .collect())
+    }
+
+    /// Confirm a pending suggestion into a real `External` entry. The
+    /// suggestion is claimed first (pending -> confirmed), so a racing
+    /// second confirm refuses instead of double-creating.
+    pub fn confirm_suggestion(
+        &self,
+        id: &str,
+        project_id: Option<&str>,
+    ) -> Result<EntryView, ServiceError> {
+        let (suggestion, fallback_project) = {
+            let g = lock(&self.inner);
+            let suggestion = g
+                .store
+                .suggestion(id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .ok_or_else(|| ServiceError::Other(format!("no suggestion with id '{id}'")))?;
+            if suggestion.status != "pending" {
+                return Err(ServiceError::Other(format!(
+                    "suggestion '{id}' is already {}",
+                    suggestion.status
+                )));
+            }
+            let source_project = g
+                .store
+                .source(&suggestion.source_id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .and_then(|s| s.project_id);
+            let fallback = project_id
+                .map(str::to_string)
+                .or(source_project)
+                .or_else(|| {
+                    g.data
+                        .projects
+                        .iter()
+                        .find(|p| !p.archived)
+                        .map(|p| p.id.clone())
+                })
+                .ok_or_else(|| ServiceError::Other("no project to confirm into".into()))?;
+            (suggestion, fallback)
+        };
+        {
+            let g = lock(&self.inner);
+            let claimed = g
+                .store
+                .decide_suggestion(id, "confirmed", None, now_ms())
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            if !claimed {
+                return Err(ServiceError::Other(format!(
+                    "suggestion '{id}' is already decided"
+                )));
+            }
+        }
+        let entry = self.mutate(|s, ids, _| {
+            core::create_entry_from(
+                s,
+                ids,
+                &fallback_project,
+                &suggestion.title,
+                suggestion.started_at,
+                suggestion.ended_at,
+                EntrySource::External,
+            )
+        })?;
+        let view = protocol::entry_to_view(&entry);
+        let g = lock(&self.inner);
+        g.store
+            .link_suggestion_entry(id, &entry.id)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        Ok(view)
+    }
+
+    pub fn dismiss_suggestion(&self, id: &str) -> Result<(), ServiceError> {
+        let g = lock(&self.inner);
+        let decided = g
+            .store
+            .decide_suggestion(id, "dismissed", None, now_ms())
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        if decided {
+            Ok(())
+        } else {
+            Err(ServiceError::Other(format!(
+                "suggestion '{id}' is not pending"
+            )))
+        }
+    }
+
+    /// Set (or clear) an entry's free-form note (socket-only surface).
+    pub fn set_note(&self, id: &str, note: Option<&str>) -> Result<EntryView, ServiceError> {
+        let e = self.mutate(|s, _ids, _| core::set_text(s, id, None, Some(note)))?;
+        Ok(protocol::entry_to_view(&e))
+    }
+}
+
+fn source_view(s: timetrack_store::ExternalSource) -> protocol::SourceView {
+    protocol::SourceView {
+        id: s.id,
+        kind: s.kind,
+        locator: s.locator,
+        project_id: s.project_id,
+        label: s.label,
+    }
+}
+
+fn suggestion_view(s: timetrack_store::Suggestion) -> protocol::SuggestionView {
+    protocol::SuggestionView {
+        id: s.id,
+        source_id: s.source_id,
+        external_uid: s.external_uid,
+        kind: s.kind,
+        title: s.title,
+        started_at: s.started_at,
+        ended_at: s.ended_at,
+        status: s.status,
+        entry_id: s.entry_id,
+    }
+}
+
+/// Read one source's calendar texts: a file from disk, an HTTPS GET
+/// under a hard byte cap and a 15 s timeout (the update check's terms),
+/// or every `.ics` resource in a CalDAV collection. Read-only by
+/// construction — nothing here can write back.
+fn fetch_source_texts(src: &timetrack_store::ExternalSource) -> Result<Vec<String>, ServiceError> {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    match src.kind.as_str() {
+        "ics_file" => {
+            let text = std::fs::read_to_string(&src.locator)
+                .map_err(|e| ServiceError::Other(format!("could not read {}: {e}", src.locator)))?;
+            if text.len() as u64 > MAX_BYTES {
+                return Err(ServiceError::Other(format!(
+                    "{} exceeds the {MAX_BYTES}-byte calendar cap",
+                    src.locator
+                )));
+            }
+            Ok(vec![text])
+        }
+        "caldav" => crate::caldav::fetch_calendar(&src.locator).map_err(ServiceError::Other),
+        "ics_url" => {
+            use std::io::Read;
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(15)))
+                .build()
+                .into();
+            let mut response = agent
+                .get(&src.locator)
+                .call()
+                .map_err(|e| ServiceError::Other(format!("fetch {} failed: {e}", src.locator)))?;
+            let mut bytes = Vec::new();
+            response
+                .body_mut()
+                .as_reader()
+                .take(MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| ServiceError::Other(format!("fetch {} failed: {e}", src.locator)))?;
+            if bytes.len() as u64 > MAX_BYTES {
+                return Err(ServiceError::Other(format!(
+                    "{} exceeds the {MAX_BYTES}-byte calendar cap",
+                    src.locator
+                )));
+            }
+            String::from_utf8(bytes)
+                .map(|t| vec![t])
+                .map_err(|_| ServiceError::Other(format!("{} is not UTF-8 text", src.locator)))
+        }
+        other => Err(ServiceError::Other(format!(
+            "unknown source kind '{other}'"
+        ))),
+    }
 }
 
 fn to_totals_view(t: &core::Totals) -> TotalsView {
@@ -476,14 +786,19 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// The SQLite store for a legacy-shaped `store.json` test path: the
+    /// database lands beside it as `store.db`, exactly as in production
+    /// (§17), so `path` below still names the JSON name tests have always
+    /// used for "the store over there".
+    fn store_at(path: PathBuf) -> SqliteStore {
+        SqliteStore::open_at(&path).unwrap()
+    }
+
     fn service(name: &str) -> (EntryService, PathBuf) {
         let dir = std::env::temp_dir().join(format!("tt-svc-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("store.json");
-        (
-            EntryService::new(JsonStore::new(path.clone())).unwrap(),
-            path,
-        )
+        (EntryService::new(store_at(path.clone())).unwrap(), path)
     }
 
     fn project(svc: &EntryService) -> ProjectView {
@@ -503,34 +818,37 @@ mod tests {
         svc.add(&p.id, "writing", now - 3_600_000, now).unwrap();
 
         // A fresh service over the same file must see the entry.
-        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let reopened = EntryService::new(store_at(path)).unwrap();
         let snap = reopened.snapshot();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.entries[0].description, "writing");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_failed_save_rolls_the_mutation_back() {
         // #100: memory must match disk after a save failure, so the entry
         // the client was told failed must not linger in snapshots. Since
-        // #103 the mutation path appends to the journal, so the failure is
-        // injected there (a read-only directory alone no longer blocks an
-        // append to the existing journal file — which is correct: that
-        // mutation really would be durable).
-        use std::os::unix::fs::PermissionsExt;
+        // §17 the mutation path is one SQLite transaction, so the failure
+        // is injected as a real write lock: a second connection holds an
+        // open write transaction and SQLite itself refuses the service.
         let (svc, path) = service("save-failure-rollback");
         let p = project(&svc);
         let now = now_ms();
         svc.add(&p.id, "kept", now - 3_600_000, now).unwrap();
 
-        let dir = path.parent().unwrap().to_path_buf();
-        let journal = JsonStore::new(path.clone()).journal_path();
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o444)).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let db_path = SqliteStore::db_path_for(&path);
+        let mut locker = rusqlite::Connection::open(&db_path).unwrap();
+        let lock_tx = locker.transaction().unwrap();
+        lock_tx
+            .execute(
+                "INSERT INTO meta(key, value) VALUES ('lock_probe', '1')
+                 ON CONFLICT(key) DO NOTHING",
+                [],
+            )
+            .unwrap();
         let failed = svc.add(&p.id, "doomed", now - 1_800_000, now);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(lock_tx);
+        drop(locker);
 
         assert!(
             matches!(failed, Err(ServiceError::Storage(_))),
@@ -541,10 +859,29 @@ mod tests {
         assert_eq!(snap.entries[0].description, "kept");
 
         // Disk agrees, and the service still works once writes recover.
-        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let reopened = EntryService::new(store_at(path)).unwrap();
         assert_eq!(reopened.snapshot().entries.len(), 1);
         svc.add(&p.id, "after", now - 1_800_000, now).unwrap();
         assert_eq!(svc.snapshot().entries.len(), 2);
+    }
+
+    #[test]
+    fn changed_subscribers_are_notified_only_by_successful_mutations() {
+        // §16: the socket transport's Changed is notified from the
+        // mutation funnel, so it fires once per persisted mutation and
+        // never for a refusal -- on either transport, since both call
+        // these same methods.
+        let (svc, _) = service("changed-notify");
+        let p = project(&svc);
+        let rx = svc.subscribe_changed();
+        let now = now_ms();
+        svc.add(&p.id, "kept", now, now + 1).unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "a persisted mutation notifies");
+        assert!(
+            svc.add(&p.id, "bad", now + 1, now).is_err(),
+            "setup: a refusal to not-notify with"
+        );
+        assert!(rx.try_recv().is_err(), "a refused mutation must not notify");
     }
 
     #[test]
@@ -555,7 +892,7 @@ mod tests {
         for i in 0..3 {
             svc.add(&p.id, &format!("t{i}"), now, now + 1).unwrap();
         }
-        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let reopened = EntryService::new(store_at(path)).unwrap();
         let added = reopened.add(&p.id, "after restart", now, now + 1).unwrap();
 
         let ids: Vec<String> = reopened
@@ -573,85 +910,86 @@ mod tests {
     }
 
     #[test]
-    fn reopening_an_existing_store_leaves_the_file_alone() {
-        // Startup used to rewrite the file unconditionally, dirtying backups
-        // and failing on read-only stores that could otherwise be served.
-        let (svc, path) = service("untouched");
-        let p = project(&svc);
-        let now = now_ms();
-        svc.add(&p.id, "kept", now, now + 1).unwrap();
+    fn a_legacy_json_store_is_imported_on_first_start() {
+        // §17: a v1 store (checkpoint + journal) is imported by the first
+        // SQLite open, served identically, and left byte-identical on
+        // disk as the backup/rollback -- including across restarts,
+        // which must never re-import over newer database state.
+        use timetrack_core::JsonStore as LegacyStore;
+        let dir = std::env::temp_dir().join("tt-svc-legacy-import");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        let legacy = LegacyStore::new(path.clone());
+        let mut data = Store {
+            version: core::STORE_VERSION,
+            projects: vec![timetrack_core::Project {
+                id: "p1".into(),
+                name: "General".into(),
+                colour: None,
+                archived: false,
+            }],
+            entries: vec![],
+        };
+        legacy.save(&data).unwrap();
+        data.entries.push(timetrack_core::Entry {
+            id: "e1".into(),
+            project_id: "p1".into(),
+            description: "from json".into(),
+            started_at: 1_000,
+            ended_at: 61_000,
+            source: EntrySource::Manual,
+            note: None,
+        });
+        let empty = Store {
+            version: core::STORE_VERSION,
+            projects: data.projects.clone(),
+            entries: vec![],
+        };
+        legacy
+            .append(&core::Journal::between(&empty, &data))
+            .unwrap();
+        let json_before = std::fs::read(&path).unwrap();
+        let journal_before = std::fs::read(legacy.journal_path()).unwrap();
 
-        let before = std::fs::read(&path).unwrap();
-        let _ = EntryService::new(JsonStore::new(path.clone())).unwrap();
-        let after = std::fs::read(&path).unwrap();
-        assert_eq!(before, after, "starting up must not rewrite the store");
-    }
-
-    #[test]
-    fn a_failed_write_does_not_leave_the_service_reporting_success() {
-        // The mutate funnel returns the persist error, so a client never
-        // sees an entry the service could not persist as acknowledged.
-        // Since #103 a mutation persists by appending to the journal, so
-        // the journal is what gets sabotaged here.
-        let (svc, path) = service("failedwrite");
-        let p = project(&svc);
-        let now = now_ms();
-        svc.add(&p.id, "kept", now, now + 1).unwrap();
-
-        // Make the journal unwritable by turning its path into a directory.
-        let journal = JsonStore::new(path).journal_path();
-        let _ = std::fs::remove_file(&journal);
-        std::fs::create_dir_all(&journal).unwrap();
-        let err = svc.add(&p.id, "lost", now, now + 1);
-        assert!(err.is_err(), "must not acknowledge an unpersisted entry");
-    }
-
-    #[test]
-    fn a_failed_save_rolls_back_without_losing_persisted_state() {
-        // The double failure: the save fails, and a reload would fail too
-        // (the path is a directory). The failed mutation is rolled back so
-        // memory matches disk (#100), but previously persisted state must
-        // survive -- no resetting to an empty store.
-        let (svc, path) = service("double-failure");
-        let p = project(&svc);
-        let now = now_ms();
-        svc.add(&p.id, "kept", now, now + 1).unwrap();
-
-        // Break persistence both ways by turning both store paths into
-        // directories: appends and checkpoints fail (#103: the journal is
-        // a persist target too), and any reload would fail as well.
-        let journal = JsonStore::new(path.clone()).journal_path();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&journal);
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::create_dir_all(&journal).unwrap();
-        let err = svc.add(&p.id, "unpersisted", now, now + 1);
-        assert!(err.is_err(), "must not acknowledge an unpersisted entry");
-
-        // Nothing persisted was wiped, and the failed mutation is gone:
-        // memory holds exactly what the last good save put on disk.
+        let svc = EntryService::new(store_at(path.clone())).unwrap();
         let snap = svc.snapshot();
-        assert_eq!(snap.projects.len(), 1, "the seed project must survive");
-        assert_eq!(snap.entries.len(), 1, "failed mutation must roll back");
+        assert_eq!(snap.entries.len(), 1);
+        assert_eq!(snap.entries[0].description, "from json");
         assert!(
-            snap.entries.iter().any(|e| e.description == "kept"),
-            "previously persisted data must survive: {snap:?}"
-        );
-        assert!(
-            !snap.entries.iter().any(|e| e.description == "unpersisted"),
-            "the failed mutation must not linger in memory: {snap:?}"
+            SqliteStore::db_path_for(&path).exists(),
+            "the database is created beside the JSON store"
         );
 
-        // And the failure heals: once the paths are writable again the
-        // next mutation persists normally — with the checkpoint missing
-        // it heals as a whole-store save (#103), so nothing that was in
-        // memory is stranded in a journal with nothing under it.
-        std::fs::remove_dir_all(&path).unwrap();
-        std::fs::remove_dir_all(&journal).unwrap();
-        svc.add(&p.id, "healed", now, now + 1).unwrap();
-        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
-        let snap = reopened.snapshot();
-        assert_eq!(snap.entries.len(), 2, "kept + healed must be on disk");
+        let p = project(&svc);
+        let now = now_ms();
+        svc.add(&p.id, "in sqlite", now, now + 1).unwrap();
+        drop(svc);
+        let reopened = EntryService::new(store_at(path.clone())).unwrap();
+        assert_eq!(
+            reopened.snapshot().entries.len(),
+            2,
+            "restart serves the database, never re-imports the JSON"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), json_before);
+        assert_eq!(
+            std::fs::read(legacy.journal_path()).unwrap(),
+            journal_before
+        );
+    }
+
+    #[test]
+    fn a_missing_database_and_missing_json_is_a_fresh_usable_store() {
+        // No import source and no database: the seed path must still
+        // persist into SQLite, so a second start sees the seed project.
+        // (No `store.json` is created any more.)
+        let (svc, path) = service("fresh-sqlite");
+        assert!(!path.exists(), "nothing writes store.json any more");
+        let p = project(&svc);
+        assert_eq!(p.name, "General");
+        drop(svc);
+        let reopened = EntryService::new(store_at(path)).unwrap();
+        assert_eq!(reopened.snapshot().projects.len(), 1);
+        assert_eq!(reopened.snapshot().projects[0].name, "General");
     }
 
     // --- the four methods ---
@@ -899,7 +1237,7 @@ mod tests {
     fn the_seeded_project_is_persisted() {
         // Otherwise a restart would re-seed it and a rename would be lost.
         let (_svc, path) = service("seed-persist");
-        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let reopened = EntryService::new(store_at(path)).unwrap();
         let snap = reopened.snapshot();
         assert_eq!(snap.projects.len(), 1, "no duplicate seed after restart");
     }
@@ -911,7 +1249,7 @@ mod tests {
         let (svc, path) = service("no-reseed");
         let p = svc.snapshot().projects[0].id.clone();
         svc.set_archived(&p, true).unwrap();
-        let reopened = EntryService::new(JsonStore::new(path)).unwrap();
+        let reopened = EntryService::new(store_at(path)).unwrap();
         let snap = reopened.snapshot();
         assert_eq!(snap.projects.len(), 1);
         assert!(snap.projects[0].archived, "must stay archived");
@@ -1062,8 +1400,7 @@ mod tests {
         let dir = std::env::temp_dir().join("tt-svc-tz-pinned");
         let _ = std::fs::remove_dir_all(&dir);
         let svc =
-            EntryService::new_with_tz(JsonStore::new(dir.join("store.json")), core::Tz::utc())
-                .unwrap();
+            EntryService::new_with_tz(store_at(dir.join("store.json")), core::Tz::utc()).unwrap();
         assert_eq!(svc.snapshot().tz, "UTC");
         assert_eq!(svc.snapshot().tz, "UTC");
     }
@@ -1078,8 +1415,8 @@ mod tests {
         let dir = std::env::temp_dir().join("tt-svc-dst-agree");
         let _ = std::fs::remove_dir_all(&dir);
         let rome = core::Tz::parse("Europe/Rome").unwrap();
-        let svc = EntryService::new_with_tz(JsonStore::new(dir.join("store.json")), rome.clone())
-            .unwrap();
+        let svc =
+            EntryService::new_with_tz(store_at(dir.join("store.json")), rome.clone()).unwrap();
         let p = svc.snapshot().projects.first().cloned().unwrap();
 
         for (day, label) in [
@@ -1125,7 +1462,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("store.json");
         let rome = core::Tz::parse("Europe/Rome").unwrap();
-        let svc = EntryService::new_with_tz(JsonStore::new(path), rome.clone()).unwrap();
+        let svc = EntryService::new_with_tz(store_at(path), rome.clone()).unwrap();
         assert_eq!(svc.snapshot().tz, "Europe/Rome");
         let p = svc.snapshot().projects.first().cloned().unwrap();
         let utc_ms = 1_783_290_600_000; // 2026-07-05 22:30 UTC
@@ -1187,7 +1524,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tt-svc-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("store.json");
-        EntryService::new_with_tz(JsonStore::new(path), core::Tz::utc()).unwrap()
+        EntryService::new_with_tz(store_at(path), core::Tz::utc()).unwrap()
     }
 
     #[test]

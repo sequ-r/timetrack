@@ -11,18 +11,18 @@
 //! (an AppImage) and the CLI (bundled in that same image) agree on one
 //! definition. It carries no GUI and no storage code.
 //!
-//! # Two interfaces, one contract
+//! # One contract, on the local socket
 //!
-//! The original interface (`org.sequ.timetrack.Entries`) carries one
-//! JSON string per call: serde structs were the single definition, so a
-//! field added service-side arrived client-side with no signature
-//! change. The typed interface (`org.sequ.timetrack.Entries2`, #110,
-//! ADR 0012) speaks real D-Bus signatures — introspectable structs and
-//! named, typed errors — now that the types have settled enough for
-//! signatures to be worth more than they cost. The service serves both
-//! through the transition; [`Client`] probes `ApiVersion`, prefers the
-//! typed interface, and maps both back to the structs below, so no
-//! caller downstream can tell which answered.
+//! The service speaks exactly one wire now: the local socket (see
+//! [`socket`], §16/ADR 0013), carrying these serde structs and the
+//! typed [`ServiceError`] refusals. It grew from two D-Bus interfaces
+//! (the JSON-in-string original and the typed `Entries2`, ADR 0012),
+//! dual-served through the socket transition and retired with the
+//! bus (#129); the shapes below are what all three generations shared,
+//! so the contract survived both moves unchanged. The one bus use
+//! left in this crate is `desktop_notify` — freedesktop notifications
+//! are a D-Bus protocol, and they are the tray's surface, not the
+//! service's.
 //!
 //! # The running timer is gone
 //!
@@ -33,31 +33,21 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Well-known bus name. Also the app-id used by the desktop entry.
-pub const BUS_NAME: &str = "org.sequ.timetrack";
+pub mod socket;
 
-/// Object path of the single exported interface.
-pub const OBJECT_PATH: &str = "/org/sequ/timetrack";
+use socket::{Request as SocketRequest, Response as SocketResponse, SocketClient};
 
-/// Interface name (the original JSON-in-string interface, "v1").
-pub const INTERFACE: &str = "org.sequ.timetrack.Entries";
-
-/// The typed interface name (#110). Same bus name and object path, new
-/// interface: that is the version discriminator. A service answers on
-/// the interfaces it speaks, so a client probes this one first and a
-/// service too old for it simply never answers here.
-pub const INTERFACE2: &str = "org.sequ.timetrack.Entries2";
-
-/// The typed API revision `ApiVersion` reports. Bump when a typed
-/// signature changes; clients refuse anything but their own value and
-/// fall back to the legacy interface instead of guessing.
-pub const TYPED_API_VERSION: u32 = 2;
+/// The app-id (desktop entry, notification icon). The service's wire
+/// identity is its socket now (§16); this name lives on for the
+/// desktop integration that still uses it.
+pub const APP_ID: &str = "org.sequ.timetrack";
 
 /// How long a method call may take before the client gives up on it.
 ///
 /// zbus has no default method timeout, so without this a service that
 /// accepts the connection and then never answers hangs the caller forever:
-/// the TUI freezes inside its refresh and even `q` stops working (issue #43).
+/// a client freezes inside its refresh and even quitting stops working
+/// (issue #43, from the removed TUI).
 ///
 /// Ten seconds is the trade-off. A healthy service answers a snapshot in
 /// milliseconds, so ten seconds is three orders of magnitude more than it
@@ -78,11 +68,11 @@ const TIMEOUT_WORDING: &str = "the service did not answer in time";
 /// On the typed interface (#110) this travels as its string spelling
 /// (`Manual`/`QuickAdd` — the same bytes the JSON form used), so the
 /// signature is pinned to `s` rather than a variant box.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
-#[zvariant(signature = "s")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntrySource {
     Manual,
     QuickAdd,
+    External,
 }
 
 /// One entry as seen by a client.
@@ -129,8 +119,46 @@ pub struct ProjectView {
     pub archived: bool,
 }
 
+/// A registered external calendar/task source (§19). Socket-only for
+/// now: sources are a new feature, so no D-Bus-era service could serve
+/// them anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceView {
+    pub id: String,
+    /// `ics_file` or `ics_url`.
+    pub kind: String,
+    pub locator: String,
+    pub project_id: Option<String>,
+    pub label: String,
+}
+
+/// A fetched event/task awaiting (or past) decision (§19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestionView {
+    pub id: String,
+    pub source_id: String,
+    pub external_uid: String,
+    /// `event` or `task`.
+    pub kind: String,
+    pub title: String,
+    pub started_at: i64,
+    pub ended_at: i64,
+    /// `pending`, `confirmed`, or `dismissed`.
+    pub status: String,
+    pub entry_id: Option<String>,
+}
+
+/// What one refresh fetched: items seen, newly stored, and skipped by
+/// the parser (no interval, no UID, unparseable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RefreshView {
+    pub fetched: usize,
+    pub inserted: usize,
+    pub skipped: usize,
+}
+
 /// Totals for one period, mirroring `timetrack_core::aggregate::Totals`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TotalsView {
     pub total_ms: i64,
     pub per_project: std::collections::BTreeMap<String, i64>,
@@ -205,133 +233,6 @@ impl Snapshot {
     }
 }
 
-/// The typed-interface (`org.sequ.timetrack.Entries2`, #110) shapes.
-///
-/// They mirror the JSON views field for field, with the two changes
-/// D-Bus itself forces: it has no `Option`, so an entry's note travels
-/// as `(has_note, note)` and a project's colour as the `i64` encoding
-/// `UpdateProject` already used (-1 for none). Conversions keep one
-/// internal representation ([`Snapshot`]/[`EntryView`]/[`ProjectView`])
-/// for every client, whichever interface answered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
-pub struct Entry2 {
-    pub id: String,
-    pub project_id: String,
-    pub description: String,
-    pub started_at: i64,
-    pub ended_at: i64,
-    pub source: EntrySource,
-    pub has_note: bool,
-    pub note: String,
-}
-
-impl From<&EntryView> for Entry2 {
-    fn from(e: &EntryView) -> Self {
-        Entry2 {
-            id: e.id.clone(),
-            project_id: e.project_id.clone(),
-            description: e.description.clone(),
-            started_at: e.started_at,
-            ended_at: e.ended_at,
-            source: e.source,
-            has_note: e.note.is_some(),
-            note: e.note.clone().unwrap_or_default(),
-        }
-    }
-}
-
-impl From<Entry2> for EntryView {
-    fn from(e: Entry2) -> Self {
-        EntryView {
-            id: e.id,
-            project_id: e.project_id,
-            description: e.description,
-            started_at: e.started_at,
-            ended_at: e.ended_at,
-            source: e.source,
-            note: e.has_note.then_some(e.note),
-        }
-    }
-}
-
-/// The typed twin of [`ProjectView`]; colour is -1 for none, else the
-/// `0xRRGGBB` value, as `UpdateProject` has always spelled it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
-pub struct Project2 {
-    pub id: String,
-    pub name: String,
-    pub colour: i64,
-    pub archived: bool,
-}
-
-impl From<&ProjectView> for Project2 {
-    fn from(p: &ProjectView) -> Self {
-        Project2 {
-            id: p.id.clone(),
-            name: p.name.clone(),
-            colour: p.colour.map(i64::from).unwrap_or(-1),
-            archived: p.archived,
-        }
-    }
-}
-
-impl From<Project2> for ProjectView {
-    fn from(p: Project2) -> Self {
-        ProjectView {
-            id: p.id,
-            name: p.name,
-            colour: u32::try_from(p.colour).ok(),
-            archived: p.archived,
-        }
-    }
-}
-
-/// The typed twin of [`Snapshot`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, zbus::zvariant::Type)]
-pub struct Snapshot2 {
-    pub projects: Vec<Project2>,
-    pub entries: Vec<Entry2>,
-    pub week: TotalsView,
-    pub month: TotalsView,
-    pub all: TotalsView,
-    pub total_ms: i64,
-    pub over_24h_days: Vec<i64>,
-    pub local_offset_ms: i64,
-    pub tz: String,
-}
-
-impl From<&Snapshot> for Snapshot2 {
-    fn from(s: &Snapshot) -> Self {
-        Snapshot2 {
-            projects: s.projects.iter().map(Project2::from).collect(),
-            entries: s.entries.iter().map(Entry2::from).collect(),
-            week: s.week.clone(),
-            month: s.month.clone(),
-            all: s.all.clone(),
-            total_ms: s.total_ms,
-            over_24h_days: s.over_24h_days.clone(),
-            local_offset_ms: s.local_offset_ms,
-            tz: s.tz.clone(),
-        }
-    }
-}
-
-impl From<Snapshot2> for Snapshot {
-    fn from(s: Snapshot2) -> Self {
-        Snapshot {
-            projects: s.projects.into_iter().map(ProjectView::from).collect(),
-            entries: s.entries.into_iter().map(EntryView::from).collect(),
-            week: s.week,
-            month: s.month,
-            all: s.all,
-            total_ms: s.total_ms,
-            over_24h_days: s.over_24h_days,
-            local_offset_ms: s.local_offset_ms,
-            tz: s.tz,
-        }
-    }
-}
-
 /// Convert a core entry into its wire representation.
 pub fn entry_to_view(e: &timetrack_core::Entry) -> EntryView {
     EntryView {
@@ -343,6 +244,7 @@ pub fn entry_to_view(e: &timetrack_core::Entry) -> EntryView {
         source: match e.source {
             timetrack_core::EntrySource::Manual => EntrySource::Manual,
             timetrack_core::EntrySource::QuickAdd => EntrySource::QuickAdd,
+            timetrack_core::EntrySource::External => EntrySource::External,
         },
         note: e.note.clone(),
     }
@@ -360,10 +262,9 @@ pub fn project_to_view(p: &timetrack_core::Project) -> ProjectView {
 
 /// Why the service refused a call, in typed form.
 ///
-/// This travels as JSON in the D-Bus `Failed` message body, so the D-Bus
-/// signatures never change. `Display` reproduces exactly the strings clients
-/// have always shown, so CLI output and scripts keep matching: match on the
-/// variants, never on the text.
+/// This travels in the socket reply frame. `Display` reproduces exactly
+/// the strings clients have always shown, so CLI output and scripts
+/// keep matching: match on the variants, never on the text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ServiceError {
     /// A rule refused the operation; the wording is the rule's own.
@@ -381,247 +282,6 @@ pub enum ServiceError {
     Other(String),
 }
 
-impl ServiceError {
-    /// Decode a `org.freedesktop.DBus.Error.Failed` message body back into
-    /// the typed refusal. Anything that is not our JSON is a refusal from an
-    /// older service; keep its text rather than failing the decode.
-    pub fn from_failed_body(body: &str) -> Self {
-        serde_json::from_str(body).unwrap_or_else(|_| ServiceError::Other(body.to_string()))
-    }
-
-    /// Encode for the D-Bus `Failed` message body.
-    pub fn to_failed_body(&self) -> String {
-        serde_json::to_string(self).expect("service errors are always serializable")
-    }
-}
-
-/// [`ServiceError`] as named D-Bus errors, for the typed interface
-/// (#110): one error name per refusal variant
-/// (`org.sequ.timetrack.Error.DuplicateProject`, …) with the variant's
-/// fields as the typed error body, replacing the JSON-in-`Failed`
-/// encoding the legacy interface retains during the transition. There
-/// is still exactly one error mechanism per interface, and the client
-/// maps both back to the same [`ServiceError`], so nothing downstream
-/// of `timetrack-proto` can tell which interface answered.
-#[derive(Debug, Clone)]
-pub enum WireError {
-    UnknownEntry(String),
-    UnknownProject(String),
-    DuplicateProject(String),
-    BlankProjectName,
-    TextTooLong(String, u64),
-    TextHasControlCharacters(String),
-    NegativeDuration,
-    InstantOutOfRange(i64),
-    LastProject,
-    ProjectHasEntries(String),
-    InvalidQuickAdd(i64),
-    InvalidMerge(String),
-    NotQuickAdd(String),
-    UnknownExportScope(String),
-    Storage(String),
-    /// A refusal with no typed shape (a hand-edited discrepancy between
-    /// client and service builds): its message, verbatim.
-    Other(String),
-}
-
-impl std::fmt::Display for WireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The wording is ServiceError's, as everywhere downstream.
-        write!(f, "{}", ServiceError::from(self.clone()))
-    }
-}
-
-impl std::error::Error for WireError {}
-
-/// Hand-written rather than derived: the derive assumes a variant's
-/// first field is the human description string, while ours are the
-/// refusal's own typed fields (an id, an instant, a cap). The error
-/// *name* identifies the variant; the body carries exactly its fields.
-impl zbus::DBusError for WireError {
-    fn name(&self) -> zbus::names::ErrorName<'_> {
-        use zbus::names::ErrorName;
-        match self {
-            WireError::UnknownEntry(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.UnknownEntry")
-            }
-            WireError::UnknownProject(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.UnknownProject")
-            }
-            WireError::DuplicateProject(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.DuplicateProject")
-            }
-            WireError::BlankProjectName => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.BlankProjectName")
-            }
-            WireError::TextTooLong(..) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.TextTooLong")
-            }
-            WireError::TextHasControlCharacters(_) => ErrorName::from_static_str_unchecked(
-                "org.sequ.timetrack.Error.TextHasControlCharacters",
-            ),
-            WireError::NegativeDuration => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.NegativeDuration")
-            }
-            WireError::InstantOutOfRange(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.InstantOutOfRange")
-            }
-            WireError::LastProject => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.LastProject")
-            }
-            WireError::ProjectHasEntries(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.ProjectHasEntries")
-            }
-            WireError::InvalidQuickAdd(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.InvalidQuickAdd")
-            }
-            WireError::InvalidMerge(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.InvalidMerge")
-            }
-            WireError::NotQuickAdd(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.NotQuickAdd")
-            }
-            WireError::UnknownExportScope(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.UnknownExportScope")
-            }
-            WireError::Storage(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.Storage")
-            }
-            WireError::Other(_) => {
-                ErrorName::from_static_str_unchecked("org.sequ.timetrack.Error.Other")
-            }
-        }
-    }
-
-    fn description(&self) -> Option<&str> {
-        // The body carries the typed fields; clients rebuild the
-        // wording from the variant, like everywhere else.
-        None
-    }
-
-    fn create_reply(&self, call: &zbus::message::Header<'_>) -> zbus::Result<zbus::Message> {
-        let builder = zbus::Message::error(call, self.name());
-        match self {
-            WireError::BlankProjectName | WireError::NegativeDuration | WireError::LastProject => {
-                builder.build(&())
-            }
-            WireError::TextTooLong(what, cap) => builder.build(&(what, *cap)),
-            WireError::InstantOutOfRange(v) | WireError::InvalidQuickAdd(v) => {
-                builder.build(&(*v,))
-            }
-            WireError::UnknownEntry(v)
-            | WireError::UnknownProject(v)
-            | WireError::DuplicateProject(v)
-            | WireError::TextHasControlCharacters(v)
-            | WireError::ProjectHasEntries(v)
-            | WireError::InvalidMerge(v)
-            | WireError::NotQuickAdd(v)
-            | WireError::UnknownExportScope(v)
-            | WireError::Storage(v)
-            | WireError::Other(v) => builder.build(&(v,)),
-        }
-    }
-}
-
-impl WireError {
-    /// Rebuild from a typed-interface error reply: the D-Bus error name
-    /// picks the variant and the body supplies its fields. Anything
-    /// that is not one of ours keeps the caller's generic mapping.
-    fn from_bus_error(error: &zbus::Error) -> Option<Self> {
-        let zbus::Error::MethodError(name, _detail, msg) = error else {
-            return None;
-        };
-        let variant = name.strip_prefix("org.sequ.timetrack.Error.")?;
-        let body = msg.body();
-        let one_string = |body: &zbus::message::Body| -> Option<String> {
-            body.deserialize::<(String,)>().ok().map(|(v,)| v)
-        };
-        Some(match variant {
-            "UnknownEntry" => WireError::UnknownEntry(one_string(&body)?),
-            "UnknownProject" => WireError::UnknownProject(one_string(&body)?),
-            "DuplicateProject" => WireError::DuplicateProject(one_string(&body)?),
-            "BlankProjectName" => WireError::BlankProjectName,
-            "TextTooLong" => {
-                let (what, cap) = body.deserialize::<(String, u64)>().ok()?;
-                WireError::TextTooLong(what, cap)
-            }
-            "TextHasControlCharacters" => WireError::TextHasControlCharacters(one_string(&body)?),
-            "NegativeDuration" => WireError::NegativeDuration,
-            "InstantOutOfRange" => {
-                WireError::InstantOutOfRange(body.deserialize::<(i64,)>().ok()?.0)
-            }
-            "LastProject" => WireError::LastProject,
-            "ProjectHasEntries" => WireError::ProjectHasEntries(one_string(&body)?),
-            "InvalidQuickAdd" => WireError::InvalidQuickAdd(body.deserialize::<(i64,)>().ok()?.0),
-            "InvalidMerge" => WireError::InvalidMerge(one_string(&body)?),
-            "NotQuickAdd" => WireError::NotQuickAdd(one_string(&body)?),
-            "UnknownExportScope" => WireError::UnknownExportScope(one_string(&body)?),
-            "Storage" => WireError::Storage(one_string(&body)?),
-            "Other" => WireError::Other(one_string(&body)?),
-            _ => return None,
-        })
-    }
-}
-
-impl From<ServiceError> for WireError {
-    fn from(e: ServiceError) -> Self {
-        use timetrack_core::RuleError as R;
-        match e {
-            ServiceError::Rule(rule) => match rule {
-                R::UnknownEntry(v) => WireError::UnknownEntry(v),
-                R::UnknownProject(v) => WireError::UnknownProject(v),
-                R::DuplicateProject(v) => WireError::DuplicateProject(v),
-                R::BlankProjectName => WireError::BlankProjectName,
-                R::TextTooLong(what, cap) => WireError::TextTooLong(what, cap as u64),
-                R::TextHasControlCharacters(v) => WireError::TextHasControlCharacters(v),
-                R::NegativeDuration => WireError::NegativeDuration,
-                R::InstantOutOfRange(v) => WireError::InstantOutOfRange(v),
-                R::LastProject => WireError::LastProject,
-                R::ProjectHasEntries(v) => WireError::ProjectHasEntries(v),
-                R::InvalidQuickAdd(v) => WireError::InvalidQuickAdd(v),
-                R::InvalidMerge(v) => WireError::InvalidMerge(v),
-                R::NotQuickAdd(v) => WireError::NotQuickAdd(v),
-            },
-            ServiceError::UnknownExportScope(v) => WireError::UnknownExportScope(v),
-            ServiceError::Storage(v) => WireError::Storage(v),
-            ServiceError::Other(v) => WireError::Other(v),
-        }
-    }
-}
-
-impl From<WireError> for ServiceError {
-    fn from(e: WireError) -> Self {
-        use timetrack_core::RuleError as R;
-        match e {
-            WireError::UnknownEntry(v) => R::UnknownEntry(v).into(),
-            WireError::UnknownProject(v) => R::UnknownProject(v).into(),
-            WireError::DuplicateProject(v) => R::DuplicateProject(v).into(),
-            WireError::BlankProjectName => R::BlankProjectName.into(),
-            WireError::TextTooLong(what, cap) => R::TextTooLong(what, cap as usize).into(),
-            WireError::TextHasControlCharacters(v) => R::TextHasControlCharacters(v).into(),
-            WireError::NegativeDuration => R::NegativeDuration.into(),
-            WireError::InstantOutOfRange(v) => R::InstantOutOfRange(v).into(),
-            WireError::LastProject => R::LastProject.into(),
-            WireError::ProjectHasEntries(v) => R::ProjectHasEntries(v).into(),
-            WireError::InvalidQuickAdd(v) => R::InvalidQuickAdd(v).into(),
-            WireError::InvalidMerge(v) => R::InvalidMerge(v).into(),
-            WireError::NotQuickAdd(v) => R::NotQuickAdd(v).into(),
-            WireError::UnknownExportScope(v) => ServiceError::UnknownExportScope(v),
-            WireError::Storage(v) => ServiceError::Storage(v),
-            WireError::Other(v) => ServiceError::Other(v),
-        }
-    }
-}
-
-/// D-Bus error names that decide a call's fate. These come from the D-Bus
-/// specification and never change; matching on them exactly is protocol
-/// dispatch, not message-text sniffing.
-const FAILED: &str = "org.freedesktop.DBus.Error.Failed";
-const SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";
-const NAME_HAS_NO_OWNER: &str = "org.freedesktop.DBus.Error.NameHasNoOwner";
-const UNKNOWN_INTERFACE: &str = "org.freedesktop.DBus.Error.UnknownInterface";
-const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
-
 /// Why a client call failed, without anyone matching on message text.
 ///
 /// The `?` operator still converts this into `anyhow::Error` wherever the
@@ -633,56 +293,22 @@ pub enum ClientError {
     /// `Display` is the service's own wording, unchanged from before.
     #[error("{0}")]
     Service(#[from] ServiceError),
-    /// Nothing owns the well-known name: the service is not running.
+    /// Nothing listens on the service socket: the service is not running.
     #[error("the timetrack service is not running")]
     NoService,
-    /// The service answered unknown-interface or unknown-method: the client
-    /// and the service are different versions.
+    /// The client and the service are different versions. Kept variant
+    /// for the GUI/tray skew surfaces built around it; the socket
+    /// transport reports skew as transport failures today.
     #[error(
         "service spoke an unknown interface or method ({name}); client and service are different versions"
     )]
     VersionMismatch {
-        /// The D-Bus error name the service answered with.
+        /// What the peer answered with, named for the log line.
         name: String,
     },
-    /// Any other bus-level failure, with the bus's own wording.
+    /// Any other transport-level failure, with its own wording.
     #[error("{0}")]
     Transport(String),
-}
-
-impl ClientError {
-    /// Sort a bus failure by its error NAME, never by message text: only a
-    /// `Failed` body is decoded further, and only as typed JSON.
-    pub fn from_bus(error: zbus::Error) -> Self {
-        match error {
-            zbus::Error::MethodError(name, detail, _) => {
-                Self::from_error_name(name.as_str(), detail.as_deref())
-            }
-            // A call that ran out of time: the service took the connection
-            // and then stopped answering. That is a transport failure, not a
-            // refusal, and it must not look like a missing service.
-            zbus::Error::InputOutput(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                ClientError::Transport(TIMEOUT_WORDING.to_string())
-            }
-            other => ClientError::Transport(other.to_string()),
-        }
-    }
-
-    /// Sort a D-Bus error reply. `name` is one of the spec-fixed error names;
-    /// `detail` is the message body, JSON only for our own `Failed` errors.
-    fn from_error_name(name: &str, detail: Option<&str>) -> Self {
-        if name == SERVICE_UNKNOWN || name == NAME_HAS_NO_OWNER {
-            ClientError::NoService
-        } else if name == UNKNOWN_INTERFACE || name == UNKNOWN_METHOD {
-            ClientError::VersionMismatch {
-                name: name.to_string(),
-            }
-        } else if name == FAILED {
-            ClientError::Service(ServiceError::from_failed_body(detail.unwrap_or("")))
-        } else {
-            ClientError::Transport(format!("{name}: {}", detail.unwrap_or("no details")))
-        }
-    }
 }
 
 /// The "service is not running" guidance, shared by the GUI footer and
@@ -746,28 +372,16 @@ pub async fn desktop_notify(summary: &str, body: &str) -> Result<(), ClientError
 /// disagrees with the service. Shown for [`ClientError::VersionMismatch`].
 pub fn version_mismatch_hint(client: &str) -> String {
     format!(
-        "The {client} and the service are different versions.\nReinstall whichever one is older so both speak\n{INTERFACE}."
+        "The {client} and the service are different versions.\nReinstall whichever one is older so both speak\nthe same socket protocol."
     )
 }
 
-/// Which interface a [`Client`] is speaking (#110).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiMode {
-    /// `org.sequ.timetrack.Entries2`: typed arguments, structs and
-    /// named errors.
-    Typed,
-    /// `org.sequ.timetrack.Entries`: the original JSON-in-string
-    /// interface, kept for services older than the typed one (and new
-    /// services keep serving it for older clients).
-    Legacy,
-}
-
-/// A connection to the running service.
+/// A connection to the running service over its local socket (§16).
+/// Cheap to clone — it is only a socket path; each call opens its own
+/// connection (see `socket` module docs).
 #[derive(Clone)]
 pub struct Client {
-    proxy: zbus::Proxy<'static>,
-    typed: zbus::Proxy<'static>,
-    mode: ApiMode,
+    socket: SocketClient,
 }
 
 /// How a bounded wait for `Changed` ended (#103).
@@ -782,34 +396,44 @@ pub enum ChangedWait {
     Ended,
 }
 
-/// A subscription to the service's `Changed` signal (#103).
+/// A subscription to the service's `Changed` announcements (#103).
 ///
-/// Wraps zbus' signal stream so client crates need no futures traits of
-/// their own: await [`ChangedStream::next`] for the next announcement,
-/// or [`ChangedStream::wait_timeout`] to share a wait with a fallback
-/// timer. Coalescing is inexact by design — two mutations may arrive as
-/// one refresh — because the snapshot fetched after any signal is the
+/// Coalescing is inexact by design — two mutations may arrive as one
+/// refresh — because the snapshot fetched after any signal is the
 /// service's current state either way.
 pub struct ChangedStream {
-    inner: std::pin::Pin<Box<zbus::proxy::SignalStream<'static>>>,
+    inner: ChangedInner,
+}
+
+enum ChangedInner {
+    #[cfg(unix)]
+    Socket(async_io::Async<std::os::unix::net::UnixStream>),
+    #[cfg(not(unix))]
+    SocketChannel(std::sync::mpsc::Receiver<()>),
 }
 
 impl ChangedStream {
     /// The next `Changed`, or `None` when the stream has ended.
-    ///
-    /// zbus also yields the proxy's internal `NameOwnerChanged`
-    /// bookkeeping messages on this stream; only the service's own
-    /// member counts, or merely subscribing would read as a change.
     pub async fn next(&mut self) -> Option<()> {
-        loop {
-            let msg = futures_lite::StreamExt::next(&mut self.inner).await?;
-            if msg
-                .header()
-                .member()
-                .is_some_and(|m| m.as_str() == "Changed")
-            {
-                return Some(());
-            }
+        match &mut self.inner {
+            #[cfg(unix)]
+            ChangedInner::Socket(stream) => loop {
+                match socket::read_frame_async(stream).await {
+                    Ok(Some(socket::Frame::Changed)) => return Some(()),
+                    Ok(Some(_)) => continue,
+                    _ => return None,
+                }
+            },
+            #[cfg(not(unix))]
+            ChangedInner::SocketChannel(rx) => loop {
+                match rx.try_recv() {
+                    Ok(()) => return Some(()),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        async_io::Timer::after(Duration::from_millis(25)).await;
+                    }
+                }
+            },
         }
     }
 
@@ -834,164 +458,45 @@ impl ChangedStream {
 impl Client {
     /// Connect to the service.
     ///
-    /// The connection carries a default method timeout ([`CALL_TIMEOUT`]), so
-    /// every call this client makes is abandoned if the service stops
-    /// answering: a wedged service becomes an error, never a hang
-    /// (issue #43).
+    /// This proves nothing yet — a socket client is just a path, so a
+    /// missing service surfaces at the first method call as
+    /// `NoService`, the same contract the bus client had. Every call
+    /// carries [`CALL_TIMEOUT`], so a wedged service becomes an error,
+    /// never a hang (issue #43).
     pub async fn connect() -> Result<Self, ClientError> {
-        // NOTE: do *not* call `.name(BUS_NAME)` here. On a client connection
-        // that asks the bus to hand us the well-known name, which only ever
-        // succeeds if nothing else owns it -- so it would block forever
-        // against a healthy service and report success when the service is
-        // absent. A client must connect anonymously and address the owner by
-        // name at call time, which is what `Proxy::new` does.
-        //
-        // This connects to the bus, it does not reach the service: a missing
-        // service surfaces at the first method call, as `NoService`.
-        let conn = zbus::connection::Builder::session()
-            // The timeout lives on the connection, so every method inherits
-            // it -- there is no per-call timeout to forget.
-            .method_timeout(CALL_TIMEOUT)
-            .build()
-            .await
-            .map_err(ClientError::from_bus)?;
-        let proxy = zbus::Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE)
-            .await
-            .map_err(ClientError::from_bus)?;
-        let typed = zbus::Proxy::new(&conn, BUS_NAME, OBJECT_PATH, INTERFACE2)
-            .await
-            .map_err(ClientError::from_bus)?;
-        // Probe the typed interface (#110). Anything but our exact
-        // revision — an older service with no such interface, no
-        // service at all yet, a future revision — means the legacy
-        // interface, which every service in the transition serves.
-        // Connecting must not fail on a missing service (see above), so
-        // every probe failure is a mode, never an error.
-        let mode = match typed.call_method("ApiVersion", &()).await {
-            Ok(reply) if reply.body().deserialize::<u32>().ok() == Some(TYPED_API_VERSION) => {
-                ApiMode::Typed
-            }
-            _ => ApiMode::Legacy,
-        };
-        Ok(Client { proxy, typed, mode })
+        Ok(Client {
+            socket: SocketClient::at_default_path(),
+        })
     }
 
-    /// Which interface this client is speaking.
-    pub fn api_mode(&self) -> ApiMode {
-        self.mode
-    }
-
-    /// Sort a typed-interface failure: our named errors rebuild the
-    /// exact [`ServiceError`]; anything else keeps the generic mapping.
-    fn map_typed(error: zbus::Error) -> ClientError {
-        if let Some(wire) = WireError::from_bus_error(&error) {
-            return ClientError::Service(wire.into());
-        }
-        ClientError::from_bus(error)
-    }
-
-    /// Call a typed method with arguments and decode its typed reply.
-    async fn call2<
-        T: serde::de::DeserializeOwned + zbus::zvariant::Type,
-        A: serde::Serialize + zbus::zvariant::DynamicType,
-    >(
-        &self,
-        method: &str,
-        arg: &A,
-    ) -> Result<T, ClientError> {
-        let reply = self
-            .typed
-            .call_method(method, arg)
-            .await
-            .map_err(Self::map_typed)?;
-        reply
-            .body()
-            .deserialize()
-            .map_err(|e| ClientError::Transport(e.to_string()))
-    }
-
-    /// Call a typed method that answers nothing.
-    async fn call2_unit<A: serde::Serialize + zbus::zvariant::DynamicType>(
-        &self,
-        method: &str,
-        arg: &A,
-    ) -> Result<(), ClientError> {
-        self.typed
-            .call_method(method, arg)
-            .await
-            .map(|_| ())
-            .map_err(Self::map_typed)
-    }
-
-    /// Call a no-argument method and decode its JSON reply.
-    async fn call<T: serde::de::DeserializeOwned>(&self, method: &str) -> Result<T, ClientError> {
-        let reply = self
-            .proxy
-            .call_method(method, &())
-            .await
-            .map_err(ClientError::from_bus)?;
-        let wire: String = reply
-            .body()
-            .deserialize()
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        serde_json::from_str(&wire).map_err(|e| ClientError::Transport(e.to_string()))
-    }
-
-    /// Call a one-argument method and decode its JSON reply.
-    ///
-    /// `A` needs zbus's own `DynamicType`, not just `Serialize`: zbus derives
-    /// the D-Bus signature from the type, so a plain `Serialize` bound is not
-    /// enough to call a method.
-    async fn call1<
-        T: serde::de::DeserializeOwned,
-        A: serde::Serialize + zbus::zvariant::DynamicType,
-    >(
-        &self,
-        method: &str,
-        arg: &A,
-    ) -> Result<T, ClientError> {
-        let reply = self
-            .proxy
-            .call_method(method, arg)
-            .await
-            .map_err(ClientError::from_bus)?;
-        let wire: String = reply
-            .body()
-            .deserialize()
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        serde_json::from_str(&wire).map_err(|e| ClientError::Transport(e.to_string()))
+    fn call(&self, request: SocketRequest) -> Result<SocketResponse, ClientError> {
+        self.socket.call(request)
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let snap: Snapshot2 = self.call2("Snapshot", &()).await?;
-            return Ok(snap.into());
-        }
-        self.call("Snapshot").await
+        self.call(SocketRequest::Snapshot)?.snapshot()
     }
 
-    /// Subscribe to the service's `Changed` signal (#103).
-    ///
-    /// Subscribing only adds a bus match rule, so it succeeds even against
-    /// a service (or a bus) that never emits: old services simply never
-    /// fire, and callers keep a slow fallback poll for exactly that case.
+    /// Subscribe to the service's `Changed` announcements (#103).
     pub async fn changed_stream(&self) -> Result<ChangedStream, ClientError> {
-        let proxy = match self.mode {
-            ApiMode::Typed => &self.typed,
-            ApiMode::Legacy => &self.proxy,
-        };
-        let inner = proxy
-            .receive_signal("Changed")
-            .await
-            .map_err(ClientError::from_bus)?;
-        Ok(ChangedStream {
-            inner: Box::pin(inner),
-        })
+        #[cfg(unix)]
+        {
+            let stream = self.socket.subscribe_changed().await?;
+            Ok(ChangedStream {
+                inner: ChangedInner::Socket(stream),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let rx = self.socket.subscribe_changed_channel()?;
+            Ok(ChangedStream {
+                inner: ChangedInner::SocketChannel(rx),
+            })
+        }
     }
 
     // --- the four v1 entry methods (REQUIREMENTS §5) ---
 
-    /// Method 1: an explicit start and end.
     pub async fn add(
         &self,
         project_id: &str,
@@ -999,34 +504,29 @@ impl Client {
         started_at: i64,
         ended_at: i64,
     ) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self
-                .call2("Add", &(project_id, description, started_at, ended_at))
-                .await?;
-            return Ok(e.into());
-        }
-        self.call1("Add", &(project_id, description, started_at, ended_at))
-            .await
+        self.call(SocketRequest::Add {
+            project_id: project_id.into(),
+            description: description.into(),
+            started_at,
+            ended_at,
+        })?
+        .entry()
     }
 
-    /// Method 2: a duration ending now.
     pub async fn add_duration(
         &self,
         project_id: &str,
         description: &str,
         duration_ms: i64,
     ) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self
-                .call2("AddDuration", &(project_id, description, duration_ms))
-                .await?;
-            return Ok(e.into());
-        }
-        self.call1("AddDuration", &(project_id, description, duration_ms))
-            .await
+        self.call(SocketRequest::AddDuration {
+            project_id: project_id.into(),
+            description: description.into(),
+            duration_ms,
+        })?
+        .entry()
     }
 
-    /// Method 3: a duration ending at a given instant.
     pub async fn add_duration_ending(
         &self,
         project_id: &str,
@@ -1034,223 +534,226 @@ impl Client {
         duration_ms: i64,
         ended_at: i64,
     ) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self
-                .call2(
-                    "AddDurationEnding",
-                    &(project_id, description, duration_ms, ended_at),
-                )
-                .await?;
-            return Ok(e.into());
-        }
-        self.call1(
-            "AddDurationEnding",
-            &(project_id, description, duration_ms, ended_at),
-        )
-        .await
+        self.call(SocketRequest::AddDurationEnding {
+            project_id: project_id.into(),
+            description: description.into(),
+            duration_ms,
+            ended_at,
+        })?
+        .entry()
     }
 
-    /// Method 4: one of the quick-add buckets, ending now.
     pub async fn quick_add(
         &self,
         project_id: &str,
         duration_ms: i64,
     ) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self.call2("QuickAdd", &(project_id, duration_ms)).await?;
-            return Ok(e.into());
-        }
-        self.call1("QuickAdd", &(project_id, duration_ms)).await
+        self.call(SocketRequest::QuickAdd {
+            project_id: project_id.into(),
+            duration_ms,
+        })?
+        .entry()
     }
 
     // --- editing ---
 
-    /// Move an entry's interval. This is method 1's "remove" side: it
-    /// shortens by moving an endpoint and never deletes (REQUIREMENTS §5).
     pub async fn set_times(
         &self,
         id: &str,
         started_at: i64,
         ended_at: i64,
     ) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self.call2("SetTimes", &(id, started_at, ended_at)).await?;
-            return Ok(e.into());
-        }
-        self.call1("SetTimes", &(id, started_at, ended_at)).await
+        self.call(SocketRequest::SetTimes {
+            id: id.into(),
+            started_at,
+            ended_at,
+        })?
+        .entry()
     }
 
-    /// Edit an entry's description.
     pub async fn set_text(&self, id: &str, description: &str) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self.call2("SetText", &(id, description)).await?;
-            return Ok(e.into());
-        }
-        self.call1("SetText", &(id, description)).await
+        self.call(SocketRequest::SetText {
+            id: id.into(),
+            description: description.into(),
+        })?
+        .entry()
     }
 
-    /// Reassign an entry to another project.
     pub async fn set_project(&self, id: &str, project_id: &str) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self.call2("SetProject", &(id, project_id)).await?;
-            return Ok(e.into());
-        }
-        self.call1("SetProject", &(id, project_id)).await
+        self.call(SocketRequest::SetProject {
+            id: id.into(),
+            project_id: project_id.into(),
+        })?
+        .entry()
     }
 
-    /// Undo exactly the entry a quick-add created.
     pub async fn undo_quick_add(&self, id: &str) -> Result<(), ClientError> {
-        if self.mode == ApiMode::Typed {
-            return self.call2_unit("UndoQuickAdd", &(id,)).await;
-        }
-        self.proxy
-            .call_method("UndoQuickAdd", &(id,))
-            .await
-            .map(|_| ())
-            .map_err(ClientError::from_bus)
+        self.call(SocketRequest::UndoQuickAdd { id: id.into() })?
+            .unit()
     }
 
-    /// Explicit deletion. The only way an entry is removed on purpose.
     pub async fn delete_entry(&self, id: &str) -> Result<(), ClientError> {
-        if self.mode == ApiMode::Typed {
-            return self.call2_unit("DeleteEntry", &(id,)).await;
-        }
-        self.proxy
-            .call_method("DeleteEntry", &(id,))
-            .await
-            .map(|_| ())
-            .map_err(ClientError::from_bus)
+        self.call(SocketRequest::DeleteEntry { id: id.into() })?
+            .unit()
     }
 
     pub async fn split(&self, id: &str, at_ms: i64) -> Result<(EntryView, EntryView), ClientError> {
-        if self.mode == ApiMode::Typed {
-            let (a, b): (Entry2, Entry2) = self.call2("Split", &(id, at_ms)).await?;
-            return Ok((a.into(), b.into()));
-        }
-        self.call1("Split", &(id, at_ms)).await
+        self.call(SocketRequest::Split {
+            id: id.into(),
+            at_ms,
+        })?
+        .entry_pair()
     }
 
-    /// Merge entries into one spanning the union of their intervals.
-    ///
-    /// The result's duration is the union, so merging *overlapping* entries
-    /// reduces the total by the overlap. Clients must say so before calling.
     pub async fn merge(&self, ids: &[String]) -> Result<EntryView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let e: Entry2 = self.call2("Merge", &ids.to_vec()).await?;
-            return Ok(e.into());
-        }
-        self.call1("Merge", &ids.to_vec()).await
+        self.call(SocketRequest::Merge { ids: ids.to_vec() })?
+            .entry()
     }
 
     // --- projects ---
 
     pub async fn add_project(&self, name: &str) -> Result<ProjectView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let p: Project2 = self.call2("AddProject", &name).await?;
-            return Ok(p.into());
-        }
-        self.call1("AddProject", &name).await
+        self.call(SocketRequest::AddProject { name: name.into() })?
+            .project()
     }
 
     /// Rename and/or recolour a project. Empty `name` keeps the current
-    /// name; `colour` -1 keeps the current colour, -2 clears it, otherwise
-    /// the low 24 bits become the new `0xRRGGBB` (mirrors the service's
-    /// sentinels; an old service reads -2 as "keep").
+    /// name; `colour` -1 keeps, -2 clears (the service's sentinels).
     pub async fn update_project(
         &self,
         id: &str,
         name: &str,
         colour: i64,
     ) -> Result<ProjectView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let p: Project2 = self.call2("UpdateProject", &(id, name, colour)).await?;
-            return Ok(p.into());
-        }
-        self.call1("UpdateProject", &(id, name, colour)).await
+        self.call(SocketRequest::UpdateProject {
+            id: id.into(),
+            name: name.into(),
+            colour,
+        })?
+        .project()
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> Result<ProjectView, ClientError> {
-        if self.mode == ApiMode::Typed {
-            let p: Project2 = self.call2("SetArchived", &(id, archived)).await?;
-            return Ok(p.into());
-        }
-        self.call1("SetArchived", &(id, archived)).await
+        self.call(SocketRequest::SetArchived {
+            id: id.into(),
+            archived,
+        })?
+        .project()
     }
 
     pub async fn delete_project(&self, id: &str) -> Result<(), ClientError> {
-        if self.mode == ApiMode::Typed {
-            return self.call2_unit("DeleteProject", &(id,)).await;
-        }
-        self.proxy
-            .call_method("DeleteProject", &(id,))
-            .await
-            .map(|_| ())
-            .map_err(ClientError::from_bus)
+        self.call(SocketRequest::DeleteProject { id: id.into() })?
+            .unit()
     }
 
-    /// CSV export (REQUIREMENTS §10). `scope` is `week`, `month` or `all`;
-    /// returns the CSV text including the header row.
-    ///
-    /// This stays on the old `ExportCsv` call, anchored at now by the
-    /// service, so it works against both old and new services: current-period
-    /// behaviour never needs the new call.
+    // --- export ---
+
     pub async fn export_csv(&self, scope: &str) -> Result<String, ClientError> {
-        if self.mode == ApiMode::Typed {
-            return self.call2("ExportCsv", &scope).await;
-        }
-        self.call1("ExportCsv", &scope).await
+        self.call(SocketRequest::ExportCsv {
+            scope: scope.into(),
+        })?
+        .csv()
     }
 
-    /// CSV export anchored at `anchor_ms` (REQUIREMENTS §10). `scope` is
-    /// `week`, `month` or `all`; the anchor selects which week or month and
-    /// is ignored by `all`.
-    ///
-    /// Wire compat (per ADR-0001): this speaks the new `ExportCsvAt` call.
-    /// Against an old service the call answers unknown-method/interface,
-    /// which sorts as [`ClientError::VersionMismatch`] — a version message,
-    /// never a wrong file. Current-period callers stay on [`Client::export_csv`]
-    /// (the old `ExportCsv` call), which works against both old and new
-    /// services; only a chosen anchor needs the new call, and only a chosen
-    /// anchor can meet an old service.
     pub async fn export_csv_at(&self, scope: &str, anchor_ms: i64) -> Result<String, ClientError> {
-        if self.mode == ApiMode::Typed {
-            return self.call2("ExportCsvAt", &(scope, anchor_ms)).await;
-        }
-        self.call1("ExportCsvAt", &(scope, anchor_ms)).await
+        self.call(SocketRequest::ExportCsvAt {
+            scope: scope.into(),
+            anchor_ms,
+        })?
+        .csv()
     }
 
-    /// Poll until the service appears on the bus, or give up.
+    pub async fn export_csv_range(&self, from_ms: i64, to_ms: i64) -> Result<String, ClientError> {
+        self.call(SocketRequest::ExportCsvRange { from_ms, to_ms })?
+            .csv()
+    }
+
+    // --- external sources (§19) ---
+
+    pub async fn add_source(
+        &self,
+        kind: &str,
+        locator: &str,
+        project_id: Option<&str>,
+        label: &str,
+    ) -> Result<SourceView, ClientError> {
+        self.call(SocketRequest::AddSource {
+            kind: kind.into(),
+            locator: locator.into(),
+            project_id: project_id.map(str::to_string),
+            label: label.into(),
+        })?
+        .source()
+    }
+
+    pub async fn sources(&self) -> Result<Vec<SourceView>, ClientError> {
+        self.call(SocketRequest::ListSources)?.sources()
+    }
+
+    pub async fn refresh_source(&self, id: Option<&str>) -> Result<RefreshView, ClientError> {
+        self.call(SocketRequest::RefreshSource {
+            id: id.map(str::to_string),
+        })?
+        .refresh()
+    }
+
+    pub async fn suggestions(&self) -> Result<Vec<SuggestionView>, ClientError> {
+        self.call(SocketRequest::ListSuggestions)?.suggestions()
+    }
+
+    pub async fn confirm_suggestion(
+        &self,
+        id: &str,
+        project_id: Option<&str>,
+    ) -> Result<EntryView, ClientError> {
+        self.call(SocketRequest::ConfirmSuggestion {
+            id: id.into(),
+            project_id: project_id.map(str::to_string),
+        })?
+        .entry()
+    }
+
+    pub async fn dismiss_suggestion(&self, id: &str) -> Result<(), ClientError> {
+        self.call(SocketRequest::DismissSuggestion { id: id.into() })?
+            .unit()
+    }
+
+    pub async fn set_note(&self, id: &str, note: Option<&str>) -> Result<EntryView, ClientError> {
+        self.call(SocketRequest::SetNote {
+            id: id.into(),
+            note: note.map(str::to_string),
+        })?
+        .entry()
+    }
+
+    /// Poll until the service answers, or give up.
     ///
-    /// Connecting proves a *bus* is there, not that the service owns the
-    /// name: `Client::connect` is anonymous, so it succeeds with no service
-    /// around. The first method call is what proves the service, so that is
-    /// what this waits for -- otherwise the name and the timeout promised a
-    /// wait the function never did, and a missing service surfaced as a bare
-    /// error from whatever command was being run.
-    ///
-    /// Gives up with the shared "not running" guidance, so every client says
-    /// the same thing about a missing service.
+    /// The first method call is what proves the service, so that is
+    /// what this waits for. One auto-spawn attempt (§16) is made along
+    /// the way: the AppRun script used to be the only thing that ever
+    /// started the service, so a bare CLI launch outside it met a dead
+    /// store. Gives up with the shared "not running" guidance.
     pub async fn wait_for_service(timeout: Duration) -> anyhow::Result<Self> {
         let deadline = std::time::Instant::now() + timeout;
+        let mut spawned = false;
         loop {
-            if let Ok(client) = Client::connect().await {
-                match client.snapshot().await {
-                    Ok(_) => return Ok(client),
-                    // The bus is there and the service is not: wait for it.
-                    Err(ClientError::NoService) => {}
-                    // Any other failure is about this call, not about the
-                    // service being absent: report it as it is.
-                    Err(e) => return Err(anyhow::Error::new(e)),
+            let client = Client::connect().await?;
+            match client.snapshot().await {
+                Ok(_) => return Ok(client),
+                Err(ClientError::NoService) => {
+                    if !spawned {
+                        socket::try_spawn_service();
+                        spawned = true;
+                    }
                 }
+                Err(e) => return Err(anyhow::Error::new(e)),
             }
             if std::time::Instant::now() >= deadline {
                 anyhow::bail!("{}", no_service_hint());
             }
             // `async_io::Timer`, not a tokio sleep: this function runs
-            // inside a program driven by `async_io::block_on` (the CLI and the
-            // TUI), which has no tokio reactor -- a tokio sleep here panicked
-            // with "there is no reactor running" the moment the session bus
-            // was absent, which is exactly when this loop runs.
+            // inside a program driven by `async_io::block_on` (the CLI),
+            // which has no tokio reactor.
             async_io::Timer::after(Duration::from_millis(200)).await;
         }
     }
@@ -1317,11 +820,6 @@ mod tests {
     }
 
     #[test]
-    fn bus_name_matches_object_path_convention() {
-        assert_eq!(OBJECT_PATH, format!("/{}", BUS_NAME.replace('.', "/")));
-    }
-
-    #[test]
     fn duration_needs_no_clock() {
         assert_eq!(entry().duration_ms(), 3_500);
     }
@@ -1368,102 +866,6 @@ mod tests {
         assert_eq!(view.source, EntrySource::QuickAdd);
         assert_eq!(view.duration_ms(), 5);
         assert_eq!(view.note.as_deref(), Some("n"));
-    }
-
-    #[test]
-    fn typed_shapes_round_trip_through_the_views() {
-        // #110: the typed twins differ only where D-Bus has no Option,
-        // and converting there and back must lose nothing — including
-        // a present-but-empty note and an explicit colour.
-        let mut e = entry();
-        e.note = Some(String::new());
-        assert_eq!(EntryView::from(Entry2::from(&e)), e);
-        e.note = None;
-        assert_eq!(EntryView::from(Entry2::from(&e)), e);
-        let p = ProjectView {
-            id: "p1".into(),
-            name: "Work".into(),
-            colour: Some(0x00aa00),
-            archived: true,
-        };
-        assert_eq!(ProjectView::from(Project2::from(&p)), p);
-        let p_none = ProjectView {
-            colour: None,
-            ..p.clone()
-        };
-        assert_eq!(ProjectView::from(Project2::from(&p_none)), p_none);
-    }
-
-    #[test]
-    fn every_service_error_round_trips_through_the_typed_names() {
-        // #110: clients pattern-match refusal variants (tray undo
-        // staleness, GUI recovery), so the typed error names must carry
-        // the same variant and fields, not just a message.
-        use timetrack_core::RuleError as R;
-        let all = [
-            ServiceError::Rule(R::UnknownEntry("e1".into())),
-            ServiceError::Rule(R::UnknownProject("p1".into())),
-            ServiceError::Rule(R::DuplicateProject("Work".into())),
-            ServiceError::Rule(R::BlankProjectName),
-            ServiceError::Rule(R::TextTooLong("project name".into(), 80)),
-            ServiceError::Rule(R::TextHasControlCharacters("description".into())),
-            ServiceError::Rule(R::NegativeDuration),
-            ServiceError::Rule(R::InstantOutOfRange(-5)),
-            ServiceError::Rule(R::LastProject),
-            ServiceError::Rule(R::ProjectHasEntries("p1".into())),
-            ServiceError::Rule(R::InvalidQuickAdd(7)),
-            ServiceError::Rule(R::InvalidMerge("why".into())),
-            ServiceError::Rule(R::NotQuickAdd("e1".into())),
-            ServiceError::UnknownExportScope("daily".into()),
-            ServiceError::Storage("disk sad".into()),
-            ServiceError::Other("misc".into()),
-        ];
-        for err in all {
-            let wire = WireError::from(err.clone());
-            assert!(
-                zbus::DBusError::name(&wire)
-                    .as_str()
-                    .starts_with("org.sequ.timetrack.Error."),
-                "typed name for {err:?}"
-            );
-            assert_eq!(ServiceError::from(wire), err);
-        }
-    }
-
-    #[test]
-    fn a_typed_snapshot_serializes_smaller_than_its_json() {
-        // #110's snapshot sizing, pinned: at a generated multi-thousand
-        // entry workload the typed snapshot must not be *larger* than
-        // the JSON it replaces. (Absolute size is the ADR's measured
-        // argument for keeping the whole snapshot in v2.)
-        let mut snap = Snapshot::default();
-        snap.projects.push(ProjectView {
-            id: "p1".into(),
-            name: "Work".into(),
-            colour: None,
-            archived: false,
-        });
-        for n in 0..2_000 {
-            let mut e = entry();
-            e.id = format!("e{n}");
-            e.description = format!("task {n}");
-            e.started_at = 1_700_000_000_000 + n * 3_600_000;
-            e.ended_at = e.started_at + 1_800_000;
-            snap.entries.push(e);
-        }
-        let json_len = serde_json::to_string(&snap).unwrap().len();
-        let snap2 = Snapshot2::from(&snap);
-        let ctx = zbus::wire::serialized::Context::new(zbus::wire::Endian::Little, 0);
-        let typed = zbus::wire::to_bytes(ctx, &snap2).unwrap();
-        let typed_len = typed.len();
-        // And it comes back identical.
-        let back: Snapshot2 = typed.deserialize().unwrap().0;
-        assert_eq!(back, snap2);
-        assert_eq!(Snapshot::from(back), snap);
-        assert!(
-            typed_len < json_len,
-            "typed {typed_len} must beat json {json_len}"
-        );
     }
 
     #[test]
@@ -1540,9 +942,7 @@ mod tests {
         );
         assert_eq!(
             version_mismatch_hint("GUI"),
-            format!(
-                "The GUI and the service are different versions.\nReinstall whichever one is older so both speak\n{INTERFACE}."
-            )
+            "The GUI and the service are different versions.\nReinstall whichever one is older so both speak\nthe same socket protocol."
         );
         assert!(
             version_mismatch_hint("tray").starts_with("The tray and the service"),
@@ -1580,141 +980,6 @@ mod tests {
     }
 
     #[test]
-    fn service_errors_round_trip_through_the_failed_body() {
-        for e in [
-            ServiceError::Rule(timetrack_core::RuleError::UnknownEntry("e9".into())),
-            ServiceError::UnknownExportScope("bogus".into()),
-            ServiceError::Storage("disk full".into()),
-            ServiceError::Other("some old wording".into()),
-        ] {
-            assert_eq!(ServiceError::from_failed_body(&e.to_failed_body()), e);
-        }
-    }
-
-    #[test]
-    fn an_old_services_plain_text_survives_decoding() {
-        // A service predating the typed errors sends its sentence, not JSON.
-        // Decoding keeps the text verbatim instead of failing.
-        let body = "an entry must not end before it starts";
-        assert_eq!(
-            ServiceError::from_failed_body(body),
-            ServiceError::Other(body.into())
-        );
-    }
-
-    fn failed(name: &str, detail: Option<&str>) -> ClientError {
-        // Mirror of the D-Bus error-name dispatch, without needing a bus:
-        // `from_error_name` is the whole decision.
-        ClientError::from_error_name(name, detail)
-    }
-
-    #[test]
-    fn missing_services_sort_as_no_service() {
-        assert_eq!(
-            failed(
-                "org.freedesktop.DBus.Error.ServiceUnknown",
-                Some("whatever the daemon says")
-            ),
-            ClientError::NoService
-        );
-        assert_eq!(
-            failed("org.freedesktop.DBus.Error.NameHasNoOwner", None),
-            ClientError::NoService
-        );
-    }
-
-    #[test]
-    fn stale_interfaces_sort_as_version_mismatch() {
-        for name in [
-            "org.freedesktop.DBus.Error.UnknownInterface",
-            "org.freedesktop.DBus.Error.UnknownMethod",
-        ] {
-            assert_eq!(
-                failed(name, None),
-                ClientError::VersionMismatch {
-                    name: name.to_string()
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn anchored_export_against_an_old_service_refuses_as_version_mismatch() {
-        // `export_csv_at` speaks the new `ExportCsvAt` call, which an old
-        // service answers with unknown-method/interface. That must sort as a
-        // version refusal — a version message, never a wrong file — while
-        // current-period callers stay on `export_csv` (the old `ExportCsv`
-        // call), which works against both old and new services.
-        for name in [
-            "org.freedesktop.DBus.Error.UnknownInterface",
-            "org.freedesktop.DBus.Error.UnknownMethod",
-        ] {
-            let err = failed(name, None);
-            assert_eq!(
-                err,
-                ClientError::VersionMismatch {
-                    name: name.to_string()
-                },
-                "a chosen anchor against an old service must refuse, not serve now"
-            );
-            assert!(
-                err.to_string().contains("different versions"),
-                "version wording, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn refusals_decode_to_typed_service_errors() {
-        let typed = ServiceError::Rule(timetrack_core::RuleError::LastProject);
-        assert_eq!(
-            failed(
-                "org.freedesktop.DBus.Error.Failed",
-                Some(&typed.to_failed_body())
-            ),
-            ClientError::Service(typed)
-        );
-        // And an old service's sentence arrives intact, as a refusal.
-        assert_eq!(
-            failed(
-                "org.freedesktop.DBus.Error.Failed",
-                Some("a project named 'Work' already exists")
-            ),
-            ClientError::Service(ServiceError::Other(
-                "a project named 'Work' already exists".into()
-            ))
-        );
-    }
-
-    #[test]
-    fn dispatch_keys_on_names_not_on_message_text() {
-        // Adversarial contents: a project literally named after a D-Bus
-        // error must still dispatch as a validation refusal, and a refusal
-        // mentioning the bus must not read as a missing service.
-        let hostile = ServiceError::Rule(timetrack_core::RuleError::DuplicateProject(
-            "org.freedesktop.DBus.Error.UnknownInterface".into(),
-        ));
-        assert!(
-            matches!(
-                failed(
-                    "org.freedesktop.DBus.Error.Failed",
-                    Some(&hostile.to_failed_body())
-                ),
-                ClientError::Service(_)
-            ),
-            "error names inside the message must not steer dispatch"
-        );
-        let legacy = "org.freedesktop.DBus.Error.ServiceUnknown was seen";
-        assert!(
-            matches!(
-                failed("org.freedesktop.DBus.Error.Failed", Some(legacy)),
-                ClientError::Service(_)
-            ),
-            "legacy text mentioning the bus must not read as no-service"
-        );
-    }
-
-    #[test]
     fn client_errors_convert_for_propagating_callers() {
         // Call sites that only use `?` keep working: the wording survives.
         fn propagated() -> anyhow::Result<()> {
@@ -1742,35 +1007,5 @@ mod tests {
         assert_eq!(CALL_TIMEOUT, Duration::from_secs(10));
         assert!(CALL_TIMEOUT >= Duration::from_secs(5));
         assert!(CALL_TIMEOUT <= Duration::from_secs(30));
-    }
-
-    #[test]
-    fn a_timed_out_call_is_a_transport_failure_not_a_hang() {
-        // zbus reports a call that ran out of time as an I/O error with
-        // `ErrorKind::TimedOut`. It must sort as a transport failure, so no
-        // client mistakes it for a missing service or a refusal, and it must
-        // say what happened (issue #43).
-        let err = ClientError::from_bus(zbus::Error::InputOutput(
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into(),
-        ));
-        assert!(
-            matches!(err, ClientError::Transport(_)),
-            "a timeout is a transport failure, got {err:?}"
-        );
-        assert_eq!(err.to_string(), TIMEOUT_WORDING);
-        assert!(
-            !err.to_string().contains("not running"),
-            "a wedged service is not a missing one: {err}"
-        );
-    }
-
-    #[test]
-    fn other_io_failures_keep_their_own_wording() {
-        // Only a timeout gets the timeout wording: a broken socket is a
-        // different problem and keeps the bus's own words.
-        let err = ClientError::from_bus(zbus::Error::InputOutput(
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "socket closed").into(),
-        ));
-        assert_eq!(err.to_string(), "I/O error: socket closed");
     }
 }

@@ -5,7 +5,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-//! Loading and saving the store.
+//! Loading and saving the store — the legacy JSON format (§17).
+//!
+//! Live persistence is SQLite in `timetrack-store`; this module remains
+//! as the import reader (and its writers, which importer tests and test
+//! fakes still use to build fixtures). Nothing in production writes JSON
+//! any more.
 //!
 //! Storage lives in the service, not in the rules: the core stays pure so it
 //! can be tested without a filesystem, and so the CLI never links it.
@@ -357,7 +362,9 @@ impl JsonStore {
                 source,
             })?;
         }
-        let existed = journal.exists();
+        // Only the unix directory-sync below reads this; the underscore
+        // keeps non-unix builds (Windows) warning-free.
+        let _existed = journal.exists();
         let mut line = serde_json::to_string(record).map_err(|e| StorageError::Invalid {
             path: shown.clone(),
             reason: e.to_string(),
@@ -376,7 +383,7 @@ impl JsonStore {
         file.sync_all().map_err(write)?;
         drop(file);
         #[cfg(unix)]
-        if !existed {
+        if !_existed {
             let parent = match self.path.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
                 _ => PathBuf::from("."),

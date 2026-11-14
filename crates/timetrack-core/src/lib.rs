@@ -21,7 +21,10 @@
 //!
 //! `storage` is the one module that touches a filesystem. It is kept out of
 //! `rules` so the rules stay pure, and out of the clients' dependency path so
-//! the CLI never links it.
+//! the CLI never links it. Since §17 it is the *legacy* JSON format: live
+//! persistence is SQLite in `timetrack-store`, and this module remains so
+//! the one-time import replays checkpoint+journal through exactly the
+//! loader v1 used.
 //!
 //! # Timezone
 //!
@@ -38,6 +41,7 @@
 
 pub mod aggregate;
 pub mod export;
+pub mod ics;
 pub mod model;
 pub mod parse;
 pub mod rules;
@@ -49,10 +53,12 @@ pub use aggregate::{
     month_of, month_totals, snapshot_totals, totals_in_day_range, week_totals, ymd_of,
 };
 pub use export::{
-    CSV_HEADER, ExportScope, anchor_day_string, default_export_filename, entries_in_scope,
-    entries_in_scope_at, entry_in_scope, escape_field, export_csv, export_csv_at,
-    format_export_status, format_local_iso8601, month_id, week_id,
+    CSV_HEADER, ExportScope, ImportError, ImportedEntry, anchor_day_string,
+    default_export_filename, entries_in_scope, entries_in_scope_at, entry_in_scope, escape_field,
+    export_csv, export_csv_at, export_csv_between, format_export_status, format_local_iso8601,
+    month_id, parse_export_csv, week_id,
 };
+pub use ics::{ExternalItem, ExternalKind, IcsParse, NotIcs, parse_ics, parse_ics_in_window};
 pub use model::{
     Entry, EntrySource, MAX_DAY, MAX_INSTANT_MS, MIN_DAY, MIN_INSTANT_MS, MS_PER_DAY, Project,
     STORE_VERSION, Store, instant_in_range, local_day_of, local_day_start,
@@ -63,10 +69,10 @@ pub use parse::{
 };
 pub use rules::{
     Counter, Ids, MAX_DESCRIPTION_CHARS, MAX_NOTE_CHARS, MAX_PROJECT_NAME_CHARS, QUICK_ADD_MS,
-    RuleError, RuleResult, create_duration, create_duration_ending, create_entry, create_project,
-    days_exceeding_24h, delete_entry, delete_project, format_merge_delta, merge_entries,
-    merge_shrink_ms, next_project_id, quick_add, set_archived, set_project, set_text, set_times,
-    split_entry, update_project,
+    RuleError, RuleResult, create_duration, create_duration_ending, create_entry,
+    create_entry_from, create_project, days_exceeding_24h, delete_entry, delete_project,
+    format_merge_delta, merge_entries, merge_shrink_ms, next_project_id, quick_add, set_archived,
+    set_project, set_text, set_times, split_entry, update_project,
 };
 pub use storage::{JOURNAL_CHECKPOINT_BYTES, Journal, JsonStore, StorageError, StorageResult};
 pub use tz::{Tz, TzError};

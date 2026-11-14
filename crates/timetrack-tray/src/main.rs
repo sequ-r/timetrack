@@ -1071,7 +1071,7 @@ mod tests {
             ["timetrack-gui", "--foo"]
         );
         assert!(super::gui_argv("[Desktop Entry]\nName=X\n").is_empty());
-        // The shipped entry launches the GUI, not the TUI.
+        // The shipped entry launches the GUI, not the CLI.
         assert_eq!(super::gui_argv(super::DESKTOP_ENTRY), ["timetrack-gui"]);
     }
 

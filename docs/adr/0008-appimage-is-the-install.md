@@ -1,5 +1,7 @@
 # The AppImage is the install
 
+Status: scoped to Linux by [0013](0013-multiplatform-local-socket-ipc.md) — still the whole Linux install story; Windows and macOS get their own packaging under the same per-OS rule.
+
 The GUI, the service and the CLI ship as one file: `build-appimage.sh`
 bundles `timetrack-gui`, `timetrack-service` and `timetrack` into
 `TimeTrack-<arch>.AppImage`, and `release.yml` publishes nothing else.

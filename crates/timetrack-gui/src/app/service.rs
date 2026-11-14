@@ -66,6 +66,10 @@ pub(super) enum Msg {
     UpdateFailed {
         reason: String,
     },
+    /// The pending external suggestions changed (§19). Sent only on
+    /// change, beside the snapshot cadence; a bus-only service simply
+    /// never produces it and the section stays hidden.
+    Suggestions(Vec<timetrack_proto::SuggestionView>),
 }
 
 /// What an export save needs: the typed scope plus the paths and labels
@@ -171,16 +175,21 @@ pub(super) enum Action {
     /// dialog; `path` is the direct-save fallback when no portal answers.
     /// `period_id` feeds the saved status line.
     ExportCsv(ExportRequest),
-    /// Launch the service. From a host build (development only) this asks
-    /// the session bus to activate it, which works when a D-Bus activation
-    /// file is installed by hand; the AppImage starts its bundled service
-    /// on launch, so the bus already owns the name there.
+    /// Launch the service: spawn the sibling `timetrack-service`
+    /// binary (§16 auto-spawn). The AppImage starts its bundled service
+    /// on launch too; socket ownership makes the second copy exit.
     StartService,
     /// Download a confirmed update asset and rename it over the running
     /// AppImage (REQUIREMENTS: only the AppImage updates itself; host
     /// builds never send this). Like the export save, the download runs on
     /// its own thread and reports back over the channel.
     InstallUpdate { url: String, version: String },
+    /// Fetch every external source now (§19). Creates no entries.
+    RefreshSources,
+    /// Confirm a suggestion into an entry on its source's project.
+    ConfirmSuggestion(String),
+    /// Dismiss a suggestion for good.
+    DismissSuggestion(String),
 }
 
 /// What happened to a snapshot offered to the view.
@@ -198,8 +207,8 @@ pub(super) enum Offered {
 /// next refresh falls due.
 ///
 /// The thread waits on the action channel with this as the timeout, so a
-/// command wakes it at once and only an idle channel waits the tick out --
-/// the same shape as the TUI's service loop. Sleeping the whole tick
+/// command wakes it at once and only an idle channel waits the tick out.
+/// Sleeping the whole tick
 /// unconditionally used to leave every click queueing behind whatever was
 /// left of it, which read as the service itself being slow. No snapshot
 /// yet (`None`) means one is due now.
@@ -342,11 +351,15 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
             // the first one is due at once and the first frame is never
             // blank for a whole tick.
             let mut last_refresh: Option<Instant> = None;
+            // The suggestions last sent to the view: refetched beside
+            // each snapshot and forwarded only on change, so an idle
+            // window is not repainted with the same list every tick.
+            let mut last_suggestions: Vec<timetrack_proto::SuggestionView> = Vec::new();
             loop {
                 // Wait for a command, but never longer than until the
                 // next refresh is due: a click reaches the service at
-                // once instead of queueing behind the tick's remainder
-                // (the TUI's service loop waits the same way). zbus reads
+                // once instead of queueing behind the tick's remainder.
+                // zbus reads
                 // the socket on its own executor thread, so blocking here
                 // does not stall the bus. A timeout folds into the drain
                 // loop's "nothing waiting" case below, which falls
@@ -474,11 +487,20 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                                 }
                             }
                         }
+                        Ok(Action::RefreshSources) => {
+                            report(&tx, client.refresh_source(None).await.map(|_| ()));
+                        }
+                        Ok(Action::ConfirmSuggestion(id)) => {
+                            report(&tx, client.confirm_suggestion(&id, None).await.map(|_| ()));
+                        }
+                        Ok(Action::DismissSuggestion(id)) => {
+                            report(&tx, client.dismiss_suggestion(&id).await.map(|_| ()));
+                        }
                         Ok(Action::StartService) => {
-                            // Calling a method is what triggers D-Bus
-                            // activation; `Client::connect` just asks for a
-                            // proxy, so make a real call to force the bus to
-                            // start the service if it can.
+                            // Spawn the sibling binary, then prove it by
+                            // snapshot: the next refresh tick would find
+                            // it anyway, this just answers the click now.
+                            timetrack_proto::socket::try_spawn_service();
                             report(&tx, client.snapshot().await.map(|_| ()));
                         }
                         Ok(Action::InstallUpdate { url, version }) => {
@@ -512,6 +534,15 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                 }
                 match client.snapshot().await {
                     Ok(s) => {
+                        // Suggestions ride the same cadence (§19). A
+                        // bus-only service refuses here every time; that
+                        // is silence, not an error worth a footer.
+                        if let Ok(fresh) = client.suggestions().await
+                            && fresh != last_suggestions
+                        {
+                            last_suggestions = fresh.clone();
+                            let _ = tx.send(Msg::Suggestions(fresh));
+                        }
                         match offer_snapshot(&snapshot_tx, s) {
                             Offered::Queued | Offered::Dropped => {}
                             // The window is gone: nothing left to do.

@@ -252,6 +252,9 @@ fn pending_outcome(action: &Action, snapshot: &Snapshot) -> Option<Option<String
         Action::SetText { .. } => Some("entry text updated".to_string()),
         Action::SplitEntry { .. } => Some("entry split".to_string()),
         Action::MergeEntries { ids } => Some(format!("merged {} entries", ids.len())),
+        Action::RefreshSources => Some("calendars refreshed".to_string()),
+        Action::ConfirmSuggestion(_) => Some("suggestion added".to_string()),
+        Action::DismissSuggestion(_) => Some("suggestion dismissed".to_string()),
     };
     Some(label)
 }
@@ -264,6 +267,9 @@ pub struct TimetrackView {
     rx: Receiver<Msg>,
     actions: Sender<Action>,
     snapshot: Snapshot,
+    /// Pending external suggestions (§19), forwarded by the service
+    /// thread when they change. Empty against a bus-only service.
+    suggestions: Vec<timetrack_proto::SuggestionView>,
     /// Whether any snapshot has arrived yet. Until it has, `snapshot`
     /// is the empty default and the tabs say "Connecting" rather than
     /// drawing it as an empty store (see `show_connecting`).
@@ -338,6 +344,7 @@ impl TimetrackView {
             rx,
             actions,
             snapshot: Snapshot::default(),
+            suggestions: Vec::new(),
             snapshot_received: false,
             status: None,
             pending_outcomes: VecDeque::new(),
@@ -557,6 +564,10 @@ impl TimetrackView {
                         StatusMsg::local(format!("update available: v{version} — U installs it")),
                         &mut changed,
                     );
+                }
+                Ok(Msg::Suggestions(fresh)) => {
+                    self.suggestions = fresh;
+                    changed = true;
                 }
                 Ok(Msg::UpdateCurrent) => {
                     self.update.checked = true;

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/timetrack-core",
+    "crates/timetrack-store",
     "crates/timetrack-proto",
     "crates/timetrack-service",
     "crates/timetrack-cli",
@@ -19,11 +20,21 @@ repository = "https://github.com/sequ-r/timetrack"
 
 [workspace.dependencies]
 timetrack-core = { path = "crates/timetrack-core" }
+timetrack-store = { path = "crates/timetrack-store" }
 timetrack-proto = { path = "crates/timetrack-proto" }
 timetrack-update = { path = "crates/timetrack-update" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Embedded SQLite for the service's store (§17, ADR 0014). `bundled` builds
+# SQLite from the crate so no platform's system library can version-skew
+# against the schema; only `timetrack-store` depends on it, and only the
+# service depends on that.
+rusqlite = { version = "0.42", features = ["bundled"] }
+# Blocking HTTPS with rustls for the two network touches the app makes
+# at all: the AppImage update check and .ics URL fetches (§19). Both run
+# off any async executor; no tokio (see the zbus note below).
+ureq = "3"
 # Our crates are on zbus 6; gpui and ashpd still pull zbus 5, so the two
 # majors coexist in the tree and meet only on the wire. Feature choices
 # here no longer reach gpui's copy, which keeps its own "async-io" backend
@@ -50,8 +61,6 @@ async-io = "2"
 # `timetrack-proto` drive a `SignalStream` without client crates each
 # having to learn a futures crate.
 futures-lite = "2"
-ratatui = "0.30"
-crossterm = "0.29"
 anyhow = "1"
 
 # Upstream gpui, as published from Zed. The community fork (gpui-ce) was only

@@ -102,6 +102,10 @@ fn tray_registers_with_watcher_and_exposes_icon_tooltip() {
         let _tray = ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_timetrack-tray"))
                 .env("DBUS_SESSION_BUS_ADDRESS", &address)
+                // §16: this test's tray must find *no* service -- and, on
+                // a machine where the real one is running, its socket
+                // would happily answer instead of the private bus.
+                .env("TIMETRACK_SOCKET", dir.join("tt.sock"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()

@@ -23,16 +23,27 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use timetrack_proto::{Client, EntrySource};
 
-/// A workspace binary built for the same profile as this test: the test
-/// executable lives in `<profile>/deps/`, so its grandparent is `<profile>/`,
-/// next to every built binary.
+/// A workspace binary built for the same profile as this test.
+///
+/// Cargo does not promise one fixed path for test executables: older layouts
+/// put them under `<profile>/deps/`, while newer CI layouts put them under
+/// `<profile>/build/<package>-<hash>/out/`. Walk up from this executable and
+/// use the first ancestor that actually contains the requested built binary.
 fn workspace_bin(name: &str) -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("test executable path must be known");
-    let profile = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("test executable must live in <profile>/deps");
-    profile.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+    let file_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+
+    for ancestor in exe.ancestors().skip(1) {
+        let candidate = ancestor.join(&file_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    // Preserve a useful path in the assertion if the service was not built.
+    exe.parent()
+        .expect("test executable must have a parent directory")
+        .join(file_name)
 }
 
 /// Wait until the real service answers snapshots on the private bus.
@@ -82,7 +93,7 @@ fn tray_round_trips_against_the_real_service() {
     async_io::block_on(async {
         let dir = std::env::temp_dir().join(format!("timetrack-tray-real-{}", std::process::id()));
         let address = common::start_private_bus(&dir);
-        common::point_at_private_bus(&address);
+        common::point_at_private_bus(&address, &dir);
         let (conn, items) = common::serve_watcher(&address).await;
 
         // A fresh store: the service seeds `General` itself, which is what
@@ -107,16 +118,28 @@ fn tray_round_trips_against_the_real_service() {
                 .expect("could not spawn timetrack-service"),
         );
 
+        // §16: the rig pointed TIMETRACK_SOCKET at the service's private
+        // socket (common::point_at_private_bus), so this whole round
+        // trip -- snapshots, menu clicks, Changed below -- speaks the
+        // socket, with the bus carrying only the tray menu. Connecting
+        // is just naming the socket now; wait_for_service below proves
+        // the bind by snapshot.
         let client = Client::connect()
             .await
-            .expect("must connect to the private bus");
+            .expect("must connect toward the private socket");
         // The seed, through the real wire: one unarchived General, no time.
         let snap = wait_for_service(&client, Duration::from_secs(15)).await;
         assert_eq!(snap.projects.len(), 1);
         assert_eq!(snap.projects[0].name, "General");
         assert!(!snap.projects[0].archived);
         assert!(snap.entries.is_empty());
-        assert!(store_path.exists(), "the service must persist its seed");
+        // §17: the seed persists to the SQLite database beside the legacy
+        // store path the service was given; no JSON store is created.
+        assert!(
+            dir.join("store.db").exists(),
+            "the service must persist its seed to store.db"
+        );
+        assert!(!store_path.exists(), "no JSON store is created any more");
 
         let tray_log = std::fs::File::create(dir.join("tray.log")).unwrap();
         let _tray = ChildGuard(
