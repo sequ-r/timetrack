@@ -21,6 +21,40 @@
 //! Pure like the rest of the core: instants resolve through the shared
 //! parsers in an explicit zone (ADR 0009) — a `TZID` names its own
 //! zone, a floating time takes the caller's.
+//!
+//! # Conformance matrix (#160)
+//!
+//! "Refused" always means the component counts once into
+//! [`IcsParse::skipped`] and yields no occurrences — never a silently
+//! mis-expanded approximation of a rule that was only half read.
+//!
+//! | Construct | Support |
+//! |---|---|
+//! | `VEVENT`/`VTODO` with UID, `DTSTART`, `DTEND`/`DURATION` (or `DUE`) | Supported |
+//! | Date-only (`VALUE=DATE`, all-day) items | Refused |
+//! | `DTSTART` in UTC (`Z`), `TZID` (IANA name), or floating (caller's zone) | Supported |
+//! | Unknown `TZID` | Refused |
+//! | `VTIMEZONE` | Partial: ignored — `TZID`s resolve against the IANA database, so a zone that exists only as a custom `VTIMEZONE` refuses |
+//! | `STATUS:CANCELLED` (single item, series master, or override) | Supported: suggests nothing |
+//! | Components other than `VEVENT`/`VTODO` | Ignored, not counted as skipped |
+//! | `RRULE` with `FREQ=DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY`, `INTERVAL`, `COUNT`, `UNTIL` | Supported |
+//! | `FREQ=HOURLY`/`MINUTELY`/`SECONDLY` | Refused |
+//! | `BYDAY` (ordinals in `MONTHLY`, and in `YEARLY` with `BYMONTH`) | Supported |
+//! | Ordinal `BYDAY` in `YEARLY` without `BYMONTH` (nth weekday of the year) | Refused |
+//! | `BYMONTHDAY`, `BYMONTH` (expanding in `MONTHLY`/`YEARLY`, limiting in `DAILY`/`WEEKLY`) | Supported |
+//! | `BYHOUR`, `BYMINUTE` (`DTSTART`'s seconds are kept) | Supported |
+//! | `BYSETPOS` (within each `FREQ` period: day, week, month, or year) | Supported |
+//! | `BYSECOND`, `BYYEARDAY`, `BYWEEKNO`, unknown `BY*` parts | Refused |
+//! | `WKST=MO` | Supported; any other `WKST` is refused |
+//! | `EXDATE` (date-time lists; unparseable values are ignored) | Supported |
+//! | `RDATE` (date-time lists) | Supported; `VALUE=DATE`/`VALUE=PERIOD` are refused |
+//! | `EXRULE`, more than one `RRULE` | Refused |
+//! | `RECURRENCE-ID` override moving/retitling/resizing one occurrence (including an `RDATE` one) | Supported |
+//! | `RECURRENCE-ID` with `STATUS:CANCELLED` | Supported: the occurrence drops out |
+//! | `RECURRENCE-ID;RANGE=...`, or an override carrying its own `RRULE` | Refused: the whole series counts as skipped |
+//! | Malformed `RECURRENCE-ID` | Partial: that override counts as skipped, the series still expands |
+//! | Override whose master is absent from the same calendar | Partial: the override stands alone as a single occurrence |
+//! | Expansion across DST | Supported: arithmetic runs in the wall clock of `DTSTART`'s zone |
 
 use crate::tz::Tz;
 
@@ -41,8 +75,9 @@ pub struct ExternalItem {
     pub title: String,
     pub started_at: i64,
     pub ended_at: i64,
-    /// The item recurs (`RRULE` present); only its written first
-    /// occurrence is represented here.
+    /// The item belongs to a recurrence set (its component carried an
+    /// `RRULE` or `RDATE`, or it is a `RECURRENCE-ID` override);
+    /// expanded occurrences share the UID.
     pub recurring: bool,
 }
 
@@ -69,15 +104,19 @@ pub fn parse_ics(text: &str, tz: &Tz) -> Result<IcsParse, NotIcs> {
 /// Parse, expanding recurrences (`RRULE`) and keeping only occurrences
 /// overlapping `[from_ms, until_ms)`. Recurrence arithmetic runs in
 /// the wall clock of each item's own zone, so a weekly 10:00 stays
-/// 10:00 across DST. The supported rule subset covers what calendar
-/// UIs actually emit: `FREQ` daily/weekly/monthly/yearly, `INTERVAL`,
+/// 10:00 across DST. The supported subset covers what calendar UIs
+/// actually emit: `FREQ` daily/weekly/monthly/yearly, `INTERVAL`,
 /// `COUNT`, `UNTIL`, `BYDAY` (with month ordinals), `BYMONTHDAY`,
-/// `BYMONTH`, `WKST=MO` (the default week start), and `EXDATE`
-/// exclusions. Anything else in the rule — another `FREQ`, `BYSETPOS`,
-/// `BYHOUR`, `BYMINUTE`, `BYSECOND`, `BYYEARDAY`, `BYWEEKNO`, a
-/// non-Monday `WKST`, an unknown `BY*` part, or a malformed token —
-/// refuses the whole component into [`IcsParse::skipped`], never
-/// silently mis-expanding an ignored rule into wrong occurrences.
+/// `BYMONTH`, `BYHOUR`, `BYMINUTE`, `BYSETPOS`, `WKST=MO` (the default
+/// week start), `EXDATE` exclusions, `RDATE` additions, and
+/// `RECURRENCE-ID` overrides of single occurrences (a cancelled
+/// override drops its occurrence; components sharing a UID expand as
+/// one series). Anything else — another `FREQ`, `BYSECOND`,
+/// `BYYEARDAY`, `BYWEEKNO`, a non-Monday `WKST`, an unknown `BY*`
+/// part, `EXRULE`, a `RANGE` override, or a malformed token — refuses
+/// the whole component into [`IcsParse::skipped`], never silently
+/// mis-expanding an ignored rule into wrong occurrences. The module
+/// documentation carries the full conformance matrix.
 pub fn parse_ics_in_window(
     text: &str,
     tz: &Tz,
@@ -91,8 +130,8 @@ pub fn parse_ics_in_window(
     {
         return Err(NotIcs);
     }
-    let mut out = IcsParse::default();
-    let mut current: Option<(ExternalKind, Vec<Prop>)> = None;
+    let mut components: Vec<Component> = Vec::new();
+    let mut current: Option<Component> = None;
     for line in &lines {
         if let Some(rest) = strip_prefix_ci(line, "BEGIN:") {
             match rest.trim().to_ascii_uppercase().as_str() {
@@ -105,12 +144,9 @@ pub fn parse_ics_in_window(
         if let Some(rest) = strip_prefix_ci(line, "END:") {
             let ends = rest.trim().to_ascii_uppercase();
             if (ends == "VEVENT" || ends == "VTODO")
-                && let Some((kind, props)) = current.take()
+                && let Some(component) = current.take()
             {
-                match items_from_props(kind, &props, tz, from_ms, until_ms) {
-                    Some(items) => out.items.extend(items),
-                    None => out.skipped += 1,
-                }
+                components.push(component);
             }
             continue;
         }
@@ -120,7 +156,176 @@ pub fn parse_ics_in_window(
             props.push(prop);
         }
     }
+    // Group by (UID, kind) in first-appearance order: a master and its
+    // RECURRENCE-ID overrides share a UID and must expand as one
+    // series, wherever in the file each component sits.
+    let mut out = IcsParse::default();
+    let mut order: Vec<(String, bool)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, bool), Vec<&Component>> =
+        std::collections::HashMap::new();
+    for component in &components {
+        let Some(uid) = component_uid(&component.1) else {
+            out.skipped += 1;
+            continue;
+        };
+        let key = (uid, matches!(component.0, ExternalKind::Event));
+        let members = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            Vec::new()
+        });
+        members.push(component);
+    }
+    for key in &order {
+        emit_group(&groups[key], tz, from_ms, until_ms, &mut out);
+    }
     Ok(out)
+}
+
+/// One `VEVENT`/`VTODO` component and its properties.
+type Component = (ExternalKind, Vec<Prop>);
+
+/// A component's dedupe identity; absent or blank means the component
+/// cannot be a suggestion or part of a series at all.
+fn component_uid(props: &[Prop]) -> Option<String> {
+    let uid = get(props, "UID")?.value.trim().to_string();
+    (!uid.is_empty()).then_some(uid)
+}
+
+/// Expand one UID group into `out`. A lone component (the common case)
+/// and groups with no single master to resolve overrides against keep
+/// the per-component behavior; exactly one master plus
+/// `RECURRENCE-ID` overrides expands as one series, each override
+/// replacing — or, when cancelled, dropping — its occurrence.
+fn emit_group(members: &[&Component], tz: &Tz, from_ms: i64, until_ms: i64, out: &mut IcsParse) {
+    let standalone = |members: &[&Component], out: &mut IcsParse| {
+        for (kind, props) in members {
+            match items_from_props(*kind, props, tz, from_ms, until_ms) {
+                Some(items) => out.items.extend(items),
+                None => out.skipped += 1,
+            }
+        }
+    };
+    let (masters, overrides): (Vec<&Component>, Vec<&Component>) = members
+        .iter()
+        .partition(|(_, props)| get(props, "RECURRENCE-ID").is_none());
+    if overrides.is_empty() || masters.len() != 1 {
+        standalone(members, out);
+        return;
+    }
+    // A RANGE override or an override with its own rule rewrites every
+    // later occurrence, which this subset cannot expand: refuse the
+    // whole series rather than keep suggesting the old times.
+    if overrides
+        .iter()
+        .any(|(_, props)| override_refuses_series(props))
+    {
+        out.skipped += members.len();
+        return;
+    }
+    let (master_kind, master_props) = masters[0];
+    let Some(base) = parse_base(master_props, tz) else {
+        out.skipped += 1;
+        standalone(&overrides, out);
+        return;
+    };
+    if status_cancelled(master_props) {
+        return; // The whole series is cancelled; overrides are moot.
+    }
+    let Some((mut starts, recurring)) = occurrence_starts(master_props, &base, tz, until_ms) else {
+        out.skipped += 1;
+        standalone(&overrides, out);
+        return;
+    };
+    // Resolve overrides by the instant they replace, in the master's
+    // zone (their own TZID/Z form still wins inside prop_instant). A
+    // malformed RECURRENCE-ID cannot name its occurrence: count that
+    // override as skipped but keep the series. Last one wins.
+    let zone = base.zone.clone();
+    let mut by_rid: std::collections::HashMap<i64, &Component> = std::collections::HashMap::new();
+    for component in &overrides {
+        let rid = get(&component.1, "RECURRENCE-ID").expect("partitioned on it");
+        match prop_instant(rid, &zone) {
+            Some(instant) => {
+                by_rid.insert(instant, component);
+            }
+            None => out.skipped += 1,
+        }
+    }
+    starts.retain(|s| !by_rid.contains_key(s));
+    let duration = base.ended - base.started;
+    let mut items: Vec<ExternalItem> = starts
+        .into_iter()
+        .filter(|s| *s < until_ms && *s + duration > from_ms)
+        .map(|s| ExternalItem {
+            uid: base.uid.clone(),
+            kind: *master_kind,
+            title: base.title.clone(),
+            started_at: s,
+            ended_at: s + duration,
+            recurring,
+        })
+        .collect();
+    for (kind, props) in by_rid.values() {
+        if status_cancelled(props) {
+            continue; // This occurrence simply does not happen.
+        }
+        match override_item(*kind, props, &base, tz) {
+            Some(item) if item.started_at < until_ms && item.ended_at > from_ms => {
+                items.push(item);
+            }
+            Some(_) => {}
+            None => out.skipped += 1,
+        }
+    }
+    items.sort_by_key(|i| i.started_at);
+    out.items.extend(items);
+}
+
+/// Whether an override rewrites more than its own occurrence (a
+/// `RANGE` parameter or a rule of its own), which refuses its series.
+fn override_refuses_series(props: &[Prop]) -> bool {
+    if get(props, "RRULE").is_some() || get(props, "EXRULE").is_some() {
+        return true;
+    }
+    get(props, "RECURRENCE-ID").is_some_and(|rid| rid.param("RANGE").is_some())
+}
+
+/// One override as its own item: its written interval and summary,
+/// inheriting the master's duration and summary where it omits them.
+fn override_item(
+    kind: ExternalKind,
+    props: &[Prop],
+    master: &Base,
+    tz: &Tz,
+) -> Option<ExternalItem> {
+    let started = prop_instant(get(props, "DTSTART")?, tz)?;
+    let writes_end = ["DTEND", "DURATION", "DUE"]
+        .iter()
+        .any(|name| get(props, name).is_some());
+    let ended = match interval_end(props, tz, started) {
+        Some(end) => end,
+        // No end of its own: keep the master's duration. A written
+        // but unparseable end refuses the override instead.
+        None if !writes_end => started + (master.ended - master.started),
+        None => return None,
+    };
+    if ended <= started || !crate::instant_in_range(started) || !crate::instant_in_range(ended) {
+        return None;
+    }
+    let title =
+        get(props, "SUMMARY").map_or_else(|| master.title.clone(), |p| unescape_text(&p.value));
+    Some(ExternalItem {
+        uid: master.uid.clone(),
+        kind,
+        title,
+        started_at: started,
+        ended_at: ended,
+        recurring: true,
+    })
+}
+
+fn status_cancelled(props: &[Prop]) -> bool {
+    get(props, "STATUS").is_some_and(|p| p.value.trim().eq_ignore_ascii_case("CANCELLED"))
 }
 
 fn strip_prefix_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -196,51 +401,52 @@ fn unescape_text(value: &str) -> String {
     out.trim().to_string()
 }
 
-fn items_from_props(
-    kind: ExternalKind,
-    props: &[Prop],
-    tz: &Tz,
-    from_ms: i64,
-    until_ms: i64,
-) -> Option<Vec<ExternalItem>> {
-    let uid = get(props, "UID")?.value.trim().to_string();
-    if uid.is_empty() {
-        return None;
+/// A component's written first interval: what every expanded
+/// occurrence is a copy of.
+struct Base {
+    uid: String,
+    title: String,
+    started: i64,
+    ended: i64,
+    /// The wall-clock zone of `DTSTART`.
+    zone: Tz,
+}
+
+/// The end a component writes for an interval starting at `started`:
+/// `DTEND`, else `DURATION`, else a task's `DUE`.
+fn interval_end(props: &[Prop], tz: &Tz, started: i64) -> Option<i64> {
+    match get(props, "DTEND") {
+        Some(p) => prop_instant(p, tz),
+        None => match get(props, "DURATION") {
+            Some(p) => Some(started + parse_duration_ms(&p.value)?),
+            None => prop_instant(get(props, "DUE")?, tz),
+        },
     }
+}
+
+fn parse_base(props: &[Prop], tz: &Tz) -> Option<Base> {
+    let uid = component_uid(props)?;
     let dtstart = get(props, "DTSTART")?;
     let started = prop_instant(dtstart, tz)?;
-    let ended = match get(props, "DTEND") {
-        Some(p) => prop_instant(p, tz)?,
-        None => match get(props, "DURATION") {
-            Some(p) => started + parse_duration_ms(&p.value)?,
-            None => {
-                let p = get(props, "DUE")?;
-                prop_instant(p, tz)?
-            }
-        },
-    };
+    let ended = interval_end(props, tz, started)?;
     if ended <= started || !crate::instant_in_range(started) || !crate::instant_in_range(ended) {
         return None;
     }
     let title = get(props, "SUMMARY").map_or_else(String::new, |p| unescape_text(&p.value));
-    let duration = ended - started;
-    let overlaps = |s: i64| s < until_ms && s + duration > from_ms;
-    let Some(rrule) = get(props, "RRULE") else {
-        return Some(if overlaps(started) {
-            vec![ExternalItem {
-                uid,
-                kind,
-                title,
-                started_at: started,
-                ended_at: ended,
-                recurring: false,
-            }]
-        } else {
-            Vec::new()
-        });
-    };
     let zone = prop_zone(dtstart, tz);
-    let mut excluded: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    Some(Base {
+        uid,
+        title,
+        started,
+        ended,
+        zone,
+    })
+}
+
+/// All `EXDATE` instants of a component. Unparseable values are
+/// ignored (the occurrence they meant to drop simply stays).
+fn excluded_starts(props: &[Prop], tz: &Tz) -> std::collections::HashSet<i64> {
+    let mut excluded = std::collections::HashSet::new();
     for p in props.iter().filter(|p| p.name == "EXDATE") {
         for v in p.value.split(',') {
             let clone = Prop {
@@ -253,21 +459,98 @@ fn items_from_props(
             }
         }
     }
-    // An unsupported or malformed rule refuses the component (it
-    // counts as skipped by the caller) instead of expanding to
-    // occurrences the rule never described.
-    let starts = expand_recurrence(&rrule.value, started, &zone, until_ms)?;
+    excluded
+}
+
+/// All `RDATE` instants of a component, strictly: a date-only or
+/// `PERIOD` value, or any unparseable token, refuses the component
+/// rather than silently dropping occurrences the calendar asked for.
+fn rdate_starts(props: &[Prop], tz: &Tz) -> Option<Vec<i64>> {
+    let mut starts = Vec::new();
+    for p in props.iter().filter(|p| p.name == "RDATE") {
+        if p.param("VALUE")
+            .is_some_and(|v| !v.eq_ignore_ascii_case("DATE-TIME"))
+        {
+            return None;
+        }
+        for v in p.value.split(',') {
+            let v = v.trim();
+            if v.contains('/') {
+                return None; // A PERIOD, whatever VALUE claims.
+            }
+            let clone = Prop {
+                name: "RDATE".into(),
+                params: p.params.clone(),
+                value: v.to_string(),
+            };
+            let instant = prop_instant(&clone, tz)?;
+            if !crate::instant_in_range(instant) {
+                return None;
+            }
+            starts.push(instant);
+        }
+    }
+    Some(starts)
+}
+
+/// The occurrence starts a component describes — `RRULE` expansion
+/// plus `RDATE`, minus `EXDATE`, ascending and capped — and whether
+/// they form a recurrence set. An unsupported or malformed rule
+/// refuses the component (it counts as skipped by the caller) instead
+/// of expanding to occurrences the rule never described.
+fn occurrence_starts(
+    props: &[Prop],
+    base: &Base,
+    tz: &Tz,
+    until_ms: i64,
+) -> Option<(Vec<i64>, bool)> {
+    if get(props, "EXRULE").is_some() || props.iter().filter(|p| p.name == "RRULE").count() > 1 {
+        return None;
+    }
+    let rdates = rdate_starts(props, tz)?;
+    let excluded = excluded_starts(props, tz);
+    let (mut starts, recurring) = match get(props, "RRULE") {
+        Some(rrule) => (
+            expand_recurrence(&rrule.value, base.started, &base.zone, until_ms)?,
+            true,
+        ),
+        None => (vec![base.started], !rdates.is_empty()),
+    };
+    starts.extend(rdates);
+    starts.sort_unstable();
+    starts.dedup();
+    starts.retain(|s| !excluded.contains(s));
+    starts.truncate(MAX_OCCURRENCES);
+    Some((starts, recurring))
+}
+
+fn items_from_props(
+    kind: ExternalKind,
+    props: &[Prop],
+    tz: &Tz,
+    from_ms: i64,
+    until_ms: i64,
+) -> Option<Vec<ExternalItem>> {
+    let base = parse_base(props, tz)?;
+    if status_cancelled(props) {
+        return Some(Vec::new());
+    }
+    // A standalone RECURRENCE-ID component (its master lives
+    // elsewhere) is one occurrence of a series, marked as such.
+    let standalone_override = get(props, "RECURRENCE-ID").is_some();
+    let (starts, recurring) = occurrence_starts(props, &base, tz, until_ms)?;
+    let duration = base.ended - base.started;
     Some(
         starts
             .into_iter()
-            .filter(|s| overlaps(*s) && !excluded.contains(s))
+            .filter(|s| *s < until_ms && *s + duration > from_ms)
             .map(|s| ExternalItem {
-                uid: uid.clone(),
+                uid: base.uid.clone(),
                 kind,
-                title: title.clone(),
+                title: base.title.clone(),
                 started_at: s,
                 ended_at: s + duration,
-                recurring: true,
+                recurring: recurring || standalone_override,
             })
             .collect(),
     )
@@ -305,6 +588,25 @@ struct RRule {
     byday: Vec<(Option<i64>, i64)>, // (ordinal, Mon=0 weekday)
     bymonthday: Vec<i64>,
     bymonth: Vec<u32>,
+    byhour: Vec<u32>,
+    byminute: Vec<u32>,
+    bysetpos: Vec<i64>,
+}
+
+/// A comma-separated list of small unsigned numbers in `lo..=hi`,
+/// sorted and deduped; anything else refuses the rule.
+fn parse_num_list(value: &str, lo: u32, hi: u32) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for n in value.split(',') {
+        let m: u32 = n.trim().parse().ok()?;
+        if !(lo..=hi).contains(&m) {
+            return None;
+        }
+        out.push(m);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
 }
 
 fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
@@ -317,6 +619,9 @@ fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
         byday: Vec::new(),
         bymonthday: Vec::new(),
         bymonth: Vec::new(),
+        byhour: Vec::new(),
+        byminute: Vec::new(),
+        bysetpos: Vec::new(),
     };
     let mut have_freq = false;
     for part in value.split(';') {
@@ -406,19 +711,27 @@ fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
                 rule.bymonthday = days;
             }
             "BYMONTH" => {
-                let mut months = Vec::new();
+                // Sorted so YEARLY expansion stays chronological
+                // (and COUNT counts in occurrence order).
+                rule.bymonth = parse_num_list(val, 1, 12)?;
+            }
+            "BYHOUR" => rule.byhour = parse_num_list(val, 0, 23)?,
+            "BYMINUTE" => rule.byminute = parse_num_list(val, 0, 59)?,
+            "BYSETPOS" => {
+                let mut positions = Vec::new();
                 for n in val.split(',') {
-                    let m: u32 = n.trim().parse().ok()?;
-                    if !(1..=12).contains(&m) {
+                    let p: i64 = n.trim().parse().ok()?;
+                    // RFC 5545 positions run 1..=366 from either end.
+                    if p == 0 || p.abs() > 366 {
                         return None;
                     }
-                    months.push(m);
+                    positions.push(p);
                 }
-                rule.bymonth = months;
+                rule.bysetpos = positions;
             }
             // Supported explicitly as "refused": the subset has no
             // expansion for these, so their presence vetoes the rule.
-            "BYSETPOS" | "BYHOUR" | "BYMINUTE" | "BYSECOND" | "BYYEARDAY" | "BYWEEKNO" => {
+            "BYSECOND" | "BYYEARDAY" | "BYWEEKNO" => {
                 return None;
             }
             "WKST" => {
@@ -436,7 +749,19 @@ fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
             }
         }
     }
-    have_freq.then_some(rule)
+    if !have_freq {
+        return None;
+    }
+    // An ordinal BYDAY in a YEARLY rule without BYMONTH counts from
+    // the year's start (the 20th Monday of the year), not within a
+    // month; the month-wise expansion below cannot express that.
+    if rule.freq == Freq::Yearly
+        && rule.bymonth.is_empty()
+        && rule.byday.iter().any(|(ord, _)| ord.is_some())
+    {
+        return None;
+    }
+    Some(rule)
 }
 
 /// Monday-based weekday of a day index (day 0 was a Thursday).
@@ -491,6 +816,203 @@ fn month_candidates(rule: &RRule, year: i64, month: u32, base_day: i64, zone: &T
     days
 }
 
+/// Whether a day passes the rule's month-level limits (`BYMONTH`,
+/// `BYMONTHDAY`), which limit `DAILY`/`WEEKLY` rules.
+fn day_matches_month_limits(rule: &RRule, day: i64) -> bool {
+    let (year, month, dom) = crate::ymd_of(day);
+    if !rule.bymonth.is_empty() && !rule.bymonth.contains(&month) {
+        return false;
+    }
+    if !rule.bymonthday.is_empty() {
+        let len = crate::days_in_month(year, month);
+        let dom = i64::from(dom);
+        let hits = rule
+            .bymonthday
+            .iter()
+            .any(|md| dom == if *md > 0 { *md } else { len + md + 1 });
+        if !hits {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a day passes a `DAILY` rule's `BYDAY` limit (the weekday
+/// matches; ordinals mean nothing below `MONTHLY` and are ignored,
+/// as in the `WEEKLY` expansion).
+fn day_matches_byday_limit(rule: &RRule, day: i64) -> bool {
+    rule.byday.is_empty() || rule.byday.iter().any(|(_, wd)| weekday_mon(day) == *wd)
+}
+
+/// One rule's expansion in progress. Occurrences are built a `FREQ`
+/// period at a time — the day, week, month, or year the rule steps
+/// over — because `BYSETPOS` picks positions within a whole period's
+/// candidate set, so a period must be complete before any of it can
+/// count toward `COUNT`.
+struct Expander<'a> {
+    rule: &'a RRule,
+    zone: &'a Tz,
+    started: i64,
+    until_ms: i64,
+    hours: Vec<i64>,
+    minutes: Vec<i64>,
+    /// `DTSTART`'s sub-minute piece of day, kept for every occurrence
+    /// (`BYSECOND` is refused, so nothing may replace it).
+    sec_ms: i64,
+    out: Vec<i64>,
+    generated: usize,
+    /// Candidate instants built so far, selected or not.
+    candidates: usize,
+}
+
+impl Expander<'_> {
+    /// Every wall-clock instant a candidate day holds: `DTSTART`'s
+    /// time of day, or the `BYHOUR` × `BYMINUTE` cross product when
+    /// the rule names them. Anchored at the day's local midnight, so
+    /// DST transitions move the UTC instant, not the shown time; on
+    /// the transition day itself the offset changes mid-day, so each
+    /// instant resolves as a wall clock instead.
+    fn day_instants(&self, day: i64, into: &mut Vec<i64>) {
+        let midnight = self.zone.day_start(day);
+        let steady = self.zone.offset_at_ms(midnight)
+            == self.zone.offset_at_ms(self.zone.day_start(day + 1) - 1);
+        for hour in &self.hours {
+            for minute in &self.minutes {
+                let tod = hour * 3_600_000 + minute * 60_000 + self.sec_ms;
+                into.push(if steady {
+                    midnight + tod
+                } else {
+                    wall_instant(self.zone, day, tod)
+                });
+            }
+        }
+    }
+
+    /// Whether a period opening on `first_day` — and, periods
+    /// ascending, every later one — lies past the rule's `UNTIL` and
+    /// the window, so expansion can stop. Checked even for periods
+    /// whose filters select nothing, which would otherwise never
+    /// reach a terminator.
+    fn beyond(&self, first_day: i64) -> bool {
+        if self.rule.until_day.is_some_and(|d| first_day > d) {
+            return true;
+        }
+        let opens = self.zone.day_start(first_day);
+        opens >= self.until_ms || self.rule.until_instant.is_some_and(|u| opens > u)
+    }
+
+    /// One selected instant against `UNTIL`, the window, and the
+    /// caps. Returns false once expansion must stop entirely.
+    fn consider(&mut self, instant: i64) -> bool {
+        if instant < self.started {
+            return true;
+        }
+        if self
+            .rule
+            .until_day
+            .is_some_and(|d| self.zone.day_of(instant) > d)
+        {
+            return false;
+        }
+        if self.rule.until_instant.is_some_and(|u| instant > u) {
+            return false;
+        }
+        if instant >= self.until_ms {
+            // Occurrences ascend, so nothing later re-enters the window.
+            return false;
+        }
+        if self.rule.count.is_some_and(|cap| self.generated >= cap) {
+            return false;
+        }
+        self.generated += 1;
+        self.out.push(instant);
+        self.generated < MAX_OCCURRENCES
+    }
+
+    /// Feed one period of ascending candidate days: build its
+    /// instants from `DTSTART` onward, let `BYSETPOS` pick, then run
+    /// the selection through [`Expander::consider`]. Returns false
+    /// once expansion must stop entirely.
+    fn period(&mut self, days: &[i64]) -> bool {
+        let Some(first) = days.first() else {
+            return true;
+        };
+        if self.beyond(*first) {
+            return false;
+        }
+        let mut instants = Vec::new();
+        for day in days {
+            self.day_instants(*day, &mut instants);
+        }
+        self.candidates += instants.len();
+        if self.candidates > MAX_CANDIDATES {
+            return false;
+        }
+        // The recurrence set opens at DTSTART: earlier instants of the
+        // first period neither occur nor take a BYSETPOS position.
+        instants.retain(|i| *i >= self.started);
+        instants.sort_unstable();
+        instants.dedup();
+        let selected: Vec<i64> = if self.rule.bysetpos.is_empty() {
+            instants
+        } else {
+            let mut picked = Vec::new();
+            for pos in &self.rule.bysetpos {
+                let idx = if *pos > 0 {
+                    *pos - 1
+                } else {
+                    instants.len() as i64 + *pos
+                };
+                if let Some(instant) = usize::try_from(idx).ok().and_then(|i| instants.get(i)) {
+                    picked.push(*instant);
+                }
+            }
+            picked.sort_unstable();
+            picked.dedup();
+            picked
+        };
+        for instant in selected {
+            if !self.consider(instant) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The instant at local wall-clock time `tod_ms` into `day` in
+/// `zone`, on a day whose UTC offset changes. Iterates
+/// `instant + offset == wall` to a fixed point like
+/// [`Tz::day_start`] does for midnight; a repeated fall-back time
+/// reads as its first occurrence and a skipped spring-forward time
+/// with the offset before the gap (RFC 5545 §3.3.5).
+fn wall_instant(zone: &Tz, day: i64, tod_ms: i64) -> i64 {
+    let naive = day.saturating_mul(86_400_000).saturating_add(tod_ms);
+    let mut t = naive - zone.offset_at_ms(naive);
+    for _ in 0..4 {
+        let next = naive - zone.offset_at_ms(t);
+        if next == t {
+            let earlier = naive - zone.offset_at_ms(t - 3_600_000);
+            if earlier < t && earlier + zone.offset_at_ms(earlier) == naive {
+                return earlier;
+            }
+            return t;
+        }
+        t = next;
+    }
+    naive - zone.offset_at_ms(zone.day_start(day))
+}
+
+/// Safety bound on daily/weekly period walks (monthly/yearly keep
+/// their own): a rule whose filters never select — so the generation
+/// cap never bites — still ends.
+const MAX_PERIODS: i64 = 10_000;
+
+/// Safety bound on candidate instants built per rule: a pathological
+/// `BYHOUR`×`BYMINUTE` cross product in every period must not turn
+/// one fetch into unbounded work either.
+const MAX_CANDIDATES: usize = 100_000;
+
 /// All occurrence starts for a rule, ascending, capped. The base
 /// occurrence is in the zone's wall clock (`day_start + time-of-day`),
 /// so DST transitions move the UTC instant, not the shown time.
@@ -498,52 +1020,44 @@ fn expand_recurrence(rule_text: &str, started: i64, zone: &Tz, until_ms: i64) ->
     let rule = parse_rrule(rule_text, zone)?;
     let base_day = zone.day_of(started);
     let tod = started - zone.day_start(base_day);
-    let mut out: Vec<i64> = Vec::new();
-    let mut generated = 0usize;
-    let consider = |day: i64, out: &mut Vec<i64>, generated: &mut usize| -> bool {
-        // Returns false once expansion must stop entirely.
-        if day < base_day {
-            return true;
-        }
-        if let Some(until_day) = rule.until_day
-            && day > until_day
-        {
-            return false;
-        }
-        let instant = zone.day_start(day) + tod;
-        if instant < started {
-            return true;
-        }
-        if let Some(until) = rule.until_instant
-            && instant > until
-        {
-            return false;
-        }
-        if instant >= until_ms {
-            // Occurrences ascend, so nothing later re-enters the window.
-            return false;
-        }
-        if let Some(cap) = rule.count
-            && *generated >= cap
-        {
-            return false;
-        }
-        *generated += 1;
-        out.push(instant);
-        *generated < MAX_OCCURRENCES
+    let mut exp = Expander {
+        hours: if rule.byhour.is_empty() {
+            vec![tod / 3_600_000]
+        } else {
+            rule.byhour.iter().map(|h| i64::from(*h)).collect()
+        },
+        minutes: if rule.byminute.is_empty() {
+            vec![(tod % 3_600_000) / 60_000]
+        } else {
+            rule.byminute.iter().map(|m| i64::from(*m)).collect()
+        },
+        sec_ms: tod % 60_000,
+        rule: &rule,
+        zone,
+        started,
+        until_ms,
+        out: Vec::new(),
+        generated: 0,
+        candidates: 0,
     };
 
     match rule.freq {
         Freq::Daily => {
             let mut day = base_day;
+            let mut periods = 0i64;
             loop {
-                if !consider(day, &mut out, &mut generated)
-                    || out.len() + generated > MAX_OCCURRENCES && rule.count.is_none()
+                if exp.beyond(day) {
+                    break;
+                }
+                if day_matches_month_limits(&rule, day)
+                    && day_matches_byday_limit(&rule, day)
+                    && !exp.period(&[day])
                 {
                     break;
                 }
                 day += rule.interval;
-                if generated >= MAX_OCCURRENCES && rule.count.is_none() {
+                periods += 1;
+                if periods > MAX_PERIODS {
                     break;
                 }
             }
@@ -560,65 +1074,95 @@ fn expand_recurrence(rule_text: &str, started: i64, zone: &Tz, until_ms: i64) ->
             };
             let week0 = base_day - base_wd;
             let mut week = 0i64;
-            'outer: loop {
-                for wd in &weekdays {
-                    let day = week0 + week * 7 * rule.interval + wd;
-                    if !consider(day, &mut out, &mut generated) {
-                        break 'outer;
-                    }
-                    if generated >= MAX_OCCURRENCES && rule.count.is_none() {
-                        break 'outer;
-                    }
+            loop {
+                let monday = week0 + week * 7 * rule.interval;
+                if exp.beyond(monday) {
+                    break;
+                }
+                let days: Vec<i64> = weekdays
+                    .iter()
+                    .map(|wd| monday + wd)
+                    .filter(|day| day_matches_month_limits(&rule, *day))
+                    .collect();
+                if !exp.period(&days) {
+                    break;
                 }
                 week += 1;
+                if week > MAX_PERIODS {
+                    break;
+                }
             }
         }
-        Freq::Monthly | Freq::Yearly => {
+        Freq::Monthly => {
             let (base_y, base_m, _) = crate::ymd_of(base_day);
             let base_month_idx = base_y * 12 + (base_m as i64 - 1);
             let mut step = 0i64;
-            'outer: loop {
-                let months: Vec<(i64, u32)> = if rule.freq == Freq::Monthly {
-                    let idx = base_month_idx + step * rule.interval;
-                    vec![(idx.div_euclid(12), (idx.rem_euclid(12) + 1) as u32)]
-                } else {
-                    let year = base_y + step * rule.interval;
-                    let list = if rule.bymonth.is_empty() {
-                        vec![base_m]
-                    } else {
-                        rule.bymonth.clone()
-                    };
-                    list.into_iter().map(|m| (year, m)).collect()
+            loop {
+                let idx = base_month_idx + step * rule.interval;
+                let (year, month) = (idx.div_euclid(12), (idx.rem_euclid(12) + 1) as u32);
+                let Some(first) = first_day_of_month(year, month, zone) else {
+                    break;
                 };
-                for (y, m) in months {
-                    if rule.freq == Freq::Monthly
-                        && !rule.bymonth.is_empty()
-                        && !rule.bymonth.contains(&m)
-                    {
-                        continue;
-                    }
-                    for day in month_candidates(&rule, y, m, base_day, zone) {
-                        if !consider(day, &mut out, &mut generated) {
-                            break 'outer;
-                        }
-                        if generated >= MAX_OCCURRENCES && rule.count.is_none() {
-                            break 'outer;
-                        }
+                if exp.beyond(first) {
+                    break;
+                }
+                // BYMONTH limits a MONTHLY rule: a stepped-over month
+                // outside it simply holds no occurrence.
+                if rule.bymonth.is_empty() || rule.bymonth.contains(&month) {
+                    let days = month_candidates(&rule, year, month, base_day, zone);
+                    if !exp.period(&days) {
+                        break;
                     }
                 }
                 step += 1;
-                // Safety: a rule whose candidates never reach the window
-                // or a terminator still ends at the generation cap; bound
-                // the month walk itself so pathological filters can't spin.
+                // Safety: a rule whose candidates never reach the
+                // window or a terminator still ends at the generation
+                // cap; bound the month walk itself so pathological
+                // filters can't spin.
+                if step > 1200 {
+                    break;
+                }
+            }
+        }
+        Freq::Yearly => {
+            let (base_y, base_m, _) = crate::ymd_of(base_day);
+            // BYMONTH expands a YEARLY rule; with day-level BY parts
+            // but no BYMONTH, they expand across the whole year.
+            let months: Vec<u32> = if !rule.bymonth.is_empty() {
+                rule.bymonth.clone()
+            } else if rule.byday.is_empty() && rule.bymonthday.is_empty() {
+                vec![base_m]
+            } else {
+                (1..=12).collect()
+            };
+            let mut step = 0i64;
+            loop {
+                let year = base_y + step * rule.interval;
+                let Some(first) = first_day_of_month(year, 1, zone) else {
+                    break;
+                };
+                if exp.beyond(first) {
+                    break;
+                }
+                let mut days = Vec::new();
+                for month in &months {
+                    days.extend(month_candidates(&rule, year, *month, base_day, zone));
+                }
+                days.sort_unstable();
+                // One period per year, so BYSETPOS picks within it.
+                if !exp.period(&days) {
+                    break;
+                }
+                step += 1;
                 if step > 1200 {
                     break;
                 }
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
-    Some(out)
+    exp.out.sort_unstable();
+    exp.out.dedup();
+    Some(exp.out)
 }
 
 /// One DATE-TIME property to an instant. Date-only values (all-day
@@ -859,12 +1403,15 @@ mod tests {
             "FREQ=HOURLY;COUNT=2",
             "FREQ=MINUTELY;COUNT=2",
             "FREQ=SECONDLY;COUNT=2",
-            "FREQ=WEEKLY;BYDAY=MO;COUNT=2;BYSETPOS=1",
-            "FREQ=DAILY;COUNT=2;BYHOUR=10",
-            "FREQ=DAILY;COUNT=2;BYMINUTE=0",
+            "FREQ=WEEKLY;BYDAY=MO;COUNT=2;BYSETPOS=0",
+            "FREQ=WEEKLY;BYDAY=MO;COUNT=2;BYSETPOS=367",
+            "FREQ=DAILY;COUNT=2;BYHOUR=24",
+            "FREQ=DAILY;COUNT=2;BYHOUR=ten",
+            "FREQ=DAILY;COUNT=2;BYMINUTE=60",
             "FREQ=DAILY;COUNT=2;BYSECOND=0",
             "FREQ=YEARLY;COUNT=2;BYYEARDAY=32",
             "FREQ=YEARLY;COUNT=2;BYWEEKNO=3",
+            "FREQ=YEARLY;BYDAY=20MO;COUNT=2",
             "FREQ=WEEKLY;BYDAY=MO;COUNT=2;WKST=SU",
             "FREQ=DAILY;COUNT=2;BYEASTER=1",
             "FREQ=WEEKLY;BYDAY=XX;COUNT=2",
@@ -887,6 +1434,235 @@ mod tests {
         let out = parse_ics(&text, &Tz::utc()).unwrap();
         assert_eq!(out.items.len(), 0, "{out:?}");
         assert_eq!(out.skipped, rules.len(), "{out:?}");
+    }
+
+    // 2026-01-05T10:00:00Z, a Monday (the golden fixture's anchor).
+    const ANCHOR: i64 = 1_767_607_200_000;
+    const DAY: i64 = 86_400_000;
+    const HOUR: i64 = 3_600_000;
+
+    fn starts_of(out: &IcsParse, uid: &str) -> Vec<i64> {
+        let mut v: Vec<i64> = out
+            .items
+            .iter()
+            .filter(|i| i.uid == uid)
+            .map(|i| i.started_at)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn rdate_adds_occurrences_and_exdate_still_removes() {
+        // Weekly COUNT=2 (Jan 5, 12) plus two RDATEs, one EXDATE'd; a
+        // rule-less event whose extra occurrences are RDATE-only.
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:rdate-weekly\nSUMMARY:Weekly\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=WEEKLY;COUNT=2\nRDATE:20260120T100000Z,20260122T100000Z\nEXDATE:20260122T100000Z\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:rdate-only\nSUMMARY:One-offs\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRDATE:20260108T100000Z\nRDATE:20260115T100000Z\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        // RDATEs ride on top of COUNT (they are not counted by it),
+        // and EXDATE removes RDATE occurrences too.
+        assert_eq!(
+            starts_of(&out, "rdate-weekly"),
+            vec![ANCHOR, ANCHOR + 7 * DAY, ANCHOR + 15 * DAY]
+        );
+        assert_eq!(
+            starts_of(&out, "rdate-only"),
+            vec![ANCHOR, ANCHOR + 3 * DAY, ANCHOR + 10 * DAY]
+        );
+        assert!(out.items.iter().all(|i| i.recurring), "{out:?}");
+        // A window opening after Jan 12 keeps only the Jan 20 RDATE.
+        let out = parse_ics_in_window(text, &Tz::utc(), ANCHOR + 8 * DAY, i64::MAX / 4).unwrap();
+        assert_eq!(starts_of(&out, "rdate-weekly"), vec![ANCHOR + 15 * DAY]);
+    }
+
+    #[test]
+    fn rdate_periods_dates_and_garbage_refuse_the_component() {
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:period\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRDATE;VALUE=PERIOD:20260106T100000Z/20260106T110000Z\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:date\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRDATE;VALUE=DATE:20260106\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:garbage\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRDATE:next-tuesday\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.items.len(), 0, "{out:?}");
+        assert_eq!(out.skipped, 3, "{out:?}");
+    }
+
+    #[test]
+    fn recurrence_id_overrides_move_and_cancel_one_occurrence() {
+        // Weekly Jan 5/12/19: the 12th moves to Jan 13 15:00 for 90
+        // minutes under a new title, the 19th is cancelled. The move
+        // is written *before* its master: grouping is by UID, not by
+        // file position.
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:series\nSUMMARY:Moved sync\nRECURRENCE-ID:20260112T100000Z\nDTSTART:20260113T150000Z\nDTEND:20260113T163000Z\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:series\nSUMMARY:Sync\nDTSTART:20260105T100000Z\nDTEND:20260105T103000Z\nRRULE:FREQ=WEEKLY;COUNT=3\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:series\nSUMMARY:Sync\nRECURRENCE-ID:20260119T100000Z\nDTSTART:20260119T100000Z\nDTEND:20260119T103000Z\nSTATUS:CANCELLED\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        assert_eq!(
+            starts_of(&out, "series"),
+            vec![ANCHOR, ANCHOR + 8 * DAY + 5 * HOUR],
+            "{out:?}"
+        );
+        let moved = out
+            .items
+            .iter()
+            .find(|i| i.started_at == ANCHOR + 8 * DAY + 5 * HOUR)
+            .unwrap();
+        assert_eq!(moved.title, "Moved sync");
+        assert_eq!(moved.ended_at - moved.started_at, 90 * 60_000);
+        assert!(moved.recurring);
+        let kept = out.items.iter().find(|i| i.started_at == ANCHOR).unwrap();
+        assert_eq!(kept.title, "Sync");
+        assert_eq!(kept.ended_at - kept.started_at, 30 * 60_000);
+    }
+
+    #[test]
+    fn overrides_resolve_in_the_masters_zone_across_dst() {
+        // Rome springs forward 2026-03-29. The Mar 30 occurrence of a
+        // weekly 10:00 Rome series moves to Apr 1 09:00 Rome. The
+        // RECURRENCE-ID is written in the master's TZID, and the whole
+        // parse runs with a UTC caller zone: matching is by instant.
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:dst-series\nSUMMARY:Weekly\nDTSTART;TZID=Europe/Rome:20260323T100000\nDTEND;TZID=Europe/Rome:20260323T110000\nRRULE:FREQ=WEEKLY;COUNT=2\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:dst-series\nSUMMARY:Moved\nRECURRENCE-ID;TZID=Europe/Rome:20260330T100000\nDTSTART;TZID=Europe/Rome:20260401T090000\nDTEND;TZID=Europe/Rome:20260401T100000\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        // Mar 23 10:00 CET is 09:00Z (anchor + 77d - 1h); Apr 1 09:00
+        // CEST is 07:00Z, nine days minus two hours later. The unmoved
+        // Mar 30 08:00Z occurrence is gone.
+        assert_eq!(
+            starts_of(&out, "dst-series"),
+            vec![
+                ANCHOR + 77 * DAY - HOUR,
+                ANCHOR + 77 * DAY - HOUR + 9 * DAY - 2 * HOUR
+            ],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_items_exrule_and_range_overrides_suggest_nothing() {
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:cancelled\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nSTATUS:CANCELLED\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:exrule\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=DAILY;COUNT=3\nEXRULE:FREQ=WEEKLY;BYDAY=SA\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:range\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=WEEKLY;COUNT=3\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:range\nRECURRENCE-ID;RANGE=THISANDFUTURE:20260112T100000Z\nDTSTART:20260112T120000Z\nDTEND:20260112T130000Z\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.items.len(), 0, "{out:?}");
+        // Cancelled suggests nothing but is not an error (no skip);
+        // EXRULE refuses its component; a RANGE override refuses its
+        // whole two-component series.
+        assert_eq!(out.skipped, 3, "{out:?}");
+    }
+
+    #[test]
+    fn byhour_and_byminute_multiply_occurrences_within_a_day() {
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:byhour\nDTSTART:20260105T093000Z\nDURATION:PT30M\nRRULE:FREQ=DAILY;BYHOUR=9,17;BYMINUTE=30;COUNT=4\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:byminute\nDTSTART:20260105T100000Z\nDURATION:PT15M\nRRULE:FREQ=DAILY;BYMINUTE=0,30;COUNT=3\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        // Anchor is 10:00Z: 09:30 and 17:30 on Jan 5, then Jan 6 —
+        // COUNT counts the multiplied instants, not days.
+        assert_eq!(
+            starts_of(&out, "byhour"),
+            vec![
+                ANCHOR - 30 * 60_000,
+                ANCHOR + 7 * HOUR + 30 * 60_000,
+                ANCHOR + DAY - 30 * 60_000,
+                ANCHOR + DAY + 7 * HOUR + 30 * 60_000,
+            ]
+        );
+        // BYMINUTE alone keeps DTSTART's hour.
+        assert_eq!(
+            starts_of(&out, "byminute"),
+            vec![ANCHOR, ANCHOR + 30 * 60_000, ANCHOR + DAY]
+        );
+    }
+
+    #[test]
+    fn bysetpos_picks_within_each_period() {
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:last-weekday\nDTSTART:20260130T100000Z\nDTEND:20260130T110000Z\nRRULE:FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;COUNT=3\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:last-hour\nDTSTART:20260105T090000Z\nDURATION:PT1H\nRRULE:FREQ=DAILY;BYHOUR=9,12,17;BYSETPOS=-1;COUNT=2\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:first-of-week\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;BYSETPOS=1;COUNT=2\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        // Last weekday of the month: Fri Jan 30 (the 31st is a
+        // Saturday), Fri Feb 27, Tue Mar 31.
+        assert_eq!(
+            starts_of(&out, "last-weekday"),
+            vec![ANCHOR + 25 * DAY, ANCHOR + 53 * DAY, ANCHOR + 85 * DAY]
+        );
+        // Last of the day's BYHOUR set: 17:00 daily.
+        assert_eq!(
+            starts_of(&out, "last-hour"),
+            vec![ANCHOR + 7 * HOUR, ANCHOR + DAY + 7 * HOUR]
+        );
+        // First of each week's Mo/We/Fr set: the Mondays.
+        assert_eq!(
+            starts_of(&out, "first-of-week"),
+            vec![ANCHOR, ANCHOR + 7 * DAY]
+        );
+    }
+
+    #[test]
+    fn byhour_wall_clock_survives_dst() {
+        // Daily 09:00 and 17:00 in Rome across the 2026-03-29 spring
+        // forward: local times hold, so same-time-next-day gaps are
+        // 23 hours, not 24.
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:dst-hours\nDTSTART;TZID=Europe/Rome:20260328T090000\nDTEND;TZID=Europe/Rome:20260328T100000\nRRULE:FREQ=DAILY;BYHOUR=9,17;COUNT=4\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:dst-fall\nDTSTART;TZID=Europe/Rome:20261018T100000\nDTEND;TZID=Europe/Rome:20261018T110000\nRRULE:FREQ=WEEKLY;COUNT=2\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        // Mar 28 09:00 CET is 08:00Z (anchor + 82d - 2h).
+        let first = ANCHOR + 82 * DAY - 2 * HOUR;
+        assert_eq!(
+            starts_of(&out, "dst-hours"),
+            vec![
+                first,
+                first + 8 * HOUR,
+                first + 23 * HOUR,
+                first + 31 * HOUR
+            ],
+            "{out:?}"
+        );
+        // A plain weekly landing *on* the 2026-10-25 fall-back day:
+        // Oct 18 10:00 CEST to Oct 25 10:00 CET is a week plus the
+        // regained hour (elapsed-since-midnight used to drop it).
+        let fall = starts_of(&out, "dst-fall");
+        assert_eq!(fall.len(), 2, "{out:?}");
+        assert_eq!(fall[1] - fall[0], 7 * DAY + HOUR);
+    }
+
+    #[test]
+    fn daily_and_weekly_by_parts_limit_instead_of_being_ignored() {
+        // Weekdays-only daily and a weekly rule limited to January:
+        // both BY parts used to be parsed but silently ignored.
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:weekdays\nDTSTART:20260109T100000Z\nDTEND:20260109T110000Z\nRRULE:FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR;COUNT=3\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:jan-mondays\nDTSTART:20260126T100000Z\nDTEND:20260126T110000Z\nRRULE:FREQ=WEEKLY;BYMONTH=1;COUNT=3\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics_in_window(text, &Tz::utc(), 0, ANCHOR + 40 * DAY).unwrap();
+        // Fri Jan 9, then Mon Jan 12 and Tue Jan 13 (no weekend).
+        assert_eq!(
+            starts_of(&out, "weekdays"),
+            vec![ANCHOR + 4 * DAY, ANCHOR + 7 * DAY, ANCHOR + 8 * DAY]
+        );
+        // COUNT=3 wants a third Monday, but February is out of
+        // BYMONTH: only Jan 26 lands before the window closes the walk.
+        assert_eq!(starts_of(&out, "jan-mondays"), vec![ANCHOR + 21 * DAY]);
     }
 
     #[test]
