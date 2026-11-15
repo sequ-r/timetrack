@@ -696,6 +696,28 @@ contains "the imported entry is searchable" "from file" "$out"
 out=$("$CLI" import "$WORK/incoming.csv")
 contains "importing it again skips it" "imported 0 entries" "$out"
 created=$((created+1))
+# A semantically bad late row must import nothing at all (#132): the
+# good first row (and its new project) must not be left behind when
+# the second row ends before it starts.
+before_count=$(listed); before_total=$(total)
+cat >"$WORK/bad-import.csv" <<'CSV'
+id,project,description,started_at,ended_at,duration_hms,duration_minutes,source,note
+x1,PartialProj,partial bait,2026-01-05T10:00:00,2026-01-05T11:00:00,01:00:00,60,manual,
+x2,PartialProj,backwards,2026-01-05T12:00:00,2026-01-05T11:00:00,-01:00:00,-60,manual,
+CSV
+out=$("$CLI" import "$WORK/bad-import.csv" 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then ok "a bad import file is refused"; else bad "a bad import file is refused" "exit 0: $out"; fi
+contains "the refusal names the bad row" "row 3" "$out"
+contains "the refusal says why" "must not end before it starts" "$out"
+check "the bad import added no entries" "$before_count" "$(listed)"
+check "the bad import changed no totals" "$before_total" "$(total)"
+out=$("$CLI" list --search "partial bait")
+check "the good row of a bad file was not imported" "no entries match" "$out"
+# The project only the bad file named was not created either: a file
+# with just the good row still plans to create it.
+head -2 "$WORK/bad-import.csv" >"$WORK/good-only.csv"
+out=$("$CLI" import "$WORK/good-only.csv" --dry-run)
+contains "the bad file created no project" "1 new project(s)" "$out"
 
 echo
 echo "== external .ics suggestions (#19) =="
