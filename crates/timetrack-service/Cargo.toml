@@ -17,6 +17,8 @@ timetrack-store = { workspace = true }
 timetrack-proto = { workspace = true }
 anyhow = { workspace = true }
 ureq = { workspace = true }
+uuid = { workspace = true }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 
 [dev-dependencies]
 # The rollback test holds a real SQLite write lock on the service's

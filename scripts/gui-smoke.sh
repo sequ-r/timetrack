@@ -77,6 +77,9 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/tt-gui.XXXXXX")
 STORE=$WORK/store.json
 SCREEN=1024x900
 
+# A UUID, for matching the ids the CLI prints (#148).
+UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
 pass=0; fail=0; skipped=0
 ok()    { pass=$((pass+1));       printf '  ok    %s\n' "$1"; }
 bad()   { fail=$((fail+1));       printf '  FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '        %s\n' "$2"; return 0; }
@@ -449,7 +452,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   for k in minus 2 0 0; do "$WORK/xtest" "$DISP" key "$k"; done
   "$WORK/xtest" "$DISP" key Return
   sleep 2.5
-  check "split added exactly one entry" "5" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "split added exactly one entry" "5" "$("$CLI" list | grep -cE "$UUID")"
   check "split kept the total" "02:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
   # The second half is now selected; `m` offers its touching first half and
   # states the (zero) delta, and `m` again executes it.
@@ -465,7 +468,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   fi
   "$WORK/xtest" "$DISP" key m
   sleep 2.5
-  check "merge fused the halves back into one entry" "4" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "merge fused the halves back into one entry" "4" "$("$CLI" list | grep -cE "$UUID")"
   check "merge kept the total" "02:20:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
 
   echo
@@ -505,7 +508,7 @@ elif "$WORK/xtest" "$DISP" key 1; then
   "$WORK/xtest" "$DISP" key u
   sleep 2.5
   check "undo removed the 5-minute quick-add" "02:15:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
-  check "undo left three entries" "3" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "undo left three entries" "3" "$("$CLI" list | grep -cE "$UUID")"
 
   echo
   echo "== delete asks first, by keyboard =="
@@ -530,29 +533,29 @@ elif "$WORK/xtest" "$DISP" key 1; then
   # Escape cancels: nothing is deleted.
   "$WORK/xtest" "$DISP" key Escape
   sleep 1.5
-  check "escape cancels the delete" "3" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "escape cancels the delete" "3" "$("$CLI" list | grep -cE "$UUID")"
   check "a cancelled delete moves nothing" "02:15:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
   # `d` again, then `d` to confirm: the hour goes away.
   "$WORK/xtest" "$DISP" key d
   sleep 1.5
   "$WORK/xtest" "$DISP" key d
   sleep 2.5
-  check "d d deleted one entry" "2" "$("$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]')"
+  check "d d deleted one entry" "2" "$("$CLI" list | grep -cE "$UUID")"
   check "the deleted hour left the total" "01:15:00" "$("$CLI" status | sed -nE 's/^all time:[[:space:]]+//p')"
   "$CLI" list | grep -q smoke && bad "the deleted entry is gone" "smoke still listed" || ok "the deleted entry is gone"
 
   echo
   echo "== export from the GUI writes a file =="
-  # Home -> Projects -> Export. The three green buttons there are the only
-  # green on screen; they carry longer labels than the quick-add row, so the
-  # width filter is wider than the quick-add one.
+  # Home -> Projects -> Export. The four green buttons there (week, month,
+  # all, range) are the only green on screen; they carry longer labels than
+  # the quick-add row, so the width filter is wider than the quick-add one.
   "$WORK/xtest" "$DISP" key Tab
   sleep 1
   "$WORK/xtest" "$DISP" key Tab
   sleep 1.5
   shot export-tab.png
   EXPORTS=$(blobs export-tab.png '#2ea043' | awk '$1 >= 60 && $2 >= 15 && $2 <= 45' | wc -l)
-  check "three export buttons are drawn" "3" "$EXPORTS"
+  check "four export buttons are drawn" "4" "$EXPORTS"
   # The anchor picker (scope pills, stepper, typed day) is neutral, never
   # action green, so the count above still holds with the picker painted.
   # One press back a period must repaint the tab (the period label moves),

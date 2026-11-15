@@ -11,3 +11,4 @@ description = "SQLite persistence for TimeTrack, owned by the service only (REQU
 timetrack-core = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }

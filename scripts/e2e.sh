@@ -10,9 +10,9 @@
 #    sums. A week total depends on where "now" falls relative to the ISO week
 #    boundary, so an absolute week assertion would fail every Sunday night and
 #    pass every Tuesday. The all-time total has no such edge.
-#  - Entry ids are extracted from the parenthesised form the CLI prints
-#    (`(e12)`) rather than by grepping for `e<digits>`, which also matches the
-#    digits inside other words and turns a one-id result into several.
+#  - Entry ids are extracted from the parenthesised UUID the CLI prints
+#    rather than by grepping loosely, which also matches hex inside other
+#    words and turns a one-id result into several.
 set -uo pipefail
 
 # Resolve the repository from the script's own location, so the script works
@@ -37,17 +37,19 @@ contains(){ # contains <desc> <needle> <haystack>
 # exactly instead of against a magic floor that a change could silently break.
 created=0; removed=0
 
-# The entry id the CLI printed as `(... e12)`.
-id_of() { printf '%s' "$1" | grep -oE '\(e[0-9]+\)' | tr -d '()'; }
+# A UUID, for matching the ids the CLI prints (#148).
+UUID='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
-# The duration of a named entry. Matches the id as a whole field, so `e1` does
-# not also match inside `e10`.
+# The entry id the CLI printed in parentheses.
+id_of() { printf '%s' "$1" | grep -oE "\($UUID\)" | tr -d '()'; }
+
+# The duration of a named entry. Matches the id as a whole field.
 duration_of() {
   "$CLI" list | sed -nE "s/^.[[:space:]]+([0-9:]+)[[:space:]]+$1[[:space:]].*/\1/p"
 }
 
-# How many entries are listed.
-listed() { "$CLI" list | grep -cE '[[:space:]]e[0-9]+[[:space:]]'; }
+# How many entries are listed: one UUID per entry line.
+listed() { "$CLI" list | grep -cE "$UUID"; }
 
 # The all-time total, as HH:MM:SS.
 total() { "$CLI" status | sed -nE 's/^all time:[[:space:]]+//p'; }
@@ -138,29 +140,39 @@ contains "the last project cannot be deleted" "cannot delete the last project" "
 echo
 echo "== projects =="
 out=$("$CLI" project "Work"); contains "create Work" "created project" "$out"
+WORK_ID=$(id_of "$out")
 out=$("$CLI" project "General" 2>&1); contains "duplicate name refused" "already exists" "$out"
 out=$("$CLI" project "Home"); contains "create Home" "created project" "$out"
-# p1 is the seeded General, p2 Work, p3 Home. The archive check below uses p2.
+HOME_ID=$(id_of "$out")
+# Ids are UUIDs (#148): every section below names projects through these
+# captured ids (or by name), never by position.
 
 echo
 echo "== projects rename and recolour =="
 # A fourth project, so the renames below never disturb Work/Home/General
 # and no later absolute total moves.
 out=$("$CLI" project "RenameMe"); contains "create RenameMe" "created project" "$out"
-out=$("$CLI" rename p4 Renamed)
-contains "rename reports old and new" "renamed RenameMe to Renamed (p4)" "$out"
-out=$("$CLI" recolour p4 2ea043)
-contains "recolour reports the colour" "recoloured Renamed (p4) to #2ea043" "$out"
+RENAME_ID=$(id_of "$out")
+out=$("$CLI" rename "$RENAME_ID" Renamed)
+contains "rename reports old and new" "renamed RenameMe to Renamed ($RENAME_ID)" "$out"
+out=$("$CLI" recolour "$RENAME_ID" 2ea043)
+contains "recolour reports the colour" "recoloured Renamed ($RENAME_ID) to #2ea043" "$out"
+# An unambiguous id prefix renames just like the full id (#148): all but
+# the last character still names exactly this project.
+out=$("$CLI" rename "${RENAME_ID%?}" "RenamedAgain")
+contains "rename by id prefix" "renamed Renamed to RenamedAgain ($RENAME_ID)" "$out"
+out=$("$CLI" rename "$RENAME_ID" "Renamed")
+contains "rename back by full id" "renamed RenamedAgain to Renamed ($RENAME_ID)" "$out"
 SNAP_JSON=$("$CLI" snapshot)
 if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
 import json, sys
 snap = json.load(sys.stdin)
 probs = []
-ps = {p["id"]: p for p in snap["projects"]}
-if ps.get("p4", {}).get("name") != "Renamed":
-    probs.append("p4 not renamed")
-if ps.get("p4", {}).get("colour") != 0x2EA043:
-    probs.append("p4 not recoloured")
+ps = {p["name"]: p for p in snap["projects"]}
+if "Renamed" not in ps:
+    probs.append("Renamed missing")
+if ps.get("Renamed", {}).get("colour") != 0x2EA043:
+    probs.append("Renamed not recoloured")
 print(";".join(probs))
 '); then
   check "rename and recolour reached the snapshot" "" "$AGREE"
@@ -168,15 +180,15 @@ else
   bad "rename and recolour reached the snapshot" "could not parse the snapshot"
 fi
 out=$("$CLI" rename p99 X 2>&1); contains "rename of an unknown id fails" "no project with id" "$out"
-out=$("$CLI" rename p4 "" 2>&1); contains "blank rename refused" "cannot be blank" "$out"
-out=$("$CLI" rename p4 Work 2>&1); contains "duplicate rename refused" "already exists" "$out"
-out=$("$CLI" recolour p4 zzzzzz 2>&1); contains "bad hex refused" "RRGGBB" "$out"
+out=$("$CLI" rename "$RENAME_ID" "" 2>&1); contains "blank rename refused" "cannot be blank" "$out"
+out=$("$CLI" rename "$RENAME_ID" Work 2>&1); contains "duplicate rename refused" "already exists" "$out"
+out=$("$CLI" recolour "$RENAME_ID" zzzzzz 2>&1); contains "bad hex refused" "RRGGBB" "$out"
 out=$("$CLI" recolour p99 2ea043 2>&1); contains "recolour of an unknown id fails" "no project with id" "$out"
 
 echo
 echo "== deleting a project =="
-# A scratch project, created and deleted inside this section: it takes the
-# next free id (p5) and leaves the ids the later sections use untouched.
+# A scratch project, created and deleted inside this section, leaving the
+# ids the later sections use untouched.
 out=$("$CLI" project "Scratch"); contains "create Scratch" "created project" "$out"
 out=$("$CLI" add -p Scratch -S -30 -E 0 -d "scratch"); SC=$(id_of "$out"); created=$((created+1))
 # A project that still has entries cannot be deleted, and the refusal says
@@ -208,27 +220,27 @@ else
   bad "new text reads back in the list" "edited missing"
 fi
 out=$("$CLI" set-project "$EE" Home)
-contains "entry moved projects" "moved $EE to Home (p3)" "$out"
+contains "entry moved projects" "moved $EE to Home ($HOME_ID)" "$out"
 contains "export shows the new project" "$EE,Home," "$("$CLI" export --scope all | grep -E "^$EE,")"
 out=$("$CLI" set-text e9999 "x" 2>&1); contains "set-text of an unknown id fails" "no entry with id" "$out"
 out=$("$CLI" set-project e9999 Work 2>&1); contains "set-project of an unknown entry fails" "no entry with id" "$out"
 out=$("$CLI" set-project "$EE" Nope 2>&1); contains "set-project onto an unknown project fails" "no project with id" "$out"
 "$CLI" delete "$EE" >/dev/null; removed=$((removed+1))
 check "scratch entry removed" "0" "$(listed)"
-# Archive then unarchive p3: the snapshot must show both transitions, and
-# the last one leaves history untouched.
-out=$("$CLI" archive "p3")
+# Archive by id, unarchive by name: the snapshot must show both
+# transitions, and the last one leaves history untouched.
+out=$("$CLI" archive "$HOME_ID")
 contains "archived" "archived" "$out"
-out=$("$CLI" unarchive "p3")
-contains "unarchived" "unarchived Home (p3)" "$out"
+out=$("$CLI" unarchive "Home")
+contains "unarchived" "unarchived Home ($HOME_ID)" "$out"
 SNAP_JSON=$("$CLI" snapshot)
 if AGREE=$(printf '%s' "$SNAP_JSON" | python3 -c '
 import json, sys
 snap = json.load(sys.stdin)
 probs = []
-ps = {p["id"]: p for p in snap["projects"]}
-if ps.get("p3", {}).get("archived", True) is not False:
-    probs.append("p3 not unarchived")
+ps = {p["name"]: p for p in snap["projects"]}
+if ps.get("Home", {}).get("archived", True) is not False:
+    probs.append("Home not unarchived")
 print(";".join(probs))
 '); then
   check "unarchive restored the project" "" "$AGREE"
@@ -236,6 +248,22 @@ else
   bad "unarchive restored the project" "could not parse the snapshot"
 fi
 out=$("$CLI" unarchive p99 2>&1); contains "unarchive of an unknown id fails" "no project with id" "$out"
+
+echo
+echo "== unambiguous id prefixes work like full ids (#148) =="
+# A scratch entry addressed only by prefix: created with a project
+# prefix, edited by entry prefix, deleted by entry prefix. All but the
+# last character still names exactly one id.
+out=$("$CLI" add -p "${WORK_ID%?}" -S -60 -E -30 -d "prefixed")
+PE=$(id_of "$out"); created=$((created+1))
+PSHORT="${PE%?}"
+out=$("$CLI" set-text "$PSHORT" "prefixed-again")
+contains "set-text by prefix" "set text on $PE to \"prefixed-again\"" "$out"
+out=$("$CLI" shorten "$PSHORT" -E -45)
+contains "shorten by prefix" "shortened to 00:15:00" "$out"
+"$CLI" delete "$PSHORT" >/dev/null; removed=$((removed+1))
+"$CLI" list | grep -qE " $PE " && bad "prefix-deleted entry is gone" "still listed" || ok "prefix-deleted entry is gone"
+check "scratch entry removed" "0" "$(listed)"
 
 echo
 echo "== method 1: explicit start and end =="
@@ -359,8 +387,8 @@ out=$("$CLI" add -p Work -S 09:00 -E 10:00 -d "splittable")
 E_SPLIT=$(id_of "$out"); created=$((created+1))
 out=$("$CLI" split "$E_SPLIT" --at 09:30)
 contains "split reports both halves" "00:30:00" "$out"
-H1=$(printf '%s' "$out" | grep -oE '\(e[0-9]+\)' | tr -d '()' | sed -n '1p')
-H2=$(printf '%s' "$out" | grep -oE '\(e[0-9]+\)' | tr -d '()' | sed -n '2p')
+H1=$(printf '%s' "$out" | grep -oE "\($UUID\)" | tr -d '()' | sed -n '1p')
+H2=$(printf '%s' "$out" | grep -oE "\($UUID\)" | tr -d '()' | sed -n '2p')
 created=$((created+1))
 check "first half is 30m" "00:30:00" "$(duration_of "$H1")"
 check "second half is 30m" "00:30:00" "$(duration_of "$H2")"
@@ -417,14 +445,13 @@ echo
 echo "== ids do not collide after a restart =="
 out=$("$CLI" add -p Work -S -30 -E 0 -d "after restart")
 NEW=$(id_of "$out"); created=$((created+1))
-# Whole-field match, so `e1` does not also match inside `e10`.
+# Whole-field match on the full UUID.
 check "new id appears exactly once" "1" "$("$CLI" list | grep -cE " $NEW ")"
-# And the counter continued rather than restarting from 1.
-if [ "${NEW#e}" -gt 1 ]; then
-  ok "id continued past the previous maximum ($NEW)"
-else
-  bad "id continued" "got $NEW, expected more than e1"
-fi
+# And the id is a fresh UUID (#148), not a restarted counter.
+case "$NEW" in
+  ????????-????-????-????-????????????) ok "new id is a UUID ($NEW)" ;;
+  *) bad "new id is a UUID" "got $NEW" ;;
+esac
 
 echo
 echo "== a named timezone restarts cleanly and keeps every total =="
@@ -483,7 +510,7 @@ contains "the refusal names the bad zone" "Europe/Romeo" "$badtz_out"
 echo
 echo "== archiving keeps history in the totals =="
 before_all=$(total)
-out=$("$CLI" archive "p1")
+out=$("$CLI" archive "General")
 contains "archived" "archived" "$out"
 contains "history is preserved in the message" "stay in historical totals" "$out"
 check "all-time unchanged by archiving" "$before_all" "$(total)"
@@ -709,6 +736,51 @@ out=$("$CLI" dismiss "$SG2")
 contains "dismiss answers" "dismissed $SG2" "$out"
 out=$("$CLI" suggestions)
 check "no suggestions remain pending" "no pending suggestions (try: timetrack refresh)" "$out"
+
+echo
+echo "== source update and remove (#153) =="
+SRC=$("$CLI" sources | sed -n '1p' | cut -d' ' -f1)
+out=$("$CLI" source-update "$SRC" --label Renamed)
+contains "update relabels" "updated source Renamed (ics_file)" "$out"
+out=$("$CLI" sources)
+contains "sources shows the new label" "Renamed" "$out"
+# A second source, for the duplicate check and the removal below.
+# Source ids are `src-…`, not UUIDs: the new id is the last field.
+cp "$WORK/cal.ics" "$WORK/other.ics"
+SRC2=$("$CLI" source-add "$WORK/other.ics" | awk '{print $NF}')
+out=$("$CLI" source-update "$SRC2" --locator "$WORK/cal.ics" 2>&1)
+contains "an edit onto another source refuses" "already exists" "$out"
+out=$("$CLI" source-update "$SRC" --kind bogus 2>&1)
+contains "a bad kind refuses" "unknown source kind 'bogus'" "$out"
+out=$("$CLI" source-update "$SRC" --locator "" 2>&1)
+contains "an empty locator refuses" "a source needs a file path or URL" "$out"
+out=$("$CLI" source-update "$SRC" --kind caldav --locator "https://u:p@x.invalid/c/" 2>&1)
+contains "a CalDAV password in the URL refuses" "do not put a password in the source URL" "$out"
+out=$("$CLI" sources)
+check "refusals changed nothing" "2" "$(printf '%s' "$out" | grep -c .)"
+out=$("$CLI" source-remove "$SRC2")
+contains "remove answers" "removed source" "$out"
+out=$("$CLI" sources)
+check "one source is left" "1" "$(printf '%s' "$out" | grep -c .)"
+# The confirmed entry and the dismissal both predate the removal: the
+# entry stays tracked time, and the pending list stays empty.
+out=$("$CLI" source-remove "$SRC")
+contains "remove answers" "removed source Renamed" "$out"
+out=$("$CLI" sources)
+contains "no sources remain" "no external sources yet" "$out"
+out=$("$CLI" export --scope all | grep "Calendar review")
+contains "the confirmed entry survives its source" "external" "$out"
+out=$("$CLI" suggestions)
+check "no suggestions remain pending" "no pending suggestions (try: timetrack refresh)" "$out"
+# Pending suggestions, unlike decided ones, go with their source.
+# Suggestion ids are `sg-…`: count lines, not UUIDs.
+SRC3=$("$CLI" source-add "$WORK/cal.ics" | awk '{print $NF}')
+out=$("$CLI" refresh)
+contains "re-adding re-suggests" "2 new suggestion(s)" "$out"
+check "two suggestions are pending" "2" "$("$CLI" suggestions | grep -c .)"
+"$CLI" source-remove "$SRC3" >/dev/null
+out=$("$CLI" suggestions)
+check "removal discards the pending pair" "no pending suggestions (try: timetrack refresh)" "$out"
 
 echo
 echo "== custom date-range export (#133) =="

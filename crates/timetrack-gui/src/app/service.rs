@@ -17,7 +17,8 @@
 use super::REFRESH;
 use super::export::picker::export_period_label;
 use super::export::save::{
-    default_export_path, export_anchor_for_save, export_suggested_name, save_export,
+    default_export_path, default_export_range_path, export_anchor_for_save, export_range_period_id,
+    export_range_suggested_name, export_suggested_name, save_export, save_range_export,
 };
 use super::status::{StatusKind, StatusMsg};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
@@ -70,6 +71,9 @@ pub(super) enum Msg {
     /// change, beside the snapshot cadence; a bus-only service simply
     /// never produces it and the section stays hidden.
     Suggestions(Vec<timetrack_proto::SuggestionView>),
+    /// The registered external sources changed (#153). Sent only on
+    /// change, beside the snapshot cadence, like the suggestions.
+    Sources(Vec<timetrack_proto::SourceView>),
 }
 
 /// What an export save needs: the typed scope plus the paths and labels
@@ -108,6 +112,55 @@ pub(super) fn export_request(
         anchor_ms: export_anchor_for_save(scope, anchor_ms, now, tz),
         period_id: export_period_label(scope, anchor_ms, tz),
         suggested_name: export_suggested_name(scope, anchor_ms, tz),
+    }
+}
+
+/// What an export fetch asks the service for (#133).
+///
+/// The range travels as two day instants, never as an `ExportScope`:
+/// core deliberately has no `ExportScope::Range`, so the range keeps its
+/// own request shape end to end instead of re-parsing a scope.
+#[derive(Debug, Clone)]
+pub(super) enum ExportCall {
+    /// One of the fixed scopes, with the optional scope-plus-anchor call.
+    Scoped(ExportRequest),
+    /// A custom from/to day range: always the range call.
+    Range(RangeExportRequest),
+}
+
+/// A custom from/to range export (#133): the two day instants plus the
+/// paths and labels derived from them. The days are instants anywhere
+/// inside the first/last local day; the service buckets them with its own
+/// zone, exactly like the anchored call.
+#[derive(Debug, Clone)]
+pub(super) struct RangeExportRequest {
+    pub(super) from_ms: i64,
+    pub(super) to_ms: i64,
+    /// Direct-save fallback path when no portal answers.
+    pub(super) path: String,
+    /// The `from..to` day pair the dialog name and the status line print.
+    pub(super) period_id: String,
+    /// Period-stamped name prefilled in the save dialog.
+    pub(super) suggested_name: String,
+}
+
+/// Build the request for the range export button, from two day instants
+/// and one zone.
+///
+/// Like [`export_request`], everything is derived together from one
+/// snapshot and one zone at the click site, so a zone that changed between
+/// the last paint and the click cannot split the period from the file.
+pub(super) fn export_range_request(
+    from_ms: i64,
+    to_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> RangeExportRequest {
+    RangeExportRequest {
+        from_ms,
+        to_ms,
+        path: default_export_range_path(from_ms, to_ms, tz),
+        period_id: export_range_period_id(from_ms, to_ms, tz),
+        suggested_name: export_range_suggested_name(from_ms, to_ms, tz),
     }
 }
 
@@ -168,13 +221,14 @@ pub(super) enum Action {
     MergeEntries { ids: Vec<String> },
     /// Export entries as CSV (REQUIREMENTS §10). The service thread fetches
     /// the CSV over D-Bus, asks the system save dialog where to put it, and
-    /// writes it there: `anchor_ms` selects which week or month when `Some`
-    /// (the scope-plus-anchor call), while `None` keeps the old scope-only
-    /// call for all time and current scopes so old services keep serving
-    /// them. `suggested_name` is the period-stamped name prefilled in the
-    /// dialog; `path` is the direct-save fallback when no portal answers.
-    /// `period_id` feeds the saved status line.
-    ExportCsv(ExportRequest),
+    /// writes it there: `Scoped` carries `anchor_ms`, which selects which
+    /// week or month when `Some` (the scope-plus-anchor call), while `None`
+    /// keeps the old scope-only call for all time and current scopes so old
+    /// services keep serving them. `Range` always takes the range call
+    /// (`client.export_csv_range`). `suggested_name` is the period-stamped
+    /// name prefilled in the dialog; `path` is the direct-save fallback
+    /// when no portal answers. `period_id` feeds the saved status line.
+    ExportCsv(ExportCall),
     /// Launch the service: spawn the sibling `timetrack-service`
     /// binary (§16 auto-spawn). The AppImage starts its bundled service
     /// on launch too; socket ownership makes the second copy exit.
@@ -184,12 +238,34 @@ pub(super) enum Action {
     /// builds never send this). Like the export save, the download runs on
     /// its own thread and reports back over the channel.
     InstallUpdate { url: String, version: String },
-    /// Fetch every external source now (§19). Creates no entries.
-    RefreshSources,
+    /// Fetch external sources now (§19). `None` refreshes every
+    /// source (the suggestions header); `Some` refreshes one (its row).
+    /// Creates no entries either way.
+    RefreshSources { id: Option<String> },
     /// Confirm a suggestion into an entry on its source's project.
     ConfirmSuggestion(String),
     /// Dismiss a suggestion for good.
     DismissSuggestion(String),
+    /// Register an external source (#153). The service validates and
+    /// derives an empty label from the locator, as for the CLI.
+    AddSource {
+        kind: String,
+        locator: String,
+        project_id: Option<String>,
+        label: String,
+    },
+    /// Rewrite a source (#153): the dialog's full new state, replaced
+    /// wholesale on the wire.
+    UpdateSource {
+        id: String,
+        kind: String,
+        locator: String,
+        project_id: Option<String>,
+        label: String,
+    },
+    /// Delete a source, its pending suggestions, and its stored secret.
+    /// Decided suggestions and confirmed entries stay (#153).
+    RemoveSource(String),
 }
 
 /// What happened to a snapshot offered to the view.
@@ -351,10 +427,17 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
             // the first one is due at once and the first frame is never
             // blank for a whole tick.
             let mut last_refresh: Option<Instant> = None;
+            // The launch smoke check (`scripts/gui-launch-smoke.sh`)
+            // asserts on the line this gates (#157): the first snapshot
+            // that round-trips proves the GUI reached the service.
+            let mut connected_logged = false;
             // The suggestions last sent to the view: refetched beside
             // each snapshot and forwarded only on change, so an idle
             // window is not repainted with the same list every tick.
             let mut last_suggestions: Vec<timetrack_proto::SuggestionView> = Vec::new();
+            // The sources last sent to the view (#153): same cadence,
+            // same change gate.
+            let mut last_sources: Vec<timetrack_proto::SourceView> = Vec::new();
             loop {
                 // Wait for a command, but never longer than until the
                 // next refresh is due: a click reaches the service at
@@ -448,7 +531,7 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                         Ok(Action::MergeEntries { ids }) => {
                             report(&tx, client.merge(&ids).await.map(|_| ()));
                         }
-                        Ok(Action::ExportCsv(req)) => {
+                        Ok(Action::ExportCsv(call)) => {
                             // The service refusal stays typed; a local write
                             // failure is a local note, not a service error.
                             // All time and current scopes travel over the old
@@ -456,11 +539,20 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                             // serving them; only a chosen week or month needs
                             // the scope-plus-anchor call, which against an old
                             // service refuses with a version message rather
-                            // than writing a wrong file.
-                            let scope_str = req.scope.as_str().to_string();
-                            let fetched = match req.anchor_ms {
-                                Some(at) => client.export_csv_at(&scope_str, at).await,
-                                None => client.export_csv(&scope_str).await,
+                            // than writing a wrong file. The range always
+                            // takes the range call, which a service without
+                            // it refuses the same typed way.
+                            let fetched = match &call {
+                                ExportCall::Scoped(req) => {
+                                    let scope_str = req.scope.as_str().to_string();
+                                    match req.anchor_ms {
+                                        Some(at) => client.export_csv_at(&scope_str, at).await,
+                                        None => client.export_csv(&scope_str).await,
+                                    }
+                                }
+                                ExportCall::Range(req) => {
+                                    client.export_csv_range(req.from_ms, req.to_ms).await
+                                }
                             };
                             match fetched {
                                 Ok(csv) => {
@@ -478,7 +570,14 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                                     let tx = tx.clone();
                                     std::thread::spawn(move || {
                                         async_io::block_on(async move {
-                                            save_export(tx, csv, req).await;
+                                            match call {
+                                                ExportCall::Scoped(req) => {
+                                                    save_export(tx, csv, req).await;
+                                                }
+                                                ExportCall::Range(req) => {
+                                                    save_range_export(tx, csv, req).await;
+                                                }
+                                            }
                                         });
                                     });
                                 }
@@ -487,14 +586,52 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                                 }
                             }
                         }
-                        Ok(Action::RefreshSources) => {
-                            report(&tx, client.refresh_source(None).await.map(|_| ()));
+                        Ok(Action::RefreshSources { id }) => {
+                            report(&tx, client.refresh_source(id.as_deref()).await.map(|_| ()));
                         }
                         Ok(Action::ConfirmSuggestion(id)) => {
                             report(&tx, client.confirm_suggestion(&id, None).await.map(|_| ()));
                         }
                         Ok(Action::DismissSuggestion(id)) => {
                             report(&tx, client.dismiss_suggestion(&id).await.map(|_| ()));
+                        }
+                        Ok(Action::AddSource {
+                            kind,
+                            locator,
+                            project_id,
+                            label,
+                        }) => {
+                            report(
+                                &tx,
+                                client
+                                    .add_source(&kind, &locator, project_id.as_deref(), &label)
+                                    .await
+                                    .map(|_| ()),
+                            );
+                        }
+                        Ok(Action::UpdateSource {
+                            id,
+                            kind,
+                            locator,
+                            project_id,
+                            label,
+                        }) => {
+                            report(
+                                &tx,
+                                client
+                                    .update_source(
+                                        &id,
+                                        &kind,
+                                        &locator,
+                                        project_id.as_deref(),
+                                        &label,
+                                    )
+                                    .await
+                                    .map(|_| ()),
+                            );
+                        }
+                        Ok(Action::RemoveSource(id)) => {
+                            report(&tx, client.remove_source(&id).await.map(|_| ()));
                         }
                         Ok(Action::StartService) => {
                             // Spawn the sibling binary, then prove it by
@@ -534,6 +671,10 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                 }
                 match client.snapshot().await {
                     Ok(s) => {
+                        if !connected_logged {
+                            connected_logged = true;
+                            eprintln!("timetrack-gui: connected to the service");
+                        }
                         // Suggestions ride the same cadence (§19). A
                         // bus-only service refuses here every time; that
                         // is silence, not an error worth a footer.
@@ -542,6 +683,13 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                         {
                             last_suggestions = fresh.clone();
                             let _ = tx.send(Msg::Suggestions(fresh));
+                        }
+                        // Sources ride it too (#153), under the same gate.
+                        if let Ok(fresh) = client.sources().await
+                            && fresh != last_sources
+                        {
+                            last_sources = fresh.clone();
+                            let _ = tx.send(Msg::Sources(fresh));
                         }
                         match offer_snapshot(&snapshot_tx, s) {
                             Offered::Queued | Offered::Dropped => {}

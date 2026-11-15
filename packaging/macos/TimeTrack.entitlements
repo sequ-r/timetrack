@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TimeTrack signing entitlements (#159), passed explicitly to every
+  `codesign` invocation in build-bundle.sh so nothing is ever signed
+  with ambient entitlements.
+
+  The set is deliberately minimal. The app is NOT sandboxed: it keeps
+  its store in ~/Library/Application Support/timetrack, speaks over a
+  Unix-domain socket, and spawns sibling helpers from its own bundle —
+  none of which a sandboxed app may do without exceptions that would
+  gut the sandbox. Hardened Runtime (the `runtime` codesign option) is what
+  notarization requires, and it needs no entitlement by itself: no JIT,
+  no unsigned executable memory, no DYLD variables, no Apple Events.
+
+  `network.client` is the declared ceiling, inert until sandboxing is
+  adopted: outgoing connections (CalDAV fetch, the release check) are
+  the only network the app uses, so if a future build turns the
+  sandbox on, this file already states the whole allowance and the
+  audit below stays the record to extend — no silent widening.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

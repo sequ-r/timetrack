@@ -1092,4 +1092,47 @@ mod tests {
         assert!(err.to_string().contains("row 2"), "{err}");
         assert!(err.to_string().contains("not-a-time"), "{err}");
     }
+
+    #[test]
+    fn a_uuid_export_parses_back_ignoring_the_id_column() {
+        // ADR 0018: exported ids are UUIDs now, and import stays
+        // match-by-content — the id column is never trusted, so the
+        // same file re-imports to the same rows whatever the ids are.
+        let mut s = Store::default();
+        s.projects.push(Project {
+            id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        s.entries.push(Entry {
+            id: "bbbbbbbb-0000-4000-8000-000000000001".into(),
+            project_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            description: "review".into(),
+            started_at: 1_791_194_400_000,
+            ended_at: 1_791_201_600_000,
+            source: EntrySource::External,
+            note: Some("n".into()),
+        });
+        let csv = export_csv_at(&s, ExportScope::All, 0, &utc());
+        assert!(
+            csv.contains("bbbbbbbb-0000-4000-8000-000000000001,Work,review,"),
+            "the UUID id is exported verbatim: {csv}"
+        );
+        let parsed = parse_export_csv(&csv, &utc()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].project, "Work");
+        assert_eq!(parsed[0].description, "review");
+        assert_eq!(parsed[0].started_at, 1_791_194_400_000);
+        assert_eq!(parsed[0].ended_at, 1_791_201_600_000);
+        assert_eq!(parsed[0].source, EntrySource::External);
+        assert_eq!(parsed[0].note.as_deref(), Some("n"));
+        // A foreign id in the same column parses to the same row: the
+        // column is cargo, never identity.
+        let swapped = csv.replace(
+            "bbbbbbbb-0000-4000-8000-000000000001",
+            "cccccccc-0000-4000-8000-000000000002",
+        );
+        assert_eq!(parse_export_csv(&swapped, &utc()).unwrap(), parsed);
+    }
 }

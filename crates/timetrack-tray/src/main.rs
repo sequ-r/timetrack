@@ -5,94 +5,106 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+// No console window on Windows (#155): the tray is a background icon, and
+// a console would flash on every login-start.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! The TimeTrack system tray.
 //!
-//! A `StatusNotifierItem` (via `ksni`) whose presence shows the service is
-//! running. The menu lists one submenu per unarchived project with its week
-//! total plus quick-add, undo, and delete-confirm rows (tray-5..7, #9..#11);
-//! the tooltip carries the live week total and the icon asks for attention
-//! on over-24h days (tray-8, #12).
+//! On Linux a `StatusNotifierItem` (via `ksni`) whose presence shows the
+//! service is running. The menu lists one submenu per unarchived project
+//! with its week total plus quick-add, undo, and delete-confirm rows
+//! (tray-5..7, #9..#11); the tooltip carries the live week total and the
+//! icon asks for attention on over-24h days (tray-8, #12). Windows and
+//! macOS run their own native runners (#155/#156); any other target stubs
+//! out, while the neutral core in the library compiles everywhere.
 //!
 //! # Runtime
 //!
 //! `ksni` is used with its `async-io` feature only (never the default `tokio`
 //! feature -- see the workspace manifest and issue #4). The binary is driven
-//! with `async_io::block_on`, the same pattern as the service.
+//! with `async_io::block_on`, the same pattern as the service. On Windows
+//! and macOS the backend drives its own UI and worker threads instead
+//! (#155/#156), and the Windows binary ships without a console window.
 //!
 //! # Layout (#108)
 //!
-//! This file keeps only the poll loop and `main`. The seams live beside
-//! it: `item` (the ksni item and its rendering), `menu` (the snapshot →
-//! menu model), `state` (tooltip/connection classification), `ipc` (the
-//! shared service connection), and `actions` (quick-add bookkeeping).
+//! This file keeps only the poll loop and `main`. The seams live in the
+//! library: `backend_linux` (the ksni item and its rendering, Linux only),
+//! `menu` (the snapshot → menu model), `state` (tooltip/connection
+//! classification), `ipc` (the shared service connection), `actions`
+//! (quick-add bookkeeping plus neutral dispatch), and `platform`
+//! (per-OS GUI launch).
 
+#[cfg(target_os = "linux")]
 use ksni::TrayMethods as _;
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use timetrack_proto::{ChangedStream, ChangedWait, Client, ClientError};
 
-mod actions;
-mod ipc;
-mod item;
-mod menu;
-mod state;
-
-use ipc::{SharedClient, set_shared_client, shared_client};
-use item::TimetrackTray;
-use menu::{MenuModel, build_menu_model};
-use state::{ConnState, TooltipState, Unwell, conn_state, unwell_of};
+#[cfg(target_os = "linux")]
+use timetrack_tray::TRAY_NAME;
+#[cfg(target_os = "linux")]
+use timetrack_tray::backend_linux::TimetrackTray;
+#[cfg(target_os = "linux")]
+use timetrack_tray::ipc::{SharedClient, set_shared_client, shared_client};
+#[cfg(target_os = "linux")]
+use timetrack_tray::lock;
+#[cfg(target_os = "linux")]
+use timetrack_tray::menu::{MenuModel, build_menu_model};
+#[cfg(target_os = "linux")]
+use timetrack_tray::state::{ConnState, TooltipState, Unwell, conn_state, unwell_of};
 // Named only by the tests (production code reaches them through the item
 // and the model), so the non-test build does not import them.
-#[cfg(test)]
-use actions::{
+#[cfg(all(test, target_os = "linux"))]
+use timetrack_tray::actions::{
     forget_quick_add_if, quick_add_label, record_quick_add, report_action, undo_record_stale,
 };
-#[cfg(test)]
-use item::{DESKTOP_ENTRY, gui_argv};
-#[cfg(test)]
-use menu::{LastEntry, MAX_PROJECTS, ProjectItem};
-#[cfg(test)]
-use state::tooltip_text;
+#[cfg(all(test, target_os = "linux"))]
+use timetrack_tray::menu::{LastEntry, MAX_PROJECTS, ProjectItem};
+#[cfg(all(test, target_os = "linux"))]
+use timetrack_tray::platform::{DESKTOP_ENTRY, gui_argv};
+#[cfg(all(test, target_os = "linux"))]
+use timetrack_tray::state::tooltip_text;
 
 /// The fallback snapshot cadence (#103). Freshness normally arrives as
 /// a `Changed` signal the moment a mutation persists; this slow poll
 /// only covers an old (signalless) service, a missed signal, and
 /// noticing that the service has gone away.
+#[cfg(target_os = "linux")]
 const POLL: Duration = Duration::from_secs(60);
 
-/// The well-known name the tray owns for its whole lifetime, making it
-/// a single instance the same way the service is one: AppRun starts a
-/// tray next to the service on every app launch, so a name the second
-/// copy cannot also own is what keeps repeated launches from stacking
-/// tray icons. It is deliberately *not* the service's `BUS_NAME` --
-/// the tray still connects to the service anonymously and can neither
-/// steal its name nor keep a stale service alive. It matches the SNI
-/// `id()` in `item`, pinned together by the identity test.
-pub(crate) const TRAY_NAME: &str = "org.sequ.timetrack.tray";
-
-/// Take a lock without unwrapping it (#51).
-///
-/// A poisoned lock still holds its data: the panic that poisoned it
-/// happened elsewhere, and the data behind it is intact. Unwrapping the
-/// poison turned one failure into a panic loop -- every later render
-/// panicked on the same lock -- so the poison is recovered here and the
-/// caller goes on.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|e| e.into_inner())
+/// zbus uses the async-io backend (see the workspace Cargo.toml), so the
+/// runtime is `async_io`, not tokio -- same as the service. Windows and
+/// macOS skip the executor: their backends own the UI thread plus a poll
+/// worker (#155/#156).
+fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    return timetrack_tray::backend_windows::run();
+    #[cfg(target_os = "macos")]
+    return timetrack_tray::backend_macos::run();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    return async_io::block_on(run());
 }
 
-/// zbus uses the async-io backend (see the workspace Cargo.toml), so the
-/// runtime is `async_io`, not tokio -- same as the service.
-fn main() -> anyhow::Result<()> {
-    async_io::block_on(run())
+/// Stub for targets without a backend yet: the neutral core compiles,
+/// but there is no tray to run yet.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+async fn run() -> anyhow::Result<()> {
+    eprintln!("timetrack-tray: no tray backend on this OS yet");
+    Ok(())
 }
 
 /// Claim the single-instance name on its own connection, held for the
-/// process's whole run.
+/// process's whole run (Linux).
 ///
 /// `Some` holds the connection that owns `TRAY_NAME`; dropping it (on
 /// quit, or on death) releases the name, exactly like the service.
@@ -102,6 +114,7 @@ fn main() -> anyhow::Result<()> {
 /// without it the daemon queues the request behind the running tray
 /// and this copy would sail on and register a second icon, only to
 /// inherit the name when the first quits.
+#[cfg(target_os = "linux")]
 async fn claim_single_instance() -> anyhow::Result<Option<zbus::Connection>> {
     let conn = zbus::Connection::session()
         .await
@@ -124,6 +137,7 @@ async fn claim_single_instance() -> anyhow::Result<Option<zbus::Connection>> {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn run() -> anyhow::Result<()> {
     // One tray per session, claimed before the item registers so a
     // duplicate launch never even flashes a second icon. Held in
@@ -321,17 +335,17 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
         ConnState, MenuModel, TimetrackTray, TooltipState, build_menu_model, conn_state,
         quick_add_label, report_action, tooltip_text,
     };
-    use crate::state::no_watcher_notice;
     use ksni::Tray as _;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use timetrack_proto::{ClientError, ProjectView, ServiceError, Snapshot};
+    use timetrack_tray::state::no_watcher_notice;
 
     #[test]
     fn the_no_watcher_notice_names_the_working_quick_add_paths() {

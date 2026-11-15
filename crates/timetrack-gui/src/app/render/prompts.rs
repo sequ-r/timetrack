@@ -22,7 +22,9 @@ use super::super::dialogs::entry::{DialogField, EntryDialog};
 use super::super::dialogs::merge::MergeConfirm;
 use super::super::dialogs::project::ProjectPrompt;
 use super::super::dialogs::recolour::RecolourPrompt;
+use super::super::dialogs::source::{SourceDialog, SourceField, SourceRemoveConfirm};
 use super::super::dialogs::split::SplitPrompt;
+use super::super::mouse::{FieldHit, MouseField, field_mouse};
 use super::super::{display_tz, theme};
 use std::time::Duration;
 
@@ -169,6 +171,12 @@ impl TimetrackView {
             .when_some(self.delete_project_confirm.as_ref(), |el, confirm| {
                 el.child(self.render_delete_project_confirm(confirm))
             })
+            .when_some(self.source_dialog.as_ref(), |el, dlg| {
+                el.child(self.render_source_dialog(dlg))
+            })
+            .when_some(self.source_remove_confirm.as_ref(), |el, confirm| {
+                el.child(self.render_source_remove_confirm(confirm))
+            })
             .with_animation(
                 ElementId::from((ElementId::from("prompt-fade"), key)),
                 Animation::new(Duration::from_millis(theme::PROMPT_FADE_MS))
@@ -182,8 +190,10 @@ impl TimetrackView {
     /// A bordered panel at the top of Home, above the week total: while it is
     /// open it owns the keyboard (see `on_dialog_key`), so it sits where the
     /// eye already is rather than competing from below. Typing is
-    /// keyboard-driven with no toolkit text field, but a click on a field
-    /// row focuses that field, the mouse route to where Tab goes.
+    /// keyboard-driven with no toolkit text field, but a press on a field
+    /// row focuses that field and places the caret at the click (#127),
+    /// the mouse route to where Tab goes, plus the click offset — and a
+    /// drag selects.
     fn render_entry_dialog(&self, dlg: &EntryDialog) -> impl IntoElement {
         // Drawing only (the keep-hints): saving re-resolves strictly.
         let tz = display_tz(&self.snapshot);
@@ -201,6 +211,7 @@ impl TimetrackView {
                          caret: &super::super::textline::Caret| {
             let focused = current_field == field;
             let entity = entity_for_fields.clone();
+            let hit_entity = entity.clone();
             div()
                 .id(id)
                 .flex()
@@ -236,11 +247,15 @@ impl TimetrackView {
                             rgba(theme::TRANSPARENT)
                         })
                         .text_color(rgba(theme::BODY_TEXT))
-                        .child(if focused {
-                            super::super::textline::render_with_caret(value, caret)
-                        } else {
-                            timetrack_core::sanitize_display(value)
-                        }),
+                        .child(FieldHit::wrap(
+                            MouseField::Entry(field),
+                            hit_entity,
+                            if focused {
+                                super::super::textline::render_with_caret(value, caret)
+                            } else {
+                                timetrack_core::sanitize_display(value)
+                            },
+                        )),
                 )
                 .child(
                     div()
@@ -249,12 +264,7 @@ impl TimetrackView {
                         .child(hint.to_string()),
                 )
                 .when_some(entity, move |this, entity| {
-                    this.on_click(move |_ev, _window, cx| {
-                        entity.update(cx, |view, cx| {
-                            view.focus_dialog_field(field);
-                            cx.notify();
-                        });
-                    })
+                    field_mouse(this, MouseField::Entry(field), entity)
                 })
         };
 
@@ -396,10 +406,17 @@ impl TimetrackView {
                             .border_color(rgba(theme::FOCUS_RING))
                             .bg(rgba(theme::RAISED_BG))
                             .text_color(rgba(theme::BODY_TEXT))
-                            .child(super::super::textline::render_with_caret(
-                                &prompt.at,
-                                &prompt.caret,
-                            )),
+                            .child(FieldHit::wrap(
+                                MouseField::Split,
+                                self.entity.clone(),
+                                super::super::textline::render_with_caret(
+                                    &prompt.at,
+                                    &prompt.caret,
+                                ),
+                            ))
+                            .when_some(self.entity.clone(), move |this, entity| {
+                                field_mouse(this, MouseField::Split, entity)
+                            }),
                     )
                     .child(
                         div()
@@ -489,10 +506,17 @@ impl TimetrackView {
                             .border_color(rgba(theme::FOCUS_RING))
                             .bg(rgba(theme::RAISED_BG))
                             .text_color(rgba(theme::BODY_TEXT))
-                            .child(super::super::textline::render_with_caret(
-                                &prompt.name,
-                                &prompt.caret,
-                            )),
+                            .child(FieldHit::wrap(
+                                MouseField::Project,
+                                self.entity.clone(),
+                                super::super::textline::render_with_caret(
+                                    &prompt.name,
+                                    &prompt.caret,
+                                ),
+                            ))
+                            .when_some(self.entity.clone(), move |this, entity| {
+                                field_mouse(this, MouseField::Project, entity)
+                            }),
                     )
                     .child(
                         div()
@@ -597,6 +621,223 @@ impl TimetrackView {
             self.entity.clone(),
             TimetrackView::confirm_delete_project,
             TimetrackView::cancel_delete_project,
+        )
+    }
+
+    /// The source dialog (#153): kind and project cycle (`h`/`l`, or a
+    /// click), locator and label take text with caret and selection
+    /// like every other field. No password row anywhere: CalDAV
+    /// secrets stay in the OS store via the CLI, and the hint line
+    /// says exactly that.
+    fn render_source_dialog(&self, dlg: &SourceDialog) -> impl IntoElement {
+        let title = match &dlg.edit_id {
+            None => "NEW SOURCE".to_string(),
+            Some(id) => format!("EDIT SOURCE {id}"),
+        };
+        let current_field = dlg.field;
+        let entity_for_fields = self.entity.clone();
+        let text_row = |id: &'static str,
+                        field: SourceField,
+                        label: &str,
+                        value: &str,
+                        hint: &str,
+                        caret: &super::super::textline::Caret| {
+            let focused = current_field == field;
+            let entity = entity_for_fields.clone();
+            let hit_entity = entity.clone();
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_1()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .text_color(if focused {
+                            rgba(theme::SELECTED_TEXT)
+                        } else {
+                            rgba(theme::MUTED_TEXT)
+                        })
+                        .child(format!("{} {label}", if focused { ">" } else { " " })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if focused {
+                            rgba(theme::FOCUS_RING)
+                        } else {
+                            rgba(theme::TRANSPARENT)
+                        })
+                        .bg(if focused {
+                            rgba(theme::RAISED_BG)
+                        } else {
+                            rgba(theme::TRANSPARENT)
+                        })
+                        .text_color(rgba(theme::BODY_TEXT))
+                        .child(FieldHit::wrap(
+                            MouseField::Source(field),
+                            hit_entity,
+                            if focused {
+                                super::super::textline::render_with_caret(value, caret)
+                            } else {
+                                timetrack_core::sanitize_display(value)
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(theme::HINT_TEXT))
+                        .child(hint.to_string()),
+                )
+                .when_some(entity, move |this, entity| {
+                    field_mouse(this, MouseField::Source(field), entity)
+                })
+        };
+        // One cycling row: the shared shape of the kind and project
+        // rows, which step on `h`/`l` or a click instead of taking
+        // text, like the entry dialog's project row.
+        let cycle_row =
+            |id: &'static str, field: SourceField, label: &str, value: String, hint: &str| {
+                let focused = current_field == field;
+                let entity = self.entity.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .text_color(if focused {
+                                rgba(theme::SELECTED_TEXT)
+                            } else {
+                                rgba(theme::MUTED_TEXT)
+                            })
+                            .child(format!("{} {label}", if focused { ">" } else { " " })),
+                    )
+                    .child(
+                        div()
+                            .id(id)
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(if focused {
+                                rgba(theme::FOCUS_RING)
+                            } else {
+                                rgba(theme::TRANSPARENT)
+                            })
+                            .bg(if focused {
+                                rgba(theme::RAISED_BG)
+                            } else {
+                                rgba(theme::TRANSPARENT)
+                            })
+                            .text_color(rgba(theme::BODY_TEXT))
+                            .child(format!("‹ {value} ›"))
+                            .when_some(entity, move |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.focus_source_field(field);
+                                        match field {
+                                            SourceField::Kind => view.cycle_source_kind(1),
+                                            SourceField::Project => view.cycle_source_project(1),
+                                            _ => {}
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgba(theme::HINT_TEXT))
+                            .child(hint.to_string()),
+                    )
+            };
+
+        let (_, chosen) = dlg.chosen_project();
+        let mut panel = prompt_panel()
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
+            .child(cycle_row(
+                "source-field-kind",
+                SourceField::Kind,
+                "kind",
+                dlg.kind.as_str().to_string(),
+                "h/l or click to change",
+            ))
+            .child(text_row(
+                "source-field-locator",
+                SourceField::Locator,
+                "locator",
+                &dlg.locator,
+                "file path or URL",
+                &dlg.caret,
+            ))
+            .child(text_row(
+                "source-field-label",
+                SourceField::Label,
+                "label",
+                &dlg.label,
+                "empty takes the file or URL's last part",
+                &dlg.caret,
+            ))
+            .child(cycle_row(
+                "source-field-project",
+                SourceField::Project,
+                "project",
+                format!("→ {chosen}"),
+                "h/l or click to map",
+            ))
+            .child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgba(theme::HINT_TEXT))
+                    .child(
+                        "CalDAV password? run: timetrack source-set-credential <id> — secrets never live in the app",
+                    ),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgba(theme::HINT_TEXT))
+                    .child("type to edit · tab next field · h/l cycle · enter save · esc cancel"),
+            );
+        if let Some(err) = &dlg.error {
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
+        }
+        panel
+    }
+
+    /// The source-removal confirmation banner (#153): what goes with
+    /// the source and what stays, answered by the buttons (the banner
+    /// opens from a row button only) or Escape.
+    fn render_source_remove_confirm(&self, confirm: &SourceRemoveConfirm) -> impl IntoElement {
+        confirm_banner(
+            confirm.summary.clone(),
+            "confirm-remove-source",
+            "Remove source",
+            rgba(theme::DANGER),
+            "cancel-remove-source",
+            self.entity.clone(),
+            TimetrackView::confirm_source_remove,
+            TimetrackView::cancel_source_remove,
         )
     }
 }

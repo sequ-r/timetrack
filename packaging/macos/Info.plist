@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TimeTrack.app bundle metadata (#159). A template, not the shipped file:
+  build-bundle.sh next to this file stamps __VERSION__ with the release
+  version (both keys) before sealing the bundle, so the app reports the
+  version its tag names. The file stays parseable as-is (the token is a
+  plain string), which is what the Linux plist check validates.
+
+  Bundle ID matches the Linux desktop file and the tray's single-instance
+  name (org.sequ.timetrack / org.sequ.timetrack.tray): one reverse-DNS
+  root everywhere.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>TimeTrack</string>
+    <!-- The GUI is the bundle's executable: opening the app opens the
+         window, and the window auto-spawns the sibling service beside
+         it (see README.md, "Bundle layout"). -->
+    <key>CFBundleExecutable</key>
+    <string>timetrack-gui</string>
+    <key>CFBundleIconFile</key>
+    <string>TimeTrack</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.sequ.timetrack</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>TimeTrack</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <!-- 13.0 Ventura: the oldest release this slice was written against.
+         Older systems are untested, so the bundle refuses them plainly
+         instead of failing oddly; lower only with an older-host run. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright 2026 sequ. GPL-3.0-or-later.</string>
+</dict>
+</plist>

@@ -10,12 +10,25 @@
 //! could disagree with the totals on Home.
 
 use super::super::TimetrackView;
-use super::super::export::save::{export_location_text, export_preview_entries};
-use super::super::service::{Action, export_request, now_ms};
+use super::super::export::picker::RangeEnd;
+use super::super::export::save::{
+    export_location_text, export_preview_entries, export_preview_entries_between,
+};
+use super::super::mouse::{FieldHit, MouseField, field_mouse};
+use super::super::service::{Action, ExportCall, export_range_request, export_request, now_ms};
 use super::super::status::StatusMsg;
 use super::super::{display_tz, snapshot_tz, theme};
 use gpui::prelude::*;
 use gpui::{ElementId, IntoElement, div, rgba};
+
+/// What a pill in the scope row selects (#133): a fixed scope, or the
+/// custom from/to range. The click carries no zone: each arm resolves it
+/// from the snapshot at the click site.
+#[derive(Debug, Clone, Copy)]
+enum Choice {
+    Scope(timetrack_core::ExportScope),
+    Range,
+}
 
 impl TimetrackView {
     /// Export. The service owns aggregation, so what is shown here is exactly
@@ -53,17 +66,23 @@ impl TimetrackView {
                     )),
             )
             .child(self.render_export_scope())
-            .child(self.render_export_anchor(&tz))
+            .child(if self.export_picker.is_range() {
+                self.render_export_range(&tz).into_any_element()
+            } else {
+                self.render_export_anchor(&tz).into_any_element()
+            })
             .child(self.render_export_actions())
             .child(self.render_export_preview(&tz))
             .into_any_element()
     }
 
-    /// The SCOPE section: the three pills following the picker's scope.
+    /// The SCOPE section: the three pills following the picker's scope,
+    /// plus the custom range (#133).
     fn render_export_scope(&self) -> impl IntoElement {
         // Scope plus anchor: the stepper and the typed day edit one shared
-        // anchor, and all time visibly ignores it. The preview and the
-        // export buttons below follow this scope plus anchor.
+        // anchor, and all time visibly ignores it. The range choice parks
+        // the anchor and drives the two range days instead. The preview
+        // and the export buttons below follow the showing choice.
         let mut section = div().child(
             div()
                 .pt_4()
@@ -79,8 +98,94 @@ impl TimetrackView {
         ] {
             row = row.child(self.render_scope_pill(scope, id, label));
         }
+        row = row.child(self.render_range_pill());
         section = section.child(row);
         section
+    }
+
+    /// The RANGE section (#133): the from/to day fields plus any error
+    /// from a bad day. Shown in place of the anchor section while the
+    /// range choice is showing.
+    fn render_export_range(&self, tz: &timetrack_core::Tz) -> impl IntoElement {
+        let mut section = div().child(
+            div()
+                .pt_3()
+                .text_sm()
+                .text_color(rgba(theme::MUTED_TEXT))
+                .child("RANGE"),
+        );
+        section = section.child(
+            div()
+                .pt_1()
+                .text_color(rgba(theme::STRONG_TEXT))
+                .child(self.export_picker.range.period_id(tz)),
+        );
+        section = section.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pt_1()
+                .child(self.render_range_field(RangeEnd::From, "range-from-field"))
+                .child(div().text_color(rgba(theme::MUTED_TEXT)).child(".."))
+                .child(self.render_range_field(RangeEnd::To, "range-to-field")),
+        );
+        section = section.child(
+            div()
+                .pt_1()
+                .text_sm()
+                .text_color(rgba(theme::HINT_TEXT))
+                .child("t type a from day · click a day to retype it · enter set · esc cancel"),
+        );
+        if let Some(err) = &self.export_picker.range.error {
+            section = section.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
+        }
+        section
+    }
+
+    /// One of the range's day fields (#133): the typed day with its caret
+    /// while being edited, the mirror otherwise. Pressing opens it and
+    /// places the caret at the click (#127), like the anchor field —
+    /// and a drag selects.
+    fn render_range_field(&self, end: RangeEnd, id: &'static str) -> impl IntoElement {
+        let range = &self.export_picker.range;
+        let editing = range.editing == Some(end);
+        let (text, caret) = match end {
+            RangeEnd::From => (&range.from_text, &range.from_caret),
+            RangeEnd::To => (&range.to_text, &range.to_caret),
+        };
+        let field_text = if editing {
+            super::super::textline::render_with_caret(text, caret)
+        } else {
+            text.clone()
+        };
+        let entity = self.entity.clone();
+        div()
+            .id(ElementId::from(id))
+            .flex_1()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(if editing {
+                rgba(theme::RAISED_BG)
+            } else {
+                rgba(theme::TRANSPARENT)
+            })
+            .text_color(rgba(theme::BODY_TEXT))
+            .child(FieldHit::wrap(
+                MouseField::Range(end),
+                entity.clone(),
+                format!("day {field_text}"),
+            ))
+            .cursor_pointer()
+            .when_some(entity, move |el, entity| {
+                field_mouse(el, MouseField::Range(end), entity)
+            })
     }
 
     /// The ANCHOR section: the stepper, the typed day and its hint, plus any
@@ -137,15 +242,19 @@ impl TimetrackView {
                 } else {
                     rgba(theme::HINT_TEXT)
                 })
-                .child(format!("day {field_text}"));
+                .child(if picker_active {
+                    FieldHit::wrap(
+                        MouseField::Anchor,
+                        entity.clone(),
+                        format!("day {field_text}"),
+                    )
+                    .into_any_element()
+                } else {
+                    div().child(format!("day {field_text}")).into_any_element()
+                });
             if picker_active {
                 field = field.cursor_pointer().when_some(entity, |el, entity| {
-                    el.on_click(move |_ev, _window, cx| {
-                        entity.update(cx, |view, cx| {
-                            view.export_picker.start_editing();
-                            cx.notify();
-                        });
-                    })
+                    field_mouse(el, MouseField::Anchor, entity)
                 });
             } else {
                 field = field.cursor_default();
@@ -217,7 +326,9 @@ impl TimetrackView {
         // period-stamped name the status line reports. Scopes match the
         // CLI's `timetrack export --scope week|month|all`; each button saves
         // its own scope with the shared anchor (all time ignores it), so the
-        // buttons keep working while the preview follows the picker.
+        // buttons keep working while the preview follows the picker. The
+        // range button (#133) saves the two typed days over the range call
+        // with the CLI-identical status wording.
         let mut row = div().flex().gap_2().pt_3();
         for (i, button_scope) in [
             timetrack_core::ExportScope::Week,
@@ -258,7 +369,49 @@ impl TimetrackView {
                                             now_ms(),
                                             &tz,
                                         );
-                                        view.send(Action::ExportCsv(request));
+                                        view.send(Action::ExportCsv(ExportCall::Scoped(request)));
+                                    }
+                                    Err(e) => {
+                                        view.status = Some(StatusMsg::local(e.to_string()));
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        })
+                    }),
+            );
+        }
+        // The range export (#133): the two typed days over the range call.
+        // A backwards range never reaches the service: the click refuses
+        // it locally with the service's own wording, and the preview
+        // above already shows it would hold nothing.
+        {
+            let entity = self.entity.clone();
+            row = row.child(
+                div()
+                    .id(ElementId::from(("export", 3u64)))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgba(theme::ACTION))
+                    .text_color(rgba(theme::SELECTED_TEXT))
+                    .child("Export range")
+                    .when_some(entity, move |el, entity| {
+                        el.on_click(move |_ev, _window, cx| {
+                            entity.update(cx, |view, cx| {
+                                match snapshot_tz(&view.snapshot) {
+                                    Ok(tz) => {
+                                        let range = &view.export_picker.range;
+                                        let (from_ms, to_ms) = (range.from_ms, range.to_ms);
+                                        if !range.is_ordered(&tz) {
+                                            view.export_picker.range.error =
+                                                Some("the range ends before it starts".to_string());
+                                        } else {
+                                            view.send(Action::ExportCsv(ExportCall::Range(
+                                                export_range_request(from_ms, to_ms, &tz),
+                                            )));
+                                        }
                                     }
                                     Err(e) => {
                                         view.status = Some(StatusMsg::local(e.to_string()));
@@ -286,8 +439,9 @@ impl TimetrackView {
     }
 
     /// A preview of the first rows of the scoped export, so what is seen
-    /// is what the stakeholder gets: the picker's scope plus anchor,
-    /// oldest first (all time ignores the anchor).
+    /// is what the stakeholder gets: the picker's scope plus anchor, or
+    /// the two range days while the range choice is showing (#133),
+    /// oldest first either way (all time ignores the anchor).
     fn render_export_preview(&self, tz: &timetrack_core::Tz) -> impl IntoElement {
         let mut section = div().child(
             div()
@@ -296,12 +450,23 @@ impl TimetrackView {
                 .text_color(rgba(theme::MUTED_TEXT))
                 .child("PREVIEW"),
         );
-        let preview = export_preview_entries(
-            &self.snapshot,
-            self.export_picker.scope,
-            self.export_picker.anchor_ms,
-            tz,
-        );
+        // The range preview follows the two typed days; the scoped preview
+        // keeps following the picker's scope plus anchor.
+        let preview = if self.export_picker.is_range() {
+            export_preview_entries_between(
+                &self.snapshot,
+                self.export_picker.range.from_ms,
+                self.export_picker.range.to_ms,
+                tz,
+            )
+        } else {
+            export_preview_entries(
+                &self.snapshot,
+                self.export_picker.scope,
+                self.export_picker.anchor_ms,
+                tz,
+            )
+        };
         for e in preview.iter().take(20) {
             let project = self
                 .snapshot
@@ -342,7 +507,31 @@ impl TimetrackView {
         id: &'static str,
         label: &'static str,
     ) -> impl IntoElement {
-        let selected = self.export_picker.scope == scope;
+        // A scope pill never shows selected under the range choice: the
+        // scope is parked, not showing, while the range is.
+        let selected = !self.export_picker.is_range() && self.export_picker.scope == scope;
+        self.render_choice_pill(id, label, selected, Choice::Scope(scope))
+    }
+
+    /// The range pill on the Export tab (#133): same neutral styling as
+    /// the scope pills, selected exactly while the range is showing.
+    fn render_range_pill(&self) -> impl IntoElement {
+        self.render_choice_pill(
+            "scope-range",
+            "Range",
+            self.export_picker.is_range(),
+            Choice::Range,
+        )
+    }
+
+    /// One pill in the scope row: a fixed scope or the range choice.
+    fn render_choice_pill(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        selected: bool,
+        choice: Choice,
+    ) -> impl IntoElement {
         let entity = self.entity.clone();
         div()
             .id(ElementId::from(id))
@@ -364,11 +553,14 @@ impl TimetrackView {
             .when_some(entity, move |el, entity| {
                 el.on_click(move |_ev, _window, cx| {
                     entity.update(cx, |view, cx| {
-                        match snapshot_tz(&view.snapshot) {
-                            Ok(tz) => view.export_picker.set_scope(scope, &tz),
-                            Err(e) => {
-                                view.status = Some(StatusMsg::local(e.to_string()));
-                            }
+                        match choice {
+                            Choice::Scope(scope) => match snapshot_tz(&view.snapshot) {
+                                Ok(tz) => view.export_picker.set_scope(scope, &tz),
+                                Err(e) => {
+                                    view.status = Some(StatusMsg::local(e.to_string()));
+                                }
+                            },
+                            Choice::Range => view.export_picker.select_range(),
                         }
                         cx.notify();
                     });

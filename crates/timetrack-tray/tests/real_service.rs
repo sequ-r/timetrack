@@ -15,6 +15,10 @@
 //! `target/debug/timetrack-service` missing (CI builds it in the step before
 //! the tests). It fails fast with directions rather than probing a stale
 //! install.
+//!
+//! Linux only: the menu clicks travel over dbusmenu.
+
+#![cfg(target_os = "linux")]
 
 mod common;
 
@@ -64,16 +68,16 @@ async fn wait_for_service(client: &Client, timeout: Duration) -> timetrack_proto
     }
 }
 
-/// Wait until some entry with the wanted duration lands, returning the live
-/// snapshot that carries it.
-async fn wait_for_entry(client: &Client, duration_ms: i64, timeout: Duration) {
+/// Wait until some entry with the wanted duration lands on the wanted
+/// project.
+async fn wait_for_entry(client: &Client, project_id: &str, duration_ms: i64, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let snap = client.snapshot().await.expect("snapshot must succeed");
         if snap
             .entries
             .iter()
-            .any(|e| e.project_id == "p1" && e.duration_ms() == duration_ms)
+            .any(|e| e.project_id == project_id && e.duration_ms() == duration_ms)
         {
             return;
         }
@@ -128,11 +132,14 @@ fn tray_round_trips_against_the_real_service() {
             .await
             .expect("must connect toward the private socket");
         // The seed, through the real wire: one unarchived General, no time.
+        // Its id is a minted UUID (#148), so everything below names it
+        // through this discovered id, never a hardcoded one.
         let snap = wait_for_service(&client, Duration::from_secs(15)).await;
         assert_eq!(snap.projects.len(), 1);
         assert_eq!(snap.projects[0].name, "General");
         assert!(!snap.projects[0].archived);
         assert!(snap.entries.is_empty());
+        let seed_id = snap.projects[0].id.clone();
         // §17: the seed persists to the SQLite database beside the legacy
         // store path the service was given; no JSON store is created.
         assert!(
@@ -160,19 +167,19 @@ fn tray_round_trips_against_the_real_service() {
         // with the week aggregate carrying it.
         let fifteen = 15 * 60_000;
         common::click_when_ready(&menu, "+15m", false, Duration::from_secs(20)).await;
-        wait_for_entry(&client, fifteen, Duration::from_secs(15)).await;
+        wait_for_entry(&client, &seed_id, fifteen, Duration::from_secs(15)).await;
         let snap = client.snapshot().await.expect("snapshot must succeed");
         let entry = snap
             .entries
             .iter()
-            .find(|e| e.project_id == "p1" && e.duration_ms() == fifteen)
+            .find(|e| e.project_id == seed_id && e.duration_ms() == fifteen)
             .expect("the entry just waited for must still be there");
         assert_eq!(
             entry.source,
             EntrySource::QuickAdd,
             "a menu quick-add is undoable, so it must be tagged: {entry:?}"
         );
-        assert_eq!(snap.week.per_project.get("p1"), Some(&fifteen));
+        assert_eq!(snap.week.per_project.get(&seed_id), Some(&fifteen));
         let undone_id = entry.id.clone();
 
         // The menu rebuilds behind the store: the week-total header follows.
@@ -184,7 +191,7 @@ fn tray_round_trips_against_the_real_service() {
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");
             if snap.entries.iter().all(|e| e.id != undone_id) {
-                assert_eq!(snap.week.per_project.get("p1").copied().unwrap_or(0), 0);
+                assert_eq!(snap.week.per_project.get(&seed_id).copied().unwrap_or(0), 0);
                 break;
             }
             if Instant::now() > deadline {
@@ -198,7 +205,7 @@ fn tray_round_trips_against_the_real_service() {
         // confirm row stating duration and project.
         let thirty = 30 * 60_000;
         common::click_when_ready(&menu, "+30m", false, Duration::from_secs(20)).await;
-        wait_for_entry(&client, thirty, Duration::from_secs(15)).await;
+        wait_for_entry(&client, &seed_id, thirty, Duration::from_secs(15)).await;
         common::wait_for_row(&menu, "This week: 30m", false, Duration::from_secs(20)).await;
         common::click_when_ready(
             &menu,
@@ -211,7 +218,7 @@ fn tray_round_trips_against_the_real_service() {
         loop {
             let snap = client.snapshot().await.expect("snapshot must succeed");
             if snap.entries.iter().all(|e| e.duration_ms() != thirty) {
-                assert_eq!(snap.week.per_project.get("p1").copied().unwrap_or(0), 0);
+                assert_eq!(snap.week.per_project.get(&seed_id).copied().unwrap_or(0), 0);
                 break;
             }
             if Instant::now() > deadline {
@@ -236,7 +243,7 @@ fn tray_round_trips_against_the_real_service() {
             "no announcement without a mutation"
         );
         client
-            .quick_add("p1", 5 * 60_000)
+            .quick_add(&seed_id, 5 * 60_000)
             .await
             .expect("quick add must succeed");
         assert_eq!(

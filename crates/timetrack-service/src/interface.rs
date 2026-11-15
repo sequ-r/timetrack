@@ -39,11 +39,36 @@ fn lock(mutex: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 }
 
 use timetrack_core as core;
-use timetrack_core::{Counter, EntrySource, RuleError, Store};
+use timetrack_core::{EntrySource, RuleError, Store};
 use timetrack_proto::{
     self as protocol, EntryView, ProjectView, ServiceError, Snapshot, TotalsView,
 };
 use timetrack_store::SqliteStore;
+
+use crate::credentials::{CredentialStore, OsCredentialStore};
+use std::sync::Arc;
+
+/// UUID identities, minted here at the service boundary (ADR 0018).
+///
+/// The core stays randomness-free behind its [`core::Ids`] trait: this
+/// is the production generator, while [`core::Counter`] keeps serving
+/// as the deterministic test fake. Stateless — every mint is a fresh
+/// UUIDv4, so unlike the old counter there is nothing to resume after
+/// a restart and nothing two stores could collide on.
+// Clone keeps the mutation funnel's working-copy pattern (#100): the
+// clone is discarded when the persist fails.
+#[derive(Debug, Clone, Default)]
+struct UuidIds;
+
+impl core::Ids for UuidIds {
+    fn next(&mut self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    fn next_project(&mut self) -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+}
 
 /// The current time, in milliseconds since the Unix epoch.
 fn now_ms() -> i64 {
@@ -58,7 +83,11 @@ fn now_ms() -> i64 {
 struct Inner {
     store: SqliteStore,
     data: Store,
-    ids: Counter,
+    ids: UuidIds,
+    /// Per-source secrets (#149): the OS store in production, the fake
+    /// in tests. Behind an `Arc` so fetch paths can hold it without the
+    /// state lock.
+    credentials: Arc<dyn CredentialStore>,
     /// The local zone (#102): resolved strictly at startup from `TZ` (or
     /// the system zone), then re-resolved before every snapshot, mutation
     /// and export so a system timezone change (travel) is picked up live
@@ -120,7 +149,7 @@ impl EntryService {
         // here with an actionable message, instead of silently running in
         // UTC and bucketing every typed local time into the wrong day.
         let tz = core::Tz::try_from_env().map_err(anyhow::Error::new)?;
-        Self::new_inner(store, tz, true)
+        Self::new_inner(store, tz, true, Arc::new(OsCredentialStore::new()))
     }
 
     /// Build with an explicit, pinned zone. The production path is
@@ -130,10 +159,25 @@ impl EntryService {
     /// test's zone can never be replaced under it.
     #[cfg(test)]
     pub fn new_with_tz(store: SqliteStore, tz: core::Tz) -> anyhow::Result<Self> {
-        Self::new_inner(store, tz, false)
+        Self::new_inner(store, tz, false, Arc::new(OsCredentialStore::new()))
     }
 
-    fn new_inner(store: SqliteStore, tz: core::Tz, tz_live: bool) -> anyhow::Result<Self> {
+    /// Build with an injected credential backend (#149): the fake, so
+    /// credential tests never touch a real OS store.
+    #[cfg(test)]
+    pub fn new_with_credentials(
+        store: SqliteStore,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(store, core::Tz::utc(), false, credentials)
+    }
+
+    fn new_inner(
+        store: SqliteStore,
+        tz: core::Tz,
+        tz_live: bool,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> anyhow::Result<Self> {
         let mut data = store.load()?;
         // A brand-new store has no projects, and with no project there is
         // nothing to attribute time to -- which made the Home tab's quick-add
@@ -143,18 +187,19 @@ impl EntryService {
         let seeded = data.projects.is_empty();
         if seeded {
             data.projects.push(timetrack_core::Project {
-                id: "p1".into(),
+                id: uuid::Uuid::new_v4().to_string(),
                 name: "General".into(),
                 colour: None,
                 archived: false,
             });
         }
-        let ids = Counter::continuing(&data);
+        let ids = UuidIds;
         let service = EntryService {
             inner: Mutex::new(Inner {
                 store,
                 data,
                 ids,
+                credentials,
                 tz,
                 tz_live,
                 tz_refresh_error: None,
@@ -245,7 +290,7 @@ impl EntryService {
     /// linger in snapshots it was never acknowledged for.
     fn mutate<T>(
         &self,
-        f: impl FnOnce(&mut Store, &mut Counter, i64) -> core::RuleResult<T>,
+        f: impl FnOnce(&mut Store, &mut dyn core::Ids, i64) -> core::RuleResult<T>,
     ) -> Result<T, ServiceError> {
         let mut g = lock(&self.inner);
         refresh_tz(&mut g);
@@ -368,13 +413,14 @@ impl EntryService {
     /// never delete hand-entered time by mistake.
     pub fn undo_quick_add(&self, id: &str) -> Result<(), ServiceError> {
         self.mutate(|s, _ids, _| {
-            let entry = s
-                .get(id)
-                .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
+            // The one lookup this layer does itself rather than through
+            // a rule: resolve the same way, so prefixes work here too.
+            let id = core::resolve_entry_id(s, id)?;
+            let entry = s.get(&id).expect("resolved above");
             if entry.source != EntrySource::QuickAdd {
-                return Err(RuleError::NotQuickAdd(id.to_string()));
+                return Err(RuleError::NotQuickAdd(id.clone()));
             }
-            core::delete_entry(s, id).map(|_| ())
+            core::delete_entry(s, &id).map(|_| ())
         })
     }
 
@@ -499,25 +545,72 @@ impl EntryService {
         project_id: Option<&str>,
         label: &str,
     ) -> Result<protocol::SourceView, ServiceError> {
-        if kind != "ics_file" && kind != "ics_url" && kind != "caldav" {
+        validate_source_identity(kind, locator)?;
+        let g = lock(&self.inner);
+        // Resolve before registering: a prefix names its project, and an
+        // ambiguous one refuses before any row is written.
+        let project_id = project_id
+            .map(|pid| core::resolve_project_id(&g.data, pid))
+            .transpose()?;
+        let label = if label.trim().is_empty() {
+            locator.rsplit('/').next().unwrap_or(locator)
+        } else {
+            label
+        };
+        let already = g
+            .store
+            .sources()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .iter()
+            .any(|s| s.kind == kind && s.locator == locator);
+        let src = g
+            .store
+            .add_source(kind, locator, project_id.as_deref(), label, now_ms())
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        drop(g);
+        if !already {
+            self.notify_changed();
+        }
+        Ok(source_view(src))
+    }
+
+    /// Rewrite a source (#153): kind, locator, project mapping, and label
+    /// are all replaced with the given state. The same validation as
+    /// registration applies (bad kind, empty locator, a CalDAV password
+    /// in the URL), plus the edit's own: the id must exist, and the new
+    /// `(kind, locator)` must not belong to another source. An empty
+    /// label re-derives from the locator, as in registration.
+    pub fn update_source(
+        &self,
+        id: &str,
+        kind: &str,
+        locator: &str,
+        project_id: Option<&str>,
+        label: &str,
+    ) -> Result<protocol::SourceView, ServiceError> {
+        validate_source_identity(kind, locator)?;
+        let g = lock(&self.inner);
+        if g.store
+            .source(id)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .is_none()
+        {
             return Err(ServiceError::Other(format!(
-                "unknown source kind '{kind}' (use ics_file, ics_url, or caldav)"
+                "no external source with id '{id}'"
             )));
         }
-        if kind == "caldav" {
-            crate::caldav::split_userinfo(locator).map_err(ServiceError::Other)?;
-        }
-        if locator.trim().is_empty() {
-            return Err(ServiceError::Other(
-                "a source needs a file path or URL".into(),
-            ));
-        }
-        let g = lock(&self.inner);
-        if let Some(pid) = project_id
-            && g.data.project(pid).is_none()
+        // Resolve before writing, as in registration.
+        let project_id = project_id
+            .map(|pid| core::resolve_project_id(&g.data, pid))
+            .transpose()?;
+        if g.store
+            .sources()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .iter()
+            .any(|s| s.id != id && s.kind == kind && s.locator == locator)
         {
-            return Err(ServiceError::from(RuleError::UnknownProject(
-                pid.to_string(),
+            return Err(ServiceError::Other(format!(
+                "a {kind} source for '{locator}' already exists"
             )));
         }
         let label = if label.trim().is_empty() {
@@ -527,8 +620,11 @@ impl EntryService {
         };
         let src = g
             .store
-            .add_source(kind, locator, project_id, label, now_ms())
-            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            .update_source(id, kind, locator, project_id.as_deref(), label, now_ms())
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+        drop(g);
+        self.notify_changed();
         Ok(source_view(src))
     }
 
@@ -545,7 +641,7 @@ impl EntryService {
     /// Fetch one source (or all), parse, and store new suggestions.
     /// Fetching never creates entries and never writes back.
     pub fn refresh_source(&self, id: Option<&str>) -> Result<protocol::RefreshView, ServiceError> {
-        let (tz, targets) = {
+        let (tz, targets, credentials) = {
             let mut g = lock(&self.inner);
             refresh_tz(&mut g);
             let all = g
@@ -564,7 +660,7 @@ impl EntryService {
                 }
                 None => all,
             };
-            (g.tz.clone(), targets)
+            (g.tz.clone(), targets, g.credentials.clone())
         };
         let mut total = protocol::RefreshView::default();
         // Suggestions are actionable near-term: expand recurrences a
@@ -573,7 +669,16 @@ impl EntryService {
         let now = now_ms();
         let (from_ms, until_ms) = (now - 31 * 86_400_000, now + 93 * 86_400_000);
         for src in &targets {
-            for text in fetch_source_texts(src)? {
+            if src.kind == "caldav" {
+                let tally = self.refresh_caldav_source(src, &tz, from_ms, until_ms)?;
+                total.fetched += tally.fetched;
+                total.inserted += tally.inserted;
+                total.skipped += tally.skipped;
+                total.updated += tally.updated;
+                total.withdrawn += tally.withdrawn;
+                continue;
+            }
+            for text in fetch_source_texts(src, &*credentials)? {
                 let parsed =
                     core::parse_ics_in_window(&text, &tz, from_ms, until_ms).map_err(|_| {
                         ServiceError::Other(format!("{} is not an iCalendar file", src.locator))
@@ -588,6 +693,123 @@ impl EntryService {
             }
         }
         Ok(total)
+    }
+
+    /// Refresh one CalDAV source incrementally (#151): fetch only what
+    /// changed since the stored sync state, reconcile each changed
+    /// resource into pending suggestions, withdraw what the server
+    /// deleted, and record the new state last — the token/CTag claims
+    /// "seen it all", so it must never get ahead of the data.
+    ///
+    /// Every fetched body parses before anything is stored, so a
+    /// corrupt resource fails the refresh with the previous state
+    /// untouched instead of half-applying it.
+    fn refresh_caldav_source(
+        &self,
+        src: &timetrack_store::ExternalSource,
+        tz: &core::Tz,
+        from_ms: i64,
+        until_ms: i64,
+    ) -> Result<protocol::RefreshView, ServiceError> {
+        // The fetch matrix (#149): a stored credential authenticates,
+        // and only a source without one reads the headless fallback.
+        let credentials = lock(&self.inner).credentials.clone();
+        let env_password = std::env::var("TIMETRACK_CALDAV_PASSWORD").ok();
+        let auth = crate::credentials::resolve_caldav_auth(
+            src.cred_ref.as_deref(),
+            src.cred_username.as_deref(),
+            &src.locator,
+            &|reference| credentials.get(reference),
+            env_password.as_deref(),
+        )
+        .map_err(ServiceError::Other)?;
+        let (state, known) = {
+            let g = lock(&self.inner);
+            let state = g
+                .store
+                .caldav_sync_state(&src.id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .unwrap_or_default();
+            let known = g
+                .store
+                .caldav_resources(&src.id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            (state, known)
+        };
+        // Off the state lock: the fetch is network I/O.
+        let outcome = crate::caldav::fetch_calendar_incremental(
+            &src.locator,
+            auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+            &crate::caldav::SyncState {
+                sync_token: state.sync_token,
+                ctag: state.ctag,
+            },
+            &known
+                .iter()
+                .map(|k| crate::caldav::StoredValidator {
+                    href: k.href.clone(),
+                    etag: k.etag.clone(),
+                    content_hash: k.content_hash.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(ServiceError::Other)?;
+        let mut parsed_all = Vec::with_capacity(outcome.fetched.len());
+        for resource in &outcome.fetched {
+            let parsed =
+                core::parse_ics_in_window(&resource.body, tz, from_ms, until_ms).map_err(|_| {
+                    ServiceError::Other(format!("{} is not an iCalendar file", resource.href))
+                })?;
+            parsed_all.push((resource, parsed));
+        }
+        let mut tally = protocol::RefreshView::default();
+        let g = lock(&self.inner);
+        for (resource, parsed) in &parsed_all {
+            tally.fetched += parsed.items.len();
+            tally.skipped += parsed.skipped;
+            let counts = g
+                .store
+                .reconcile_caldav_resource(&src.id, &resource.href, &parsed.items, now_ms())
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            tally.inserted += counts.inserted;
+            tally.updated += counts.updated;
+            tally.withdrawn += counts.withdrawn;
+            g.store
+                .upsert_caldav_resource(
+                    &src.id,
+                    &resource.href,
+                    resource.etag.as_deref(),
+                    Some(&resource.content_hash),
+                    now_ms(),
+                )
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        }
+        for validator in &outcome.refreshed {
+            g.store
+                .upsert_caldav_resource(
+                    &src.id,
+                    &validator.href,
+                    validator.etag.as_deref(),
+                    validator.content_hash.as_deref(),
+                    now_ms(),
+                )
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        }
+        for href in &outcome.removed_hrefs {
+            tally.withdrawn += g
+                .store
+                .withdraw_caldav_resource(&src.id, href)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        }
+        g.store
+            .set_caldav_sync_state(
+                &src.id,
+                outcome.sync_token.as_deref(),
+                outcome.ctag.as_deref(),
+                now_ms(),
+            )
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        Ok(tally)
     }
 
     pub fn suggestions(&self) -> Result<Vec<protocol::SuggestionView>, ServiceError> {
@@ -626,17 +848,27 @@ impl EntryService {
                 .source(&suggestion.source_id)
                 .map_err(|e| ServiceError::Storage(e.to_string()))?
                 .and_then(|s| s.project_id);
-            let fallback = project_id
-                .map(str::to_string)
-                .or(source_project)
-                .or_else(|| {
-                    g.data
-                        .projects
-                        .iter()
-                        .find(|p| !p.archived)
-                        .map(|p| p.id.clone())
-                })
-                .ok_or_else(|| ServiceError::Other("no project to confirm into".into()))?;
+            // Resolve the override — or validate the mapped/first-active
+            // fallback — before the suggestion is claimed, so a bad
+            // project refuses with the suggestion still pending.
+            let fallback = match project_id {
+                Some(pid) => core::resolve_project_id(&g.data, pid)?,
+                None => {
+                    let candidate = source_project
+                        .or_else(|| {
+                            g.data
+                                .projects
+                                .iter()
+                                .find(|p| !p.archived)
+                                .map(|p| p.id.clone())
+                        })
+                        .ok_or_else(|| ServiceError::Other("no project to confirm into".into()))?;
+                    // A stored mapping can dangle when its project was
+                    // deleted after the source was registered: refuse
+                    // before the claim, not after.
+                    core::resolve_project_id(&g.data, &candidate)?
+                }
+            };
             (suggestion, fallback)
         };
         {
@@ -685,11 +917,234 @@ impl EntryService {
         }
     }
 
+    // --- source credentials (#149) ---
+    //
+    // The secret goes to the OS store; SQLite keeps only the reference
+    // and the login name. The same operations the future GUI source
+    // editor will call.
+
+    /// Store (or replace) a source's secret in the OS credential store.
+    /// An empty `username` falls back to the locator's userinfo, so a
+    /// `https://user@host/…` source needs no `--username`; a locator
+    /// without one refuses until a name is given.
+    pub fn set_source_credential(
+        &self,
+        id: &str,
+        username: &str,
+        secret: &str,
+    ) -> Result<protocol::SourceView, ServiceError> {
+        if secret.is_empty() {
+            return Err(ServiceError::Other(
+                "the credential is empty; pass the secret on stdin".into(),
+            ));
+        }
+        let (source, reference) = {
+            let g = lock(&self.inner);
+            let source = g
+                .store
+                .source(id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+            (source, crate::credentials::credential_ref(id))
+        };
+        let username = if username.trim().is_empty() {
+            let (_, locator_user) =
+                crate::caldav::split_userinfo(&source.locator).map_err(ServiceError::Other)?;
+            locator_user.ok_or_else(|| {
+                ServiceError::Other(format!(
+                    "source '{id}' names no user; pass --username <name>"
+                ))
+            })?
+        } else {
+            username.to_string()
+        };
+        // The fallible external write first: when the OS store refuses,
+        // the database is untouched and the source keeps working as
+        // before (env fallback included).
+        let credentials = lock(&self.inner).credentials.clone();
+        credentials
+            .set(&reference, secret)
+            .map_err(|e| ServiceError::Other(e.to_string()))?;
+        let recorded = lock(&self.inner)
+            .store
+            .set_source_credential_ref(id, &reference, &username)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        if !recorded {
+            // The source vanished between the lookup and the write (a
+            // racing remove): roll the orphaned OS entry back so no
+            // unreachable secret is left behind.
+            let _ = credentials.delete(&reference);
+            return Err(ServiceError::Other(format!(
+                "no external source with id '{id}'"
+            )));
+        }
+        let view = self
+            .sources()?
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+        self.notify_changed();
+        Ok(view)
+    }
+
+    /// Forget a source's credential: the OS entry is deleted first, and
+    /// the reference is cleared only after, so a failed delete leaves
+    /// the source exactly as it was. Removing what was never set is a
+    /// no-op returning the source unchanged.
+    pub fn remove_source_credential(&self, id: &str) -> Result<protocol::SourceView, ServiceError> {
+        let source = {
+            let g = lock(&self.inner);
+            g.store
+                .source(id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?
+        };
+        let changed = source.cred_ref.is_some();
+        if let Some(reference) = source.cred_ref {
+            lock(&self.inner)
+                .credentials
+                .clone()
+                .delete(&reference)
+                .map_err(|e| ServiceError::Other(e.to_string()))?;
+            lock(&self.inner)
+                .store
+                .clear_source_credential_ref(id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        }
+        let view = self
+            .sources()?
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+        if changed {
+            self.notify_changed();
+        }
+        Ok(view)
+    }
+
+    /// Delete a source, its still-pending suggestions, and its OS
+    /// credential (#153). Decided suggestions stay as history, and
+    /// confirmed entries stay — they are tracked time, not suggestions.
+    /// The credential purge is best-effort: when the store does not
+    /// answer, the row (the app's only reference to the secret) is
+    /// still removed, and the unreachable orphan is noted on stderr.
+    pub fn remove_source(&self, id: &str) -> Result<(), ServiceError> {
+        let source = {
+            let g = lock(&self.inner);
+            g.store
+                .source(id)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?
+        };
+        if let Some(reference) = source.cred_ref
+            && let Err(e) = lock(&self.inner).credentials.clone().delete(&reference)
+        {
+            eprintln!(
+                "timetrack-service: removing source '{id}' left its OS credential behind ({e}); \
+                 delete it in your key manager"
+            );
+        }
+        let removed = lock(&self.inner)
+            .store
+            .remove_source(id)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        if removed {
+            self.notify_changed();
+            Ok(())
+        } else {
+            Err(ServiceError::Other(format!(
+                "no external source with id '{id}'"
+            )))
+        }
+    }
+
+    /// Discover an account's CalDAV collections from a server,
+    /// account, principal, or home URL (#150), so the user can pick
+    /// collections without hand-constructing URLs. Read-only end to
+    /// end: discovery sends `PROPFIND`/`GET` only and registers
+    /// nothing — each found URL becomes a source through `add_source`.
+    ///
+    /// Authentication follows the fetch matrix (#149): `source_id`
+    /// lends a registered source's stored credential (and username),
+    /// falling back to `TIMETRACK_CALDAV_PASSWORD` only when that
+    /// source holds none; without a source the endpoint's userinfo
+    /// and the same env fallback apply.
+    pub fn discover_caldav(
+        &self,
+        endpoint: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<protocol::CaldavCollectionView>, ServiceError> {
+        if endpoint.trim().is_empty() {
+            return Err(ServiceError::Other(
+                "discovery needs a server or account URL".into(),
+            ));
+        }
+        // Refuses an embedded password, exactly as registration does.
+        crate::caldav::split_userinfo(endpoint).map_err(ServiceError::Other)?;
+        let (cred_ref, cred_username) = match source_id {
+            Some(id) => {
+                let source = lock(&self.inner)
+                    .store
+                    .source(id)
+                    .map_err(|e| ServiceError::Storage(e.to_string()))?
+                    .ok_or_else(|| {
+                        ServiceError::Other(format!("no external source with id '{id}'"))
+                    })?;
+                (source.cred_ref, source.cred_username)
+            }
+            None => (None, None),
+        };
+        let credentials = lock(&self.inner).credentials.clone();
+        let env_password = std::env::var("TIMETRACK_CALDAV_PASSWORD").ok();
+        let auth = crate::credentials::resolve_caldav_auth(
+            cred_ref.as_deref(),
+            cred_username.as_deref(),
+            endpoint,
+            &|reference| credentials.get(reference),
+            env_password.as_deref(),
+        )
+        .map_err(ServiceError::Other)?;
+        let auth = auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        // Off the state lock: discovery is network I/O, and the lock
+        // is only needed to resolve the credential above.
+        let found =
+            crate::caldav::discover_collections(endpoint, auth).map_err(ServiceError::Other)?;
+        Ok(found
+            .into_iter()
+            .map(|c| protocol::CaldavCollectionView {
+                url: c.url,
+                display_name: c.display_name,
+                components: c.components,
+            })
+            .collect())
+    }
+
     /// Set (or clear) an entry's free-form note (socket-only surface).
     pub fn set_note(&self, id: &str, note: Option<&str>) -> Result<EntryView, ServiceError> {
         let e = self.mutate(|s, _ids, _| core::set_text(s, id, None, Some(note)))?;
         Ok(protocol::entry_to_view(&e))
     }
+}
+
+/// What registration and editing agree a source's identity must be
+/// (#153): a known kind, no password smuggled into a CalDAV URL, and a
+/// non-blank locator. One function so the two paths can never refuse
+/// differently.
+fn validate_source_identity(kind: &str, locator: &str) -> Result<(), ServiceError> {
+    if kind != "ics_file" && kind != "ics_url" && kind != "caldav" {
+        return Err(ServiceError::Other(format!(
+            "unknown source kind '{kind}' (use ics_file, ics_url, or caldav)"
+        )));
+    }
+    if kind == "caldav" {
+        crate::caldav::split_userinfo(locator).map_err(ServiceError::Other)?;
+    }
+    if locator.trim().is_empty() {
+        return Err(ServiceError::Other(
+            "a source needs a file path or URL".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn source_view(s: timetrack_store::ExternalSource) -> protocol::SourceView {
@@ -699,6 +1154,8 @@ fn source_view(s: timetrack_store::ExternalSource) -> protocol::SourceView {
         locator: s.locator,
         project_id: s.project_id,
         label: s.label,
+        has_credential: s.cred_ref.is_some(),
+        username: s.cred_username,
     }
 }
 
@@ -720,7 +1177,14 @@ fn suggestion_view(s: timetrack_store::Suggestion) -> protocol::SuggestionView {
 /// under a hard byte cap and a 15 s timeout (the update check's terms),
 /// or every `.ics` resource in a CalDAV collection. Read-only by
 /// construction — nothing here can write back.
-fn fetch_source_texts(src: &timetrack_store::ExternalSource) -> Result<Vec<String>, ServiceError> {
+///
+/// A CalDAV source with a stored credential authenticates with it
+/// (#149); one without falls back to `TIMETRACK_CALDAV_PASSWORD`, the
+/// documented escape for headless setups.
+fn fetch_source_texts(
+    src: &timetrack_store::ExternalSource,
+    credentials: &dyn CredentialStore,
+) -> Result<Vec<String>, ServiceError> {
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     match src.kind.as_str() {
         "ics_file" => {
@@ -734,7 +1198,21 @@ fn fetch_source_texts(src: &timetrack_store::ExternalSource) -> Result<Vec<Strin
             }
             Ok(vec![text])
         }
-        "caldav" => crate::caldav::fetch_calendar(&src.locator).map_err(ServiceError::Other),
+        "caldav" => {
+            if src.cred_ref.is_none() {
+                return crate::caldav::fetch_calendar(&src.locator).map_err(ServiceError::Other);
+            }
+            let auth = crate::credentials::resolve_caldav_auth(
+                src.cred_ref.as_deref(),
+                src.cred_username.as_deref(),
+                &src.locator,
+                &|reference| credentials.get(reference),
+                None,
+            )
+            .map_err(ServiceError::Other)?;
+            let auth = auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+            crate::caldav::fetch_calendar_with_auth(&src.locator, auth).map_err(ServiceError::Other)
+        }
         "ics_url" => {
             use std::io::Read;
             let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -1707,5 +2185,1082 @@ mod tests {
             ServiceError::Rule(RuleError::UnknownProject("nope".into()))
         );
         assert_eq!(svc.snapshot().entries.len(), 1, "refusals move nothing");
+    }
+
+    // --- UUID identities and prefix resolution (ADR 0018) ---
+
+    #[test]
+    fn the_seed_and_new_ids_are_uuids() {
+        let (svc, _) = service("uuid-seed");
+        let snap = svc.snapshot();
+        assert_eq!(snap.projects.len(), 1);
+        assert!(
+            timetrack_store::is_uuid(&snap.projects[0].id),
+            "the seed project is a UUID: {}",
+            snap.projects[0].id
+        );
+        let p = project(&svc);
+        let now = now_ms();
+        let e = svc.add(&p.id, "x", now, now + 1).unwrap();
+        assert!(
+            timetrack_store::is_uuid(&e.id),
+            "entries mint UUIDs: {}",
+            e.id
+        );
+        let q = svc.add_project("Second").unwrap();
+        assert!(
+            timetrack_store::is_uuid(&q.id),
+            "projects mint UUIDs: {}",
+            q.id
+        );
+    }
+
+    #[test]
+    fn ids_minted_on_two_stores_never_collide() {
+        // The point of ADR 0018: two stores creating independently must
+        // not mint the same id, as the old counters did (both started
+        // at e1/p1 and the seed was p1 on both).
+        let (a, _) = service("uuid-a");
+        let (b, _) = service("uuid-b");
+        let pa = project(&a);
+        let pb = project(&b);
+        let now = now_ms();
+        let mut ids = std::collections::HashSet::new();
+        assert!(ids.insert(pa.id.clone()), "the seeds differ");
+        assert!(ids.insert(pb.id.clone()), "the seeds differ");
+        for (svc, p) in [(&a, &pa), (&b, &pb)] {
+            for i in 0..25 {
+                let e = svc.add(&p.id, &format!("t{i}"), now, now + 1).unwrap();
+                assert!(ids.insert(e.id), "a minted entry id collided");
+            }
+            let q = svc.add_project("Extra").unwrap();
+            assert!(ids.insert(q.id), "a minted project id collided");
+        }
+        assert_eq!(ids.len(), 2 + 2 * 26);
+    }
+
+    /// A store with pinned ids, so prefix tests never depend on random
+    /// UUIDs sharing a prefix: `aaaaaaaa-*` projects and `bbbbbbbb-*`
+    /// entries are ambiguous pairs, `cccccccc-*`/`dddddddd-*` unique.
+    fn ambiguous_store() -> Store {
+        use timetrack_core::Project;
+        Store {
+            version: core::STORE_VERSION,
+            projects: vec![
+                Project {
+                    id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+                    name: "Work".into(),
+                    colour: None,
+                    archived: false,
+                },
+                Project {
+                    id: "aaaaaaaa-0000-4000-8000-000000000002".into(),
+                    name: "Home".into(),
+                    colour: None,
+                    archived: false,
+                },
+                Project {
+                    id: "cccccccc-0000-4000-8000-000000000001".into(),
+                    name: "Solo".into(),
+                    colour: None,
+                    archived: false,
+                },
+            ],
+            entries: vec![
+                timetrack_core::Entry {
+                    id: "bbbbbbbb-0000-4000-8000-000000000001".into(),
+                    project_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+                    description: String::new(),
+                    started_at: 0,
+                    ended_at: 1,
+                    source: EntrySource::Manual,
+                    note: None,
+                },
+                timetrack_core::Entry {
+                    id: "bbbbbbbb-0000-4000-8000-000000000002".into(),
+                    project_id: "aaaaaaaa-0000-4000-8000-000000000002".into(),
+                    description: String::new(),
+                    started_at: 0,
+                    ended_at: 1,
+                    source: EntrySource::Manual,
+                    note: None,
+                },
+                timetrack_core::Entry {
+                    id: "dddddddd-0000-4000-8000-000000000001".into(),
+                    project_id: "cccccccc-0000-4000-8000-000000000001".into(),
+                    description: String::new(),
+                    started_at: 0,
+                    ended_at: 1,
+                    source: EntrySource::Manual,
+                    note: None,
+                },
+            ],
+        }
+    }
+
+    /// A service over pinned ids (written verbatim, never minted).
+    fn service_with(name: &str, data: &Store) -> EntryService {
+        let dir = std::env::temp_dir().join(format!("tt-svc-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        let store = store_at(path);
+        store.save_all(data, 1_000).unwrap();
+        EntryService::new(store).unwrap()
+    }
+
+    #[test]
+    fn unique_prefixes_resolve_through_the_service() {
+        let svc = service_with("prefix-ok", &ambiguous_store());
+        let p = svc.update_project("cccccccc", "Renamed", -1).unwrap();
+        assert_eq!(p.id, "cccccccc-0000-4000-8000-000000000001");
+        let e = svc.set_text("dddddddd", "edited").unwrap();
+        assert_eq!(e.id, "dddddddd-0000-4000-8000-000000000001");
+        // Creation onto a project prefix attributes to the full id.
+        let now = now_ms();
+        let e = svc.add("cccccccc", "new", now, now + 1).unwrap();
+        assert_eq!(e.project_id, "cccccccc-0000-4000-8000-000000000001");
+        // Undo by prefix removes the prefixed entry. All but the last
+        // character: short enough to prove the prefix path, long enough
+        // to be collision-proof against the other random ids.
+        let q = svc.quick_add("cccccccc", 5 * 60_000).unwrap();
+        svc.undo_quick_add(&q.id[..q.id.len() - 1]).unwrap();
+        assert!(!svc.snapshot().entries.iter().any(|x| x.id == q.id));
+    }
+
+    #[test]
+    fn ambiguous_prefixes_refuse_without_mutating_or_notifying() {
+        let svc = service_with("prefix-ambiguous", &ambiguous_store());
+        let rx = svc.subscribe_changed();
+        let before = svc.snapshot();
+        assert_eq!(
+            svc.set_text("bbbbbbbb", "x").unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousEntry("bbbbbbbb".into()))
+        );
+        assert_eq!(
+            svc.update_project("aaaaaaaa", "X", -1).unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousProject("aaaaaaaa".into()))
+        );
+        assert_eq!(
+            svc.add("aaaaaaaa", "x", 0, 1).unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousProject("aaaaaaaa".into()))
+        );
+        assert_eq!(
+            svc.undo_quick_add("bbbbbbbb").unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousEntry("bbbbbbbb".into()))
+        );
+        assert_eq!(svc.snapshot(), before, "refusals change nothing");
+        assert!(rx.try_recv().is_err(), "refusals notify nothing");
+    }
+
+    #[test]
+    fn add_source_resolves_prefixes_and_refuses_ambiguous_before_writing() {
+        let svc = service_with("prefix-source", &ambiguous_store());
+        let src = svc
+            .add_source("ics_file", "/tmp/cal.ics", Some("cccccccc"), "Cal")
+            .unwrap();
+        assert_eq!(
+            src.project_id.as_deref(),
+            Some("cccccccc-0000-4000-8000-000000000001")
+        );
+        assert_eq!(
+            svc.add_source("ics_file", "/tmp/other.ics", Some("aaaaaaaa"), "Other")
+                .unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousProject("aaaaaaaa".into()))
+        );
+        assert_eq!(
+            svc.sources().unwrap().len(),
+            1,
+            "the refusal registered nothing"
+        );
+    }
+
+    #[test]
+    fn update_source_rewrites_and_reuses_registration_validation() {
+        let svc = service_with("src-update", &ambiguous_store());
+        let other = svc
+            .add_source("ics_file", "/tmp/other.ics", None, "Other")
+            .unwrap();
+        let src = svc
+            .add_source("ics_file", "/tmp/cal.ics", None, "Cal")
+            .unwrap();
+
+        // Unknown id, bad kind, empty locator, CalDAV password in URL:
+        // the same refusals registration gives.
+        assert_eq!(
+            svc.update_source("src-nope", "ics_file", "/tmp/x.ics", None, "X")
+                .unwrap_err()
+                .to_string(),
+            "no external source with id 'src-nope'"
+        );
+        assert_eq!(
+            svc.update_source(&src.id, "bogus", "/tmp/x.ics", None, "X")
+                .unwrap_err()
+                .to_string(),
+            "unknown source kind 'bogus' (use ics_file, ics_url, or caldav)"
+        );
+        assert_eq!(
+            svc.update_source(&src.id, "ics_file", "   ", None, "X")
+                .unwrap_err()
+                .to_string(),
+            "a source needs a file path or URL"
+        );
+        assert!(
+            svc.update_source(&src.id, "caldav", "https://u:p@cal.test/x/", None, "X")
+                .unwrap_err()
+                .to_string()
+                .contains("do not put a password in the source URL"),
+        );
+        // ...plus the edit's own: another source's identity refuses.
+        assert_eq!(
+            svc.update_source(&src.id, "ics_file", "/tmp/other.ics", None, "X")
+                .unwrap_err()
+                .to_string(),
+            "a ics_file source for '/tmp/other.ics' already exists"
+        );
+        // Its own identity is not a duplicate; an empty label re-derives.
+        let updated = svc
+            .update_source(
+                &src.id,
+                "ics_url",
+                "https://cal.test/cal.ics",
+                Some("cccccccc"),
+                "",
+            )
+            .unwrap();
+        assert_eq!(updated.id, src.id);
+        assert_eq!(updated.kind, "ics_url");
+        assert_eq!(updated.locator, "https://cal.test/cal.ics");
+        assert_eq!(
+            updated.project_id.as_deref(),
+            Some("cccccccc-0000-4000-8000-000000000001")
+        );
+        assert_eq!(updated.label, "cal.ics");
+        // The untouched source reads back unchanged.
+        assert_eq!(
+            svc.sources()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == other.id)
+                .unwrap()
+                .label,
+            "Other"
+        );
+    }
+
+    #[test]
+    fn update_source_resolves_prefixes_and_refuses_ambiguous_before_writing() {
+        let svc = service_with("src-update-prefix", &ambiguous_store());
+        let src = svc
+            .add_source("ics_file", "/tmp/cal.ics", None, "Cal")
+            .unwrap();
+        assert_eq!(
+            svc.update_source(&src.id, "ics_file", "/tmp/cal.ics", Some("aaaaaaaa"), "Cal")
+                .unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousProject("aaaaaaaa".into()))
+        );
+        let kept = svc.sources().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].project_id, None, "the refusal mapped nothing");
+    }
+
+    #[test]
+    fn source_mutations_notify_but_refusals_and_noops_do_not() {
+        let svc = service_with("src-notify", &ambiguous_store());
+        let rx = svc.subscribe_changed();
+        let src = svc
+            .add_source("ics_file", "/tmp/cal.ics", None, "Cal")
+            .unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "a registration notifies");
+        svc.add_source("ics_file", "/tmp/cal.ics", None, "Cal")
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "a duplicate registration persisted nothing, so it notifies nothing"
+        );
+        assert!(
+            svc.update_source("src-nope", "ics_file", "/tmp/x.ics", None, "X")
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "refusals notify nothing");
+        svc.update_source(&src.id, "ics_file", "/tmp/cal.ics", None, "Renamed")
+            .unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "an edit notifies");
+        svc.remove_source(&src.id).unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "a removal notifies");
+        assert!(rx.try_recv().is_err(), "exactly three signals, no more");
+    }
+
+    #[test]
+    fn confirm_resolves_its_project_before_claiming() {
+        let svc = service_with("prefix-confirm", &ambiguous_store());
+        let rx = svc.subscribe_changed();
+        let src = svc
+            .add_source("ics_file", "/tmp/cal.ics", None, "Cal")
+            .unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "the registration notifies");
+        let item = |uid: &str| timetrack_core::ExternalItem {
+            uid: uid.into(),
+            kind: timetrack_core::ExternalKind::Event,
+            title: format!("Event {uid}"),
+            started_at: 1_000,
+            ended_at: 61_000,
+            recurring: false,
+        };
+        let sg = {
+            let g = lock(&svc.inner);
+            g.store
+                .upsert_suggestions(&src.id, &[item("ev1"), item("ev2")], 1_000)
+                .unwrap();
+            let pending = g.store.suggestions(true).unwrap();
+            assert_eq!(pending.len(), 2);
+            pending.into_iter().map(|s| s.id).collect::<Vec<_>>()
+        };
+        // An ambiguous override refuses with the suggestion still pending:
+        // no claim, no entry, no notification.
+        assert_eq!(
+            svc.confirm_suggestion(&sg[0], Some("aaaaaaaa"))
+                .unwrap_err(),
+            ServiceError::Rule(RuleError::AmbiguousProject("aaaaaaaa".into()))
+        );
+        assert_eq!(svc.suggestions().unwrap().len(), 2);
+        assert_eq!(svc.snapshot().entries.len(), 3);
+        assert!(rx.try_recv().is_err(), "the refusal notifies nothing");
+        // ...while a unique prefix confirms onto the resolved project.
+        let e = svc.confirm_suggestion(&sg[0], Some("cccccccc")).unwrap();
+        assert_eq!(e.project_id, "cccccccc-0000-4000-8000-000000000001");
+        assert_eq!(e.source, protocol::EntrySource::External);
+        assert_eq!(svc.suggestions().unwrap().len(), 1);
+    }
+
+    // --- source credentials (#149) ---
+
+    use crate::credentials::FakeCredentialStore;
+
+    fn service_with_fake(name: &str) -> (EntryService, PathBuf, Arc<FakeCredentialStore>) {
+        let dir = std::env::temp_dir().join(format!("tt-svc-cred-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("store.json");
+        let fake = Arc::new(FakeCredentialStore::new());
+        let svc = EntryService::new_with_credentials(store_at(path.clone()), fake.clone()).unwrap();
+        (svc, path, fake)
+    }
+
+    /// Every byte SQLite holds for this store: the database plus its
+    /// WAL, so a secret smuggled into any page or frame is caught.
+    fn sqlite_bytes(json_path: &std::path::Path) -> Vec<u8> {
+        let db_path = SqliteStore::db_path_for(json_path);
+        let mut bytes = std::fs::read(&db_path).unwrap_or_default();
+        bytes.extend(std::fs::read(db_path.with_extension("db-wal")).unwrap_or_default());
+        bytes
+    }
+
+    #[test]
+    fn credential_set_and_remove_keep_the_secret_out_of_sqlite() {
+        let (svc, path, fake) = service_with_fake("round-trip");
+        let src = svc
+            .add_source("caldav", "https://cal.test/u/", None, "Cal")
+            .unwrap();
+        assert!(!src.has_credential);
+
+        let secret = "s3cr3t-per-source";
+        let set = svc.set_source_credential(&src.id, "alice", secret).unwrap();
+        assert!(set.has_credential);
+        assert_eq!(set.username.as_deref(), Some("alice"));
+        // The secret reached the credential store and only there.
+        let reference = crate::credentials::credential_ref(&src.id);
+        assert_eq!(fake.get(&reference).unwrap().as_deref(), Some(secret));
+        let stored = lock(&svc.inner).store.source(&src.id).unwrap().unwrap();
+        assert_eq!(stored.cred_ref.as_deref(), Some(reference.as_str()));
+        assert_eq!(stored.cred_username.as_deref(), Some("alice"));
+        for field in [
+            stored.id.as_str(),
+            stored.kind.as_str(),
+            stored.locator.as_str(),
+            stored.label.as_str(),
+            stored.cred_ref.as_deref().unwrap_or_default(),
+            stored.cred_username.as_deref().unwrap_or_default(),
+        ] {
+            assert!(
+                !field.contains(secret),
+                "no SQLite field may hold the secret: {field:?}"
+            );
+        }
+        let bytes = sqlite_bytes(&path);
+        assert!(
+            !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+            "the secret must not appear in any SQLite byte"
+        );
+
+        // Removing clears both the entry and the reference.
+        let removed = svc.remove_source_credential(&src.id).unwrap();
+        assert!(!removed.has_credential);
+        assert_eq!(fake.get(&reference).unwrap(), None);
+        let cleared = lock(&svc.inner).store.source(&src.id).unwrap().unwrap();
+        assert_eq!(cleared.cred_ref, None);
+        // Removing what was never set is a no-op, not an error.
+        svc.remove_source_credential(&src.id).unwrap();
+    }
+
+    #[test]
+    fn credential_changes_notify_but_a_noop_removal_does_not() {
+        let (svc, _, _) = service_with_fake("cred-notify");
+        let src = svc
+            .add_source("caldav", "https://cal.test/u/", None, "Cal")
+            .unwrap();
+        let rx = svc.subscribe_changed();
+        svc.set_source_credential(&src.id, "alice", "s3cr3t")
+            .unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "storing notifies");
+        svc.remove_source_credential(&src.id).unwrap();
+        assert_eq!(rx.try_recv(), Ok(()), "clearing notifies");
+        svc.remove_source_credential(&src.id).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "removing what was never set persisted nothing"
+        );
+    }
+
+    #[test]
+    fn credential_set_refuses_without_writing_anything() {
+        let (svc, _, fake) = service_with_fake("refusals");
+        assert!(
+            svc.set_source_credential("src-nope", "alice", "s3cr3t")
+                .is_err(),
+            "an unknown source refuses"
+        );
+        let src = svc
+            .add_source("caldav", "https://cal.test/u/", None, "Cal")
+            .unwrap();
+        assert!(
+            svc.set_source_credential(&src.id, "alice", "").is_err(),
+            "an empty secret refuses"
+        );
+        // No username anywhere: the locator names none and none was given.
+        assert!(
+            svc.set_source_credential(&src.id, "", "s3cr3t").is_err(),
+            "a missing username refuses"
+        );
+        // ...while a locator userinfo fills the gap.
+        let with_user = svc
+            .add_source("caldav", "https://bob@cal.test/u/", None, "Cal2")
+            .unwrap();
+        let set = svc
+            .set_source_credential(&with_user.id, "", "s3cr3t")
+            .unwrap();
+        assert_eq!(set.username.as_deref(), Some("bob"));
+
+        // A down store refuses with the database untouched: no dangling
+        // reference, no half-written secret.
+        fake.fail_with("daemon away");
+        assert!(
+            svc.set_source_credential(&src.id, "alice", "s3cr3t")
+                .is_err()
+        );
+        let stored = lock(&svc.inner).store.source(&src.id).unwrap().unwrap();
+        assert_eq!(stored.cred_ref, None);
+        fake.heal();
+        assert!(svc.remove_source_credential("src-nope").is_err());
+    }
+
+    #[test]
+    fn credential_remove_keeps_the_reference_when_the_store_is_down() {
+        let (svc, _, fake) = service_with_fake("remove-down");
+        let src = svc
+            .add_source("caldav", "https://cal.test/u/", None, "Cal")
+            .unwrap();
+        svc.set_source_credential(&src.id, "alice", "s3cr3t")
+            .unwrap();
+        fake.fail_with("daemon away");
+        // The delete failed, so the reference stays: clearing it would
+        // silently downgrade the source to the env-var fallback.
+        assert!(svc.remove_source_credential(&src.id).is_err());
+        let stored = lock(&svc.inner).store.source(&src.id).unwrap().unwrap();
+        assert!(stored.cred_ref.is_some());
+        fake.heal();
+        svc.remove_source_credential(&src.id).unwrap();
+    }
+
+    #[test]
+    fn remove_source_purges_the_credential_and_its_suggestions() {
+        let (svc, _, fake) = service_with_fake("remove");
+        let src = svc
+            .add_source("caldav", "https://cal.test/u/", None, "Cal")
+            .unwrap();
+        svc.set_source_credential(&src.id, "alice", "s3cr3t")
+            .unwrap();
+        let reference = crate::credentials::credential_ref(&src.id);
+        let item = |uid: &str| timetrack_core::ExternalItem {
+            uid: uid.into(),
+            kind: timetrack_core::ExternalKind::Event,
+            title: format!("Event {uid}"),
+            started_at: 1_000,
+            ended_at: 61_000,
+            recurring: false,
+        };
+        {
+            let g = lock(&svc.inner);
+            g.store
+                .upsert_suggestions(&src.id, &[item("ev1"), item("ev2"), item("ev3")], 1_000)
+                .unwrap();
+        }
+        // One decided each way before the removal: a confirmed entry
+        // and a dismissal, beside the still-pending third.
+        let pending = svc.suggestions().unwrap();
+        assert_eq!(pending.len(), 3);
+        let confirmed = svc.confirm_suggestion(&pending[0].id, None).unwrap();
+        svc.dismiss_suggestion(&pending[1].id).unwrap();
+        svc.remove_source(&src.id).unwrap();
+        assert_eq!(fake.get(&reference).unwrap(), None, "the secret is purged");
+        assert!(lock(&svc.inner).store.source(&src.id).unwrap().is_none());
+        assert!(svc.suggestions().unwrap().is_empty());
+        let decided = lock(&svc.inner).store.suggestions(false).unwrap();
+        assert_eq!(decided.len(), 2, "decided rows survive the removal");
+        assert!(
+            svc.snapshot().entries.iter().any(|e| e.id == confirmed.id),
+            "the confirmed entry is tracked time now, not a suggestion"
+        );
+        assert!(svc.remove_source(&src.id).is_err(), "twice refuses");
+
+        // A down store does not hold deletion hostage: the row (the
+        // app's only reference) still goes, orphaning at most an
+        // unreachable entry.
+        let src = svc
+            .add_source("caldav", "https://cal.test/u2/", None, "Cal2")
+            .unwrap();
+        svc.set_source_credential(&src.id, "alice", "s3cr3t")
+            .unwrap();
+        fake.fail_with("daemon away");
+        svc.remove_source(&src.id).unwrap();
+        assert!(lock(&svc.inner).store.source(&src.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn refresh_authenticates_with_the_stored_per_source_credential() {
+        use crate::caldav::fake::{Answer, multistatus, spawn};
+
+        // Basic alice:s3cr3t-per-source, lowercased like the header
+        // text it is matched against: only the stored secret is
+        // accepted — no TIMETRACK_CALDAV_PASSWORD is involved.
+        const BASIC: &str = "authorization: basic ywxpy2u6cznjcjn0lxblci1zb3vyy2u=";
+        // The incremental shape: a CTag probe, an ETag listing, one GET.
+        let (base, server) = spawn(3, |method, path, headers| {
+            if !headers.to_ascii_lowercase().contains(BASIC) {
+                return Answer::status_body("401 Unauthorized", "login first");
+            }
+            if method == "PROPFIND" && path == "/cal/" {
+                if headers.to_ascii_lowercase().contains("depth: 0") {
+                    return Answer::status_body(
+                        "207 Multi-Status",
+                        &multistatus(
+                            "<d:response><d:href>/cal/</d:href>\
+                             <d:propstat><d:prop>\
+                             <cs:getctag xmlns:cs=\"http://calendarserver.org/ns/\">ctag-1</cs:getctag>\
+                             </d:prop>\
+                             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                        ),
+                    );
+                }
+                return Answer::status_body(
+                    "207 Multi-Status",
+                    &multistatus(
+                        "<d:response><d:href>/cal/a.ics</d:href>\
+                         <d:propstat><d:prop><d:getetag>\"v1\"</d:getetag></d:prop>\
+                         <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                    ),
+                );
+            }
+            if method == "GET" && path == "/cal/a.ics" {
+                let now = now_ms();
+                let basic = |ms: i64| {
+                    timetrack_core::format_local_iso8601(ms, &timetrack_core::Tz::utc())
+                        .replace(['-', ':'], "")
+                };
+                return Answer {
+                    status: "200 OK".to_string(),
+                    headers: vec![("ETag".to_string(), "\"v1\"".to_string())],
+                    body: format!(
+                        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev-per-source\r\nSUMMARY:Per-source auth\r\nDTSTART:{}Z\r\nDTEND:{}Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+                        basic(now - 1_800_000),
+                        basic(now + 1_800_000),
+                    ),
+                };
+            }
+            Answer::status_body("404 Not Found", "no such path")
+        });
+
+        let (svc, _, _) = service_with_fake("refresh-auth");
+        let src = svc
+            .add_source("caldav", &format!("{base}/cal/"), None, "Cal")
+            .unwrap();
+        // The locator names no user, so the stored username is the one
+        // the server sees.
+        svc.set_source_credential(&src.id, "alice", "s3cr3t-per-source")
+            .unwrap();
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!((tally.fetched, tally.inserted), (1, 1));
+        let log = server.join().unwrap();
+        assert_eq!(log.len(), 3, "probe, listing, and one download");
+        assert!(
+            log.iter().all(|e| e.to_ascii_lowercase().contains(BASIC)),
+            "every request authenticated"
+        );
+        let pending = svc.suggestions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].title, "Per-source auth");
+    }
+
+    #[test]
+    fn refresh_with_a_dangling_reference_errors_actionably() {
+        let (svc, _, fake) = service_with_fake("refresh-dangling");
+        let src = svc
+            .add_source("caldav", "https://cal.test/u/", None, "Cal")
+            .unwrap();
+        svc.set_source_credential(&src.id, "alice", "s3cr3t")
+            .unwrap();
+        // The OS entry vanishes out of band (another manager deleted
+        // it): the refresh must say how to fix it, not silently fall
+        // back to the environment.
+        fake.delete(&crate::credentials::credential_ref(&src.id))
+            .unwrap();
+        let err = svc.refresh_source(Some(&src.id)).unwrap_err();
+        assert!(
+            err.to_string().contains("source-set-credential"),
+            "the error says how to fix it: {err}"
+        );
+    }
+
+    #[test]
+    fn refresh_is_incremental_and_reconciles_remote_changes() {
+        use crate::caldav::fake::{Answer, multistatus, spawn};
+        use std::sync::{Arc, Mutex};
+
+        // Server state the test mutates between refreshes.
+        struct Resource {
+            etag: &'static str,
+            body: String,
+        }
+        struct Server {
+            ctag: &'static str,
+            resources: Vec<(&'static str, Resource)>,
+        }
+        let basic = |ms: i64| {
+            timetrack_core::format_local_iso8601(ms, &timetrack_core::Tz::utc())
+                .replace(['-', ':'], "")
+        };
+        let now = now_ms();
+        let event = |uid: &str, summary: &str, start: i64, end: i64| {
+            format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{summary}\r\nDTSTART:{}Z\r\nDTEND:{}Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+                basic(start),
+                basic(end)
+            )
+        };
+        let state = Arc::new(Mutex::new(Server {
+            ctag: "ctag-1",
+            resources: vec![
+                (
+                    "a.ics",
+                    Resource {
+                        etag: "\"a1\"",
+                        body: event("ev-a", "Alpha", now - 3_600_000, now - 1_800_000),
+                    },
+                ),
+                (
+                    "b.ics",
+                    Resource {
+                        etag: "\"b1\"",
+                        body: event("ev-b", "Beta", now + 1_800_000, now + 3_600_000),
+                    },
+                ),
+                (
+                    "c.ics",
+                    Resource {
+                        etag: "\"c1\"",
+                        body: event("ev-c", "Gamma", now + 5_400_000, now + 7_200_000),
+                    },
+                ),
+            ],
+        }));
+        let route_state = state.clone();
+        // r1: probe + listing + 3 GETs; r2: probe alone; r3: probe +
+        // listing + GET b; r4: probe + listing. Eleven requests, 4 GETs.
+        let (base, server) = spawn(11, move |method, path, headers| {
+            let state = route_state.lock().unwrap();
+            if method == "PROPFIND" && path == "/cal/" {
+                if headers.to_ascii_lowercase().contains("depth: 0") {
+                    return Answer::status_body(
+                        "207 Multi-Status",
+                        &multistatus(&format!(
+                            "<d:response><d:href>/cal/</d:href>\
+                             <d:propstat><d:prop>\
+                             <cs:getctag xmlns:cs=\"http://calendarserver.org/ns/\">\
+                             {}</cs:getctag></d:prop>\
+                             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                            state.ctag
+                        )),
+                    );
+                }
+                let mut inner = String::from(
+                    "<d:response><d:href>/cal/</d:href>\
+                     <d:propstat><d:prop><d:displayname>Cal</d:displayname></d:prop>\
+                     <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                );
+                for (name, resource) in &state.resources {
+                    inner.push_str(&format!(
+                        "<d:response><d:href>/cal/{name}</d:href>\
+                         <d:propstat><d:prop><d:getetag>{}</d:getetag></d:prop>\
+                         <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                        resource.etag
+                    ));
+                }
+                return Answer::status_body("207 Multi-Status", &multistatus(&inner));
+            }
+            if let Some(name) = path.strip_prefix("/cal/")
+                && let Some((_, resource)) = state.resources.iter().find(|(n, _)| *n == name)
+            {
+                return Answer {
+                    status: "200 OK".to_string(),
+                    headers: vec![("ETag".to_string(), resource.etag.to_string())],
+                    body: resource.body.clone(),
+                };
+            }
+            Answer::status_body("404 Not Found", "no such path")
+        });
+
+        let (svc, _, _) = service_with_fake("refresh-incr");
+        let src = svc
+            .add_source("caldav", &format!("{base}/cal/"), None, "Cal")
+            .unwrap();
+
+        // r1: the full first fetch inserts three suggestions.
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!((tally.fetched, tally.inserted), (3, 3));
+        assert_eq!(svc.suggestions().unwrap().len(), 3);
+
+        // r2: nothing changed — the probe is the whole refresh.
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!(
+            (
+                tally.fetched,
+                tally.inserted,
+                tally.updated,
+                tally.withdrawn
+            ),
+            (0, 0, 0, 0)
+        );
+
+        // r3: b is retitled remotely — its pending suggestion updates
+        // in place instead of duplicating.
+        {
+            let mut state = state.lock().unwrap();
+            state.ctag = "ctag-2";
+            let b = state
+                .resources
+                .iter_mut()
+                .find(|(n, _)| *n == "b.ics")
+                .unwrap();
+            b.1.etag = "\"b2\"";
+            b.1.body = event("ev-b", "Beta rescheduled", now + 1_800_000, now + 3_600_000);
+        }
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!((tally.fetched, tally.inserted, tally.updated), (1, 0, 1));
+        let pending = svc.suggestions().unwrap();
+        assert_eq!(pending.len(), 3);
+        assert!(
+            pending
+                .iter()
+                .any(|s| s.external_uid == "ev-b" && s.title == "Beta rescheduled"),
+            "the retitle lands on the pending suggestion: {pending:?}"
+        );
+
+        // Decide two: a confirms into a real entry, b dismisses. Then
+        // the server deletes a and c.
+        let a_id = pending
+            .iter()
+            .find(|s| s.external_uid == "ev-a")
+            .unwrap()
+            .id
+            .clone();
+        let b_id = pending
+            .iter()
+            .find(|s| s.external_uid == "ev-b")
+            .unwrap()
+            .id
+            .clone();
+        svc.confirm_suggestion(&a_id, None).unwrap();
+        svc.dismiss_suggestion(&b_id).unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.ctag = "ctag-3";
+            state.resources.retain(|(n, _)| *n == "b.ics");
+        }
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!(
+            tally.withdrawn, 1,
+            "only the still-pending deletion withdraws"
+        );
+        // The confirmed entry survives with its decision row; the
+        // dismissal survives; the withdrawn pending row is gone.
+        assert_eq!(svc.snapshot().entries.len(), 1);
+        assert_eq!(svc.snapshot().entries[0].description, "Alpha");
+        let all = lock(&svc.inner).store.suggestions(false).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .any(|s| s.external_uid == "ev-a" && s.status == "confirmed"),
+            "the confirmed row survives its resource: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|s| s.external_uid == "ev-b" && s.status == "dismissed"),
+            "the dismissal survives anything: {all:?}"
+        );
+        assert!(svc.suggestions().unwrap().is_empty());
+
+        let log = server.join().unwrap();
+        assert_eq!(log.len(), 11);
+        assert_eq!(
+            log.iter().filter(|e| e.starts_with("GET ")).count(),
+            4,
+            "three first-fetch downloads and one changed download: {log:?}"
+        );
+        assert!(
+            log.iter().all(|e| {
+                let line = e.lines().next().unwrap_or("");
+                line.starts_with("PROPFIND ") || line.starts_with("GET ")
+            }),
+            "refresh sent only reads"
+        );
+    }
+
+    #[test]
+    fn refresh_recovers_from_a_dead_sync_token() {
+        use crate::caldav::fake::{Answer, multistatus, spawn};
+        use std::sync::{Arc, Mutex};
+
+        let basic = |ms: i64| {
+            timetrack_core::format_local_iso8601(ms, &timetrack_core::Tz::utc())
+                .replace(['-', ':'], "")
+        };
+        let now = now_ms();
+        struct Server {
+            phase: u8,
+            body: String,
+        }
+        // Phase 0 speaks sync-collection; in phase 1 the token died
+        // and sync is gone, so the refresh must PROPFIND a full resync
+        // instead of losing anything.
+        let state = Arc::new(Mutex::new(Server {
+            phase: 0,
+            body: format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev-tok\r\nSUMMARY:Token\r\nDTSTART:{}Z\r\nDTEND:{}Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+                basic(now - 1_800_000),
+                basic(now + 1_800_000),
+            ),
+        }));
+        let route_state = state.clone();
+        // r1: probe + REPORT + GET. r2: REPORT (410) + probe + listing
+        // + GET.
+        let (base, server) = spawn(7, move |method, path, headers| {
+            let state = route_state.lock().unwrap();
+            if method == "REPORT" && path == "/cal/" {
+                if state.phase == 0 {
+                    return Answer::status_body(
+                        "207 Multi-Status",
+                        &multistatus(
+                            "<d:response><d:href>/cal/a.ics</d:href>\
+                             <d:propstat><d:prop><d:getetag>\"t1\"</d:getetag></d:prop>\
+                             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>\
+                             <d:sync-token>tok-1</d:sync-token>",
+                        ),
+                    );
+                }
+                return Answer::status_body("410 Gone", "unknown token");
+            }
+            if method == "PROPFIND" && path == "/cal/" {
+                if headers.to_ascii_lowercase().contains("depth: 0") {
+                    let reports = if state.phase == 0 {
+                        "<d:supported-report-set><d:supported-report><d:report>\
+                         <d:sync-collection/></d:report></d:supported-report>\
+                         </d:supported-report-set>"
+                    } else {
+                        ""
+                    };
+                    return Answer::status_body(
+                        "207 Multi-Status",
+                        &multistatus(&format!(
+                            "<d:response><d:href>/cal/</d:href><d:propstat><d:prop>\
+                             <cs:getctag xmlns:cs=\"http://calendarserver.org/ns/\">\
+                             ctag-{}</cs:getctag>{}</d:prop>\
+                             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                            state.phase + 1,
+                            reports
+                        )),
+                    );
+                }
+                // The phase-1 listing: the same body, a rotated ETag.
+                return Answer::status_body(
+                    "207 Multi-Status",
+                    &multistatus(
+                        "<d:response><d:href>/cal/a.ics</d:href>\
+                         <d:propstat><d:prop><d:getetag>\"t2\"</d:getetag></d:prop>\
+                         <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                    ),
+                );
+            }
+            if method == "GET" && path == "/cal/a.ics" {
+                let etag = if state.phase == 0 { "\"t1\"" } else { "\"t2\"" };
+                return Answer {
+                    status: "200 OK".to_string(),
+                    headers: vec![("ETag".to_string(), etag.to_string())],
+                    body: state.body.clone(),
+                };
+            }
+            Answer::status_body("404 Not Found", "no such path")
+        });
+
+        let (svc, _, _) = service_with_fake("refresh-token");
+        let src = svc
+            .add_source("caldav", &format!("{base}/cal/"), None, "Cal")
+            .unwrap();
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!((tally.fetched, tally.inserted), (1, 1));
+        {
+            let g = lock(&svc.inner);
+            let stored = g.store.caldav_sync_state(&src.id).unwrap().unwrap();
+            assert_eq!(stored.sync_token.as_deref(), Some("tok-1"));
+        }
+        state.lock().unwrap().phase = 1;
+        // The resync replays the same event: no duplicate, no loss —
+        // and the dead token is replaced by the fresh CTag.
+        let tally = svc.refresh_source(Some(&src.id)).unwrap();
+        assert_eq!((tally.fetched, tally.inserted, tally.withdrawn), (0, 0, 0));
+        assert_eq!(svc.suggestions().unwrap().len(), 1);
+        {
+            let g = lock(&svc.inner);
+            let stored = g.store.caldav_sync_state(&src.id).unwrap().unwrap();
+            assert_eq!(stored.sync_token, None);
+            assert_eq!(stored.ctag.as_deref(), Some("ctag-2"));
+            let resources = g.store.caldav_resources(&src.id).unwrap();
+            assert_eq!(resources.len(), 1);
+            assert_eq!(resources[0].etag.as_deref(), Some("\"t2\""));
+        }
+        let log = server.join().unwrap();
+        assert_eq!(log.len(), 7);
+        assert!(
+            log[3].starts_with("REPORT /cal/") && log[3].contains("tok-1"),
+            "the second refresh leads with the stored token: {}",
+            log[3]
+        );
+        assert!(
+            log.iter().all(|e| {
+                let line = e.lines().next().unwrap_or("");
+                line.starts_with("PROPFIND ")
+                    || line.starts_with("GET ")
+                    || line.starts_with("REPORT ")
+            }),
+            "refresh sent only reads"
+        );
+    }
+
+    // --- CalDAV discovery (#150) ---
+
+    #[test]
+    fn discovery_lends_a_source_stored_credential() {
+        use crate::caldav::fake::{Answer, multistatus, spawn};
+
+        // Basic alice:s3cr3t-lent, lowercased like the header text it
+        // is matched against: only the stored secret is accepted.
+        const BASIC: &str = "authorization: basic ywxpy2u6cznjcjn0lwxlbnq=";
+        // Two for the anonymous run, three for the authed one.
+        let (base, server) = spawn(5, |method, path, headers| {
+            if !headers.to_ascii_lowercase().contains(BASIC) {
+                return Answer::status_body("401 Unauthorized", "login first");
+            }
+            if path == "/.well-known/caldav" {
+                return Answer::status_body("404 Not Found", "no well-known");
+            }
+            if method == "PROPFIND" && path == "/dav/" {
+                if headers.contains("Depth: 0") {
+                    return Answer::status_body(
+                        "207 Multi-Status",
+                        &multistatus(
+                            "<d:response><d:href>/dav/</d:href>\
+                             <d:propstat><d:prop/>\
+                             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                        ),
+                    );
+                }
+                return Answer::status_body(
+                    "207 Multi-Status",
+                    &multistatus(
+                        "<d:response><d:href>/dav/</d:href>\
+                         <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype>\
+                         </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>\
+                         <d:response><d:href>/dav/cal/</d:href>\
+                         <d:propstat><d:prop><d:resourcetype><d:collection/><c:calendar/></d:resourcetype>\
+                         <d:displayname>Lent</d:displayname>\
+                         </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
+                    ),
+                );
+            }
+            Answer::status_body("404 Not Found", "no such path")
+        });
+
+        let (svc, _, _) = service_with_fake("discover-lent");
+        // The locator names no user: the stored username is the one
+        // the server sees, exactly as in refresh.
+        let src = svc
+            .add_source("caldav", &format!("{base}/dav/"), None, "Cal")
+            .unwrap();
+        svc.set_source_credential(&src.id, "alice", "s3cr3t-lent")
+            .unwrap();
+        // Without the source the fake 401s (no userinfo, no fallback
+        // username); with it the stored pair authenticates.
+        assert!(
+            svc.discover_caldav(&format!("{base}/dav/"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("401")
+        );
+        let found = svc
+            .discover_caldav(&format!("{base}/dav/"), Some(&src.id))
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].display_name, "Lent");
+        assert_eq!(found[0].url, format!("{base}/dav/cal/"));
+        assert_eq!(found[0].components, ["VEVENT", "VTODO"]);
+        // Discovery registers nothing and suggests nothing.
+        assert_eq!(svc.sources().unwrap().len(), 1);
+        assert!(svc.suggestions().unwrap().is_empty());
+        let log = server.join().unwrap();
+        assert_eq!(log.len(), 5);
+        assert!(
+            log.iter().all(|e| {
+                let line = e.lines().next().unwrap_or("");
+                line.starts_with("PROPFIND ") || line.starts_with("GET ")
+            }),
+            "discovery sent only reads"
+        );
+    }
+
+    #[test]
+    fn discovery_validates_before_touching_the_network() {
+        let (svc, _, _) = service_with_fake("discover-refusals");
+        assert!(svc.discover_caldav("", None).is_err(), "empty refuses");
+        assert!(
+            svc.discover_caldav("https://alice:secret@cal.test/u/", None)
+                .unwrap_err()
+                .to_string()
+                .contains("source-set-credential"),
+            "a locator password refuses"
+        );
+        assert!(
+            svc.discover_caldav("https://cal.test/u/", Some("src-nope"))
+                .unwrap_err()
+                .to_string()
+                .contains("src-nope"),
+            "an unknown source refuses"
+        );
     }
 }

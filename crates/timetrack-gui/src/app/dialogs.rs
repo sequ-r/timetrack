@@ -19,4 +19,5 @@ pub mod entry;
 pub mod merge;
 pub mod project;
 pub mod recolour;
+pub mod source;
 pub mod split;

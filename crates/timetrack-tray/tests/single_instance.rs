@@ -2,6 +2,10 @@
 //! so a second launch must not stack a second tray icon: the extra
 //! tray process exits at once and the first one's item stays the only
 //! registration.
+//!
+//! Linux only: single-instance is a bus name there.
+
+#![cfg(target_os = "linux")]
 
 // The shared harness is wider than this test needs (no menu clicks).
 #[allow(dead_code)]

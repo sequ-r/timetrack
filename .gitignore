@@ -5,6 +5,14 @@
 
 # AppImage
 /AppDir/
+# Windows installer build dirt (build-installer.ps1 staging, ISCC output,
+# and the copied TimeTrack-Setup-*.exe)
+/packaging/windows/bin/
+/packaging/windows/Output/
+# macOS bundle build dirt (build-bundle.sh staging: the .app, iconset,
+# dmgroot; the finished .dmg lands in /dist/ below)
+/packaging/macos/build/
+/dist/
 /TimeTrack-*.AppImage
 /TimeTrack-*.zsync
 /linuxdeploy-*.AppImage

@@ -134,6 +134,19 @@ fn dispatch(service: &EntryService, request: Request) -> Result<Response, Servic
             project_id.as_deref(),
             &label,
         )?)),
+        Request::UpdateSource {
+            id,
+            kind,
+            locator,
+            project_id,
+            label,
+        } => Response::Source(Box::new(service.update_source(
+            &id,
+            &kind,
+            &locator,
+            project_id.as_deref(),
+            &label,
+        )?)),
         Request::ListSources => Response::Sources(service.sources()?),
         Request::RefreshSource { id } => Response::Refresh(service.refresh_source(id.as_deref())?),
         Request::ListSuggestions => Response::Suggestions(service.suggestions()?),
@@ -144,6 +157,26 @@ fn dispatch(service: &EntryService, request: Request) -> Result<Response, Servic
             service.dismiss_suggestion(&id)?;
             Response::Unit
         }
+        Request::SetSourceCredential {
+            id,
+            username,
+            secret,
+        } => Response::Source(Box::new(service.set_source_credential(
+            &id,
+            &username,
+            secret.expose(),
+        )?)),
+        Request::RemoveSourceCredential { id } => {
+            Response::Source(Box::new(service.remove_source_credential(&id)?))
+        }
+        Request::RemoveSource { id } => {
+            service.remove_source(&id)?;
+            Response::Unit
+        }
+        Request::DiscoverCaldav {
+            endpoint,
+            source_id,
+        } => Response::CaldavCollections(service.discover_caldav(&endpoint, source_id.as_deref())?),
         Request::SetNote { id, note } => {
             Response::Entry(Box::new(service.set_note(&id, note.as_deref())?))
         }
@@ -377,6 +410,162 @@ mod tests {
             .entry()
             .unwrap();
         assert_eq!(noted.note.as_deref(), Some("from calendar"));
+    }
+
+    #[test]
+    fn credential_ops_round_trip_over_the_socket() {
+        use crate::credentials::FakeCredentialStore;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("tt-sock-svc-cred-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = Arc::new(FakeCredentialStore::new());
+        let svc = Arc::new(
+            EntryService::new_with_credentials(
+                SqliteStore::open_at(&dir.join("store.json")).unwrap(),
+                fake.clone(),
+            )
+            .unwrap(),
+        );
+        let path = dir.join("s.sock");
+        let _ = serve_at(Arc::clone(&svc), path.clone()).unwrap();
+        let client = SocketClient::new(path);
+        let src = client
+            .call(Request::AddSource {
+                kind: "caldav".into(),
+                locator: "https://cal.test/u/".into(),
+                project_id: None,
+                label: "Cal".into(),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        assert!(!src.has_credential);
+        // The secret crosses the socket inside SecretString; the reply
+        // carries only the reference state, never the secret.
+        let set = client
+            .call(Request::SetSourceCredential {
+                id: src.id.clone(),
+                username: "alice".into(),
+                secret: timetrack_proto::SecretString::new("s3cr3t"),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        assert!(set.has_credential);
+        assert_eq!(set.username.as_deref(), Some("alice"));
+        let listed = client
+            .call(Request::ListSources)
+            .unwrap()
+            .sources()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].has_credential);
+        let cleared = client
+            .call(Request::RemoveSourceCredential { id: src.id.clone() })
+            .unwrap()
+            .source()
+            .unwrap();
+        assert!(!cleared.has_credential);
+        client
+            .call(Request::RemoveSource { id: src.id.clone() })
+            .unwrap()
+            .unit()
+            .unwrap();
+        assert!(
+            client
+                .call(Request::ListSources)
+                .unwrap()
+                .sources()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client.call(Request::RemoveSource { id: src.id }).is_err(),
+            "removing twice refuses"
+        );
+    }
+
+    #[test]
+    fn source_update_and_remove_round_trip_and_notify() {
+        // #153 at the socket seam: edit a source over the wire, watch
+        // the subscription fire for add/edit/remove, and see refusals
+        // come back typed with no signal.
+        let (svc, dir) = service_at("src-update");
+        let path = dir.join("s.sock");
+        let _ = serve_at(Arc::clone(&svc), path.clone()).unwrap();
+        let client = SocketClient::new(path);
+        let changed = svc.subscribe_changed();
+        let src = client
+            .call(Request::AddSource {
+                kind: "ics_file".into(),
+                locator: "/tmp/a.ics".into(),
+                project_id: None,
+                label: String::new(),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        assert_eq!(src.label, "a.ics");
+        assert_eq!(changed.try_recv(), Ok(()));
+        let second = client
+            .call(Request::AddSource {
+                kind: "ics_file".into(),
+                locator: "/tmp/b.ics".into(),
+                project_id: None,
+                label: "B".into(),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        assert_eq!(changed.try_recv(), Ok(()));
+
+        let updated = client
+            .call(Request::UpdateSource {
+                id: src.id.clone(),
+                kind: "ics_file".into(),
+                locator: "/tmp/a.ics".into(),
+                project_id: None,
+                label: "A".into(),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        assert_eq!(updated.label, "A");
+        assert_eq!(changed.try_recv(), Ok(()), "an edit notifies");
+
+        let err = client
+            .call(Request::UpdateSource {
+                id: src.id.clone(),
+                kind: "ics_file".into(),
+                locator: second.locator.clone(),
+                project_id: None,
+                label: "A".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                timetrack_proto::ClientError::Service(timetrack_proto::ServiceError::Other(_))
+            ),
+            "a duplicate edit refuses typed: {err:?}"
+        );
+        assert!(changed.try_recv().is_err(), "refusals notify nothing");
+
+        client
+            .call(Request::RemoveSource { id: src.id.clone() })
+            .unwrap()
+            .unit()
+            .unwrap();
+        assert_eq!(changed.try_recv(), Ok(()), "a removal notifies");
+        let listed = client
+            .call(Request::ListSources)
+            .unwrap()
+            .sources()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, second.id);
     }
 
     #[test]

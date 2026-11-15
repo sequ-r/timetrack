@@ -68,11 +68,12 @@ pub use parse::{
     parse_moment,
 };
 pub use rules::{
-    Counter, Ids, MAX_DESCRIPTION_CHARS, MAX_NOTE_CHARS, MAX_PROJECT_NAME_CHARS, QUICK_ADD_MS,
-    RuleError, RuleResult, create_duration, create_duration_ending, create_entry,
+    Counter, IdResolution, Ids, MAX_DESCRIPTION_CHARS, MAX_NOTE_CHARS, MAX_PROJECT_NAME_CHARS,
+    QUICK_ADD_MS, RuleError, RuleResult, create_duration, create_duration_ending, create_entry,
     create_entry_from, create_project, days_exceeding_24h, delete_entry, delete_project,
-    format_merge_delta, merge_entries, merge_shrink_ms, next_project_id, quick_add, set_archived,
-    set_project, set_text, set_times, split_entry, update_project,
+    format_merge_delta, merge_entries, merge_shrink_ms, quick_add, resolve_entry_id,
+    resolve_id_prefix, resolve_project_id, set_archived, set_project, set_text, set_times,
+    split_entry, update_project,
 };
 pub use storage::{JOURNAL_CHECKPOINT_BYTES, Journal, JsonStore, StorageError, StorageResult};
 pub use tz::{Tz, TzError};

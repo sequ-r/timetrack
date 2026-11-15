@@ -5,6 +5,10 @@
 //! spawned against it, and the item's SNI properties are read back. No
 //! timetrack service is needed: the tray must register even while the
 //! service is absent (issues #6/#9).
+//!
+//! Linux only: StatusNotifier is a D-Bus protocol.
+
+#![cfg(target_os = "linux")]
 
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};

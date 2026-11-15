@@ -26,6 +26,31 @@ pub(crate) struct ProjectPrompt {
     pub(crate) error: Option<String>,
 }
 
+impl ProjectPrompt {
+    /// Apply a platform text-input edit (IME preedit or commit, #126)
+    /// to the name field, clearing a stale error like any edit.
+    pub(crate) fn ime_edit(&mut self, edit: crate::app::textline::ImeEdit) {
+        crate::app::textline::apply_ime_edit(&mut self.name, &mut self.caret, edit);
+        self.error = None;
+    }
+
+    /// Press the mouse at a text offset in the name field (#127):
+    /// places the caret, or extends to it with shift held. A press
+    /// never clears the error: it edits no text.
+    pub(crate) fn mouse_down(&mut self, at: usize, shift: bool) {
+        if shift {
+            crate::app::textline::extend_caret_to(&self.name, &mut self.caret, at);
+        } else {
+            crate::app::textline::place_caret(&self.name, &mut self.caret, at);
+        }
+    }
+
+    /// Drag the mouse to a text offset in the name field (#127).
+    pub(crate) fn mouse_drag(&mut self, at: usize) {
+        crate::app::textline::extend_caret_to(&self.name, &mut self.caret, at);
+    }
+}
+
 /// What saving a project prompt means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectSave {
@@ -90,5 +115,41 @@ mod tests {
             resolve_project_prompt(&project_prompt(Some("p1"), "   ")),
             Err(timetrack_core::RuleError::BlankProjectName)
         );
+    }
+
+    #[test]
+    fn ime_edits_compose_the_name_and_clear_errors() {
+        use crate::app::textline::ImeEdit;
+        let mut prompt = project_prompt(None, "");
+        prompt.error = Some("stale".into());
+        prompt.ime_edit(ImeEdit::Mark {
+            range: None,
+            text: "gong",
+            selected: None,
+        });
+        assert_eq!(prompt.name, "gong");
+        assert_eq!(prompt.error, None);
+        prompt.ime_edit(ImeEdit::Commit {
+            range: None,
+            text: "工作",
+        });
+        assert_eq!(prompt.name, "工作");
+        assert_eq!(prompt.caret.marked, None);
+    }
+
+    #[test]
+    fn a_press_places_and_a_drag_selects() {
+        // #127: place, drag from the press point, shift-extend — over
+        // multi-byte text, without touching the error.
+        use crate::app::textline::selected_text;
+        let mut prompt = project_prompt(None, "caffè");
+        prompt.error = Some("stale".into());
+        prompt.mouse_down(2, false);
+        assert_eq!(prompt.caret.pos, 2);
+        prompt.mouse_drag(6);
+        assert_eq!(selected_text(&prompt.name, &prompt.caret), Some("ffè"));
+        prompt.mouse_down(0, true);
+        assert_eq!(selected_text(&prompt.name, &prompt.caret), Some("ca"));
+        assert_eq!(prompt.error.as_deref(), Some("stale"));
     }
 }

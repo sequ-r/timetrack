@@ -45,7 +45,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::time::Duration;
-use timetrack_proto::{Client, ClientError, ProjectView, Snapshot, no_service_hint};
+use timetrack_proto::{Client, ClientError, EntryView, ProjectView, Snapshot, no_service_hint};
 
 /// How long to wait for the service to appear before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,7 +78,8 @@ enum Command {
     // --- the four add methods ---
     /// Method 1: record an explicit start and end.
     Add {
-        /// Project to attribute the time to. Defaults to the first project.
+        /// Project to attribute the time to (id, name, or id prefix).
+        /// Defaults to the first project.
         #[arg(short, long)]
         project: Option<String>,
         /// What you are working on.
@@ -94,6 +95,8 @@ enum Command {
 
     /// Method 2: record a duration ending now.
     Duration {
+        /// Project to attribute the time to (id, name, or id prefix).
+        /// Defaults to the first project.
         #[arg(short, long)]
         project: Option<String>,
         #[arg(short, long, default_value = "")]
@@ -105,6 +108,8 @@ enum Command {
 
     /// Method 3: record a duration ending at a given moment.
     Past {
+        /// Project to attribute the time to (id, name, or id prefix).
+        /// Defaults to the first project.
         #[arg(short, long)]
         project: Option<String>,
         #[arg(short, long, default_value = "")]
@@ -119,6 +124,8 @@ enum Command {
 
     /// Method 4: add one of the fixed buckets, ending now.
     Quick {
+        /// Project to attribute the time to (id, name, or id prefix).
+        /// Defaults to the first project.
         #[arg(short, long)]
         project: Option<String>,
         /// One of 5, 15, 30 or 60.
@@ -134,7 +141,7 @@ enum Command {
     // --- the three ways time comes back off ---
     /// Move an entry's endpoints. Shortens without deleting.
     Shorten {
-        /// The entry to change.
+        /// The entry to change: its id or an unambiguous id prefix.
         id: String,
         /// New start, in the same format as add --start.
         #[arg(short = 'S', long, allow_hyphen_values = true)]
@@ -145,14 +152,20 @@ enum Command {
     },
 
     /// Remove the entry a quick add created. Refuses anything else.
-    Undo { id: String },
+    Undo {
+        /// The entry to remove: its id or an unambiguous id prefix.
+        id: String,
+    },
 
     /// Delete an entry outright.
-    Delete { id: String },
+    Delete {
+        /// The entry to delete: its id or an unambiguous id prefix.
+        id: String,
+    },
 
     /// Rewrite an entry's description.
     SetText {
-        /// The entry to change.
+        /// The entry to change: its id or an unambiguous id prefix.
         id: String,
         /// The new description.
         #[arg(allow_hyphen_values = true)]
@@ -161,16 +174,16 @@ enum Command {
 
     /// Move an entry to another project. Totals follow the entry.
     SetProject {
-        /// The entry to move.
+        /// The entry to move: its id or an unambiguous id prefix.
         id: String,
-        /// The project id or name.
+        /// The project id, name, or unambiguous id prefix.
         project: String,
     },
 
     // --- split and merge (REQUIREMENTS §8) ---
     /// Split one entry into two at a given moment. The total is unchanged.
     Split {
-        /// The entry to split.
+        /// The entry to split: its id or an unambiguous id prefix.
         id: String,
         /// Where to split: `-30` for 30 minutes ago, or `09:30` today.
         #[arg(short = 'A', long, allow_hyphen_values = true)]
@@ -180,7 +193,7 @@ enum Command {
     /// Merge entries into one spanning earliest start to latest end.
     /// Merging overlapping entries shrinks the total by the overlap.
     Merge {
-        /// The entries to merge (two or more; the service refuses fewer).
+        /// The entries to merge: two or more ids or unambiguous id prefixes.
         #[arg(required = true)]
         ids: Vec<String>,
         /// Confirm without prompting. The prompt states how the total changes.
@@ -197,7 +210,7 @@ enum Command {
 
     /// Rename a project.
     Rename {
-        /// The project id (or its current name).
+        /// The project id, name, or unambiguous id prefix.
         id: String,
         /// The new name.
         name: String,
@@ -205,21 +218,30 @@ enum Command {
 
     /// Recolour a project. Colour is RRGGBB hex, e.g. `2ea043`.
     Recolour {
-        /// The project id (or its current name).
+        /// The project id, name, or unambiguous id prefix.
         id: String,
         /// Six hex digits, with or without a leading `#`.
         colour: String,
     },
 
     /// Archive a project, keeping its history in totals.
-    Archive { id: String },
+    Archive {
+        /// The project to archive: its id, name, or unambiguous id prefix.
+        id: String,
+    },
 
     /// Unarchive a project, making it selectable again.
-    Unarchive { id: String },
+    Unarchive {
+        /// The project to unarchive: its id, name, or unambiguous id prefix.
+        id: String,
+    },
 
     /// Delete a project. Refused when it still has entries, and when it is
     /// the last one.
-    DeleteProject { id: String },
+    DeleteProject {
+        /// The project to delete: its id, name, or unambiguous id prefix.
+        id: String,
+    },
 
     /// Export entries as CSV (REQUIREMENTS §10).
     Export {
@@ -286,8 +308,9 @@ enum Command {
     // --- external sources (§19, socket-only) ---
     /// Register an external calendar: a local `.ics` file, an
     /// `http(s)://` URL serving one, or a CalDAV collection URL
-    /// (`--kind caldav`; password via TIMETRACK_CALDAV_PASSWORD in the
-    /// service environment). Read-only either way.
+    /// (`--kind caldav`; its secret goes to the OS credential store
+    /// via `source-set-credential`, with TIMETRACK_CALDAV_PASSWORD as
+    /// the headless fallback until one is stored). Read-only either way.
     SourceAdd {
         /// File path, or URL when it starts with `http://`/`https://`.
         locator: String,
@@ -295,7 +318,7 @@ enum Command {
         /// from the locator when omitted (`.ics` URL or file path).
         #[arg(long)]
         kind: Option<String>,
-        /// Project its suggestions confirm into (id or name).
+        /// Project its suggestions confirm into (id, name, or id prefix).
         #[arg(short, long)]
         project: Option<String>,
         /// Display label; defaults to the file or URL's last part.
@@ -303,8 +326,51 @@ enum Command {
         label: String,
     },
 
+    /// Edit a registered external source (#153): kind, locator, label
+    /// and project mapping. Omitted flags keep the current value; the
+    /// service re-validates the result exactly as on registration (bad
+    /// kind, empty locator, a CalDAV password in the URL, or another
+    /// source's identity all refuse).
+    SourceUpdate {
+        /// Source id (from `sources`).
+        id: String,
+        /// New kind: `ics_file`, `ics_url`, or `caldav`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// New file path or URL.
+        #[arg(long)]
+        locator: Option<String>,
+        /// New project mapping (id, name, or id prefix).
+        #[arg(short, long, conflicts_with = "clear_project")]
+        project: Option<String>,
+        /// Drop the project mapping instead of setting one.
+        #[arg(long)]
+        clear_project: bool,
+        /// New display label; empty re-derives it from the locator.
+        #[arg(long)]
+        label: Option<String>,
+    },
+
     /// List registered external sources.
     Sources,
+
+    /// Discover a CalDAV account's calendar/task collections from a
+    /// server, account, principal, or home URL (#150), so collections
+    /// can be registered without hand-constructing URLs. Read-only:
+    /// registers nothing — each found URL becomes a source through
+    /// `source-add --kind caldav`.
+    SourceDiscover {
+        /// Server, account, principal, or home URL to discover from.
+        endpoint: String,
+        /// Lend a registered source's stored credential to the
+        /// discovery (source id from `sources`); without one the
+        /// endpoint's userinfo and TIMETRACK_CALDAV_PASSWORD apply.
+        #[arg(long)]
+        source: Option<String>,
+        /// Print a JSON array for scripts instead of the human list.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Fetch one source (or all) now and store new suggestions.
     /// Fetching creates no entries — `confirm` does that.
@@ -324,7 +390,7 @@ enum Command {
     Confirm {
         /// Suggestion id (from `suggestions`).
         id: String,
-        /// Project override (id or name); default is the source's map.
+        /// Project override (id, name, or id prefix); default is the source's map.
         #[arg(short, long)]
         project: Option<String>,
     },
@@ -332,6 +398,31 @@ enum Command {
     /// Dismiss a suggestion; it will not be offered again.
     Dismiss {
         /// Suggestion id (from `suggestions`).
+        id: String,
+    },
+
+    /// Store a source's secret in the OS credential store (#149). The
+    /// secret is never an argument: it is prompted for (un-echoed) on
+    /// a terminal, or read as the first stdin line when piped.
+    SourceSetCredential {
+        /// Source id (from `sources`).
+        id: String,
+        /// Login name; defaults to the `user@` in the source URL.
+        #[arg(short, long)]
+        username: Option<String>,
+    },
+
+    /// Forget a source's stored secret.
+    SourceRemoveCredential {
+        /// Source id (from `sources`).
+        id: String,
+    },
+
+    /// Delete a source, its still-pending suggestions, and its
+    /// stored secret (#153). Decided suggestions stay as history, and
+    /// confirmed entries stay.
+    SourceRemove {
+        /// Source id (from `sources`).
         id: String,
     },
 }
@@ -423,6 +514,62 @@ fn quick_add_ms(minutes: i64) -> Option<i64> {
     minutes
         .checked_mul(60_000)
         .filter(|ms| timetrack_core::QUICK_ADD_MS.contains(ms))
+}
+
+/// Whether a locator carries `user@` in its authority (#149): the
+/// same rule the service's `split_userinfo` applies, minus the
+/// password refusal (a registered locator cannot hold one). Only the
+/// CLI's early "--username needed" check; the service re-resolves
+/// authoritatively, including percent-decoding.
+fn locator_has_userinfo(locator: &str) -> bool {
+    let Some((_, rest)) = locator.split_once("://") else {
+        return false;
+    };
+    let Some(at) = rest.rfind('@') else {
+        return false;
+    };
+    if rest.find('/').is_some_and(|slash| slash < at) {
+        return false;
+    }
+    !rest[..at].contains(':')
+}
+
+/// Read a source credential's secret (#149): an un-echoed prompt on a
+/// terminal, the first stdin line when piped (`printf %s "$PASS" |
+/// timetrack source-set-credential …`). Never an argument, so the
+/// secret never appears in argv, shell history, or process listings.
+fn read_credential_secret() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("password: ")
+            .map_err(|e| anyhow::anyhow!("could not read the password: {e}"))
+            .and_then(|secret| {
+                if secret.is_empty() {
+                    Err(anyhow::anyhow!("the credential is empty"))
+                } else {
+                    Ok(secret)
+                }
+            })
+    } else {
+        read_piped_secret(&mut std::io::stdin().lock())
+    }
+}
+
+/// The piped half of [`read_credential_secret`], split out so the
+/// line handling is testable without a terminal: the first line,
+/// newlines trimmed, nothing else touched (a password's own spaces
+/// are significant).
+fn read_piped_secret(reader: &mut dyn std::io::BufRead) -> Result<String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| anyhow::anyhow!("could not read the secret from stdin: {e}"))?;
+    let secret = line.trim_end_matches(['\r', '\n']).to_string();
+    if secret.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no secret on stdin; pipe one or run on a terminal for the prompt"
+        ));
+    }
+    Ok(secret)
 }
 
 async fn dispatch(client: Client, command: Command) -> Result<()> {
@@ -530,11 +677,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             // Unspecified endpoints are left alone, so `shorten e2 -E 30m`
             // moves only the end and the entry is kept.
             let snap = client.snapshot().await?;
-            let existing = snap
-                .entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let existing = find_entry(&snap, &id)?;
             let tz = snapshot_tz(&snap)?;
             let start_ms = match &start {
                 Some(s) => parse_when(s, "start", &tz)?,
@@ -544,7 +687,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 Some(s) => parse_when(s, "end", &tz)?,
                 None => existing.ended_at,
             };
-            let e = client.set_times(&id, start_ms, end_ms).await?;
+            let e = client.set_times(&existing.id, start_ms, end_ms).await?;
             println!(
                 "shortened to {} (the entry is still there: {})",
                 timetrack_core::format_duration(e.duration_ms()),
@@ -553,49 +696,43 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         }
 
         Command::Undo { id } => {
-            client.undo_quick_add(&id).await?;
-            println!("undid quick add: {id}");
+            let snap = client.snapshot().await?;
+            let existing = find_entry(&snap, &id)?;
+            client.undo_quick_add(&existing.id).await?;
+            println!("undid quick add: {}", existing.id);
         }
 
         Command::Delete { id } => {
-            client.delete_entry(&id).await?;
-            println!("deleted: {id}");
+            let snap = client.snapshot().await?;
+            let existing = find_entry(&snap, &id)?;
+            client.delete_entry(&existing.id).await?;
+            println!("deleted: {}", existing.id);
         }
 
         Command::SetText { id, text } => {
             let snap = client.snapshot().await?;
-            snap.entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
-            let e = client.set_text(&id, &text).await?;
+            let existing = find_entry(&snap, &id)?;
+            let e = client.set_text(&existing.id, &text).await?;
             println!("set text on {} to \"{}\"", e.id, disp(&e.description));
         }
 
         Command::SetProject { id, project } => {
             let snap = client.snapshot().await?;
-            snap.entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let existing = find_entry(&snap, &id)?;
             let target = find_project(&snap, &project)?;
-            let e = client.set_project(&id, &target.id).await?;
+            let e = client.set_project(&existing.id, &target.id).await?;
             println!("moved {} to {} ({})", e.id, disp(&target.name), target.id);
         }
 
         Command::Split { id, at } => {
             let snap = client.snapshot().await?;
-            let existing = snap
-                .entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?;
+            let existing = find_entry(&snap, &id)?;
             let tz = snapshot_tz(&snap)?;
             let at_ms = parse_when(&at, "at", &tz)?;
             if at_ms <= existing.started_at || at_ms >= existing.ended_at {
                 anyhow::bail!("split point is outside entry '{id}'");
             }
-            let (a, b) = client.split(&id, at_ms).await?;
+            let (a, b) = client.split(&existing.id, at_ms).await?;
             println!(
                 "split into ({}) {} and ({}) {}",
                 a.id,
@@ -609,12 +746,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let snap = client.snapshot().await?;
             let mut found = Vec::with_capacity(ids.len());
             for id in &ids {
-                found.push(
-                    snap.entries
-                        .iter()
-                        .find(|e| e.id == *id)
-                        .ok_or_else(|| anyhow::anyhow!("no entry with id '{id}'"))?,
-                );
+                found.push(find_entry(&snap, id)?);
             }
             // Preview from the snapshot so the confirmation states how the
             // total changes; the service re-validates on execute.
@@ -646,7 +778,8 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                     anyhow::bail!("merge needs confirmation ({delta}); re-run with --yes");
                 }
             }
-            let merged = client.merge(&ids).await?;
+            let resolved: Vec<String> = found.iter().map(|e| e.id.clone()).collect();
+            let merged = client.merge(&resolved).await?;
             println!(
                 "merged {} entries into ({}) {} ({delta})",
                 ids.len(),
@@ -683,7 +816,9 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         }
 
         Command::Archive { id } => {
-            let p = client.set_archived(&id, true).await?;
+            let snap = client.snapshot().await?;
+            let existing = find_project(&snap, &id)?;
+            let p = client.set_archived(&existing.id, true).await?;
             println!(
                 "archived {} ({}) -- its entries stay in historical totals",
                 disp(&p.name),
@@ -692,13 +827,16 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         }
 
         Command::Unarchive { id } => {
-            let p = client.set_archived(&id, false).await?;
+            let snap = client.snapshot().await?;
+            let existing = find_project(&snap, &id)?;
+            let p = client.set_archived(&existing.id, false).await?;
             println!("unarchived {} ({})", disp(&p.name), p.id);
         }
 
         Command::DeleteProject { id } => {
-            // Resolved by id or by name, like rename and recolour, so
-            // `timetrack delete-project Work` works as well as the id.
+            // Resolved by id, by name, or by id prefix, like rename and
+            // recolour, so `timetrack delete-project Work` works as well
+            // as the id.
             let snap = client.snapshot().await?;
             let existing = find_project(&snap, &id)?;
             // The service owns the rules: a project that still has entries
@@ -820,27 +958,114 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             );
         }
 
+        Command::SourceUpdate {
+            id,
+            kind,
+            locator,
+            project,
+            clear_project,
+            label,
+        } => {
+            // Full-replace on the wire: read the current state, apply
+            // the flags, send it all back. Omitted flags keep their
+            // values, so a label-only edit is one flag.
+            let sources = client.sources().await?;
+            let current = sources.iter().find(|s| s.id == id).ok_or_else(|| {
+                anyhow::anyhow!("no external source with id '{id}' (see: timetrack sources)")
+            })?;
+            let project_id = if clear_project {
+                None
+            } else {
+                match &project {
+                    Some(wanted) => {
+                        let snap = client.snapshot().await?;
+                        Some(find_project(&snap, wanted)?.id.clone())
+                    }
+                    None => current.project_id.clone(),
+                }
+            };
+            let updated = client
+                .update_source(
+                    &id,
+                    kind.as_deref().unwrap_or(&current.kind),
+                    locator.as_deref().unwrap_or(&current.locator),
+                    project_id.as_deref(),
+                    label.as_deref().unwrap_or(&current.label),
+                )
+                .await?;
+            println!(
+                "updated source {} ({}) {}",
+                disp(&updated.label),
+                updated.kind,
+                updated.id
+            );
+        }
+
         Command::Sources => {
             let sources = client.sources().await?;
             if sources.is_empty() {
                 println!("no external sources yet (add one with: timetrack source-add <file.ics>)");
             }
             for s in sources {
+                // The credential state, never the secret: who the stored
+                // login authenticates as, if one is stored.
+                let credential = match (s.has_credential, &s.username) {
+                    (true, Some(user)) => format!("  [credential: {}]", disp(user)),
+                    (true, None) => "  [credential]".to_string(),
+                    (false, _) => String::new(),
+                };
                 println!(
-                    "{}  {:<8}  {}  {}",
+                    "{}  {:<8}  {}  {}{}",
                     s.id,
                     s.kind,
                     disp(&s.label),
-                    disp(&s.locator)
+                    disp(&s.locator),
+                    credential
                 );
+            }
+        }
+
+        Command::SourceDiscover {
+            endpoint,
+            source,
+            json,
+        } => {
+            let found = client.discover_caldav(&endpoint, source.as_deref()).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&found)
+                        .expect("collection views are always serializable")
+                );
+            } else if found.is_empty() {
+                println!("no calendar collections found at {endpoint}");
+            } else {
+                for c in &found {
+                    println!(
+                        "{}  [{}]  {}",
+                        disp(&c.display_name),
+                        c.components.join(", "),
+                        disp(&c.url)
+                    );
+                }
+                println!("register one with: timetrack source-add --kind caldav <url>");
             }
         }
 
         Command::Refresh { id } => {
             let tally = client.refresh_source(id.as_deref()).await?;
+            // CalDAV refreshes (#151) also update and withdraw; the
+            // suffix stays silent at zero so `.ics` output is unchanged.
+            let mut extra = String::new();
+            if tally.updated > 0 {
+                extra.push_str(&format!(", {} updated", tally.updated));
+            }
+            if tally.withdrawn > 0 {
+                extra.push_str(&format!(", {} withdrawn", tally.withdrawn));
+            }
             println!(
-                "fetched {} item(s): {} new suggestion(s), {} skipped",
-                tally.fetched, tally.inserted, tally.skipped
+                "fetched {} item(s): {} new suggestion(s), {} skipped{}",
+                tally.fetched, tally.inserted, tally.skipped, extra
             );
         }
 
@@ -890,6 +1115,50 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         Command::Dismiss { id } => {
             client.dismiss_suggestion(&id).await?;
             println!("dismissed {id}");
+        }
+
+        Command::SourceSetCredential { id, username } => {
+            let sources = client.sources().await?;
+            let src = sources.iter().find(|s| s.id == id).ok_or_else(|| {
+                anyhow::anyhow!("no external source with id '{id}' (see: timetrack sources)")
+            })?;
+            let username = username.unwrap_or_default();
+            // Fail before prompting: no point reading a secret the
+            // service would refuse for want of a username. The service
+            // re-resolves authoritatively (including percent-decoding).
+            if username.trim().is_empty() && !locator_has_userinfo(&src.locator) {
+                anyhow::bail!("source '{id}' names no user; pass --username <name>");
+            }
+            let secret = read_credential_secret()?;
+            let updated = client
+                .set_source_credential(&id, &username, &secret)
+                .await?;
+            println!(
+                "stored a credential for {} on source {} ({})",
+                disp(updated.username.as_deref().unwrap_or_default()),
+                disp(&updated.label),
+                updated.id
+            );
+        }
+
+        Command::SourceRemoveCredential { id } => {
+            let updated = client.remove_source_credential(&id).await?;
+            println!(
+                "removed the credential from source {} ({})",
+                disp(&updated.label),
+                updated.id
+            );
+        }
+
+        Command::SourceRemove { id } => {
+            let sources = client.sources().await?;
+            let label = sources
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| disp(&s.label))
+                .unwrap_or_else(|| id.clone());
+            client.remove_source(&id).await?;
+            println!("removed source {label} ({id})");
         }
 
         Command::Export {
@@ -1160,21 +1429,56 @@ fn plan_import(snap: &Snapshot, rows: &[timetrack_core::ImportedEntry]) -> Impor
     }
 }
 
+/// Resolve an entry argument to a snapshot entry.
+///
+/// An exact id wins, then a unique id prefix (ADR 0018); anything else
+/// refuses in the service's own words, so scripts match one string
+/// either side. The caller sends the resolved id onward.
+fn find_entry<'a>(snap: &'a Snapshot, wanted: &str) -> Result<&'a EntryView> {
+    match timetrack_core::resolve_id_prefix(wanted, snap.entries.iter().map(|e| e.id.as_str())) {
+        timetrack_core::IdResolution::Resolved(id) => Ok(snap
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .expect("resolved above")),
+        timetrack_core::IdResolution::Unknown => Err(anyhow::Error::new(
+            timetrack_core::RuleError::UnknownEntry(wanted.to_string()),
+        )),
+        timetrack_core::IdResolution::Ambiguous => Err(anyhow::Error::new(
+            timetrack_core::RuleError::AmbiguousEntry(wanted.to_string()),
+        )),
+    }
+}
+
 /// Resolve a project argument to a snapshot entry, for rename/recolour.
 ///
 /// Unlike `pick_project` this matches archived projects too: renaming one
 /// is harmless, and refusing would strand the numbered placeholders this
-/// replaced. Matches the id first, then the name case-insensitively.
+/// replaced. Matches the id first, then the name case-insensitively,
+/// then a unique id prefix (ADR 0018). The caller sends the resolved id
+/// onward.
 fn find_project<'a>(snap: &'a Snapshot, wanted: &str) -> Result<&'a ProjectView> {
-    snap.projects
-        .iter()
-        .find(|p| p.id == wanted)
-        .or_else(|| {
-            snap.projects
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case(wanted))
-        })
-        .ok_or_else(|| anyhow::anyhow!("no project with id '{wanted}'"))
+    if let Some(found) = snap.projects.iter().find(|p| p.id == wanted).or_else(|| {
+        snap.projects
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(wanted))
+    }) {
+        return Ok(found);
+    }
+    match timetrack_core::resolve_id_prefix(wanted, snap.projects.iter().map(|p| p.id.as_str())) {
+        // Exact was checked above, so a resolution here is a unique prefix.
+        timetrack_core::IdResolution::Resolved(id) => Ok(snap
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .expect("resolved above")),
+        timetrack_core::IdResolution::Unknown => Err(anyhow::Error::new(
+            timetrack_core::RuleError::UnknownProject(wanted.to_string()),
+        )),
+        timetrack_core::IdResolution::Ambiguous => Err(anyhow::Error::new(
+            timetrack_core::RuleError::AmbiguousProject(wanted.to_string()),
+        )),
+    }
 }
 
 /// Parse an `RRGGBB` colour like `2ea043` (leading `#` allowed).
@@ -1188,21 +1492,35 @@ fn parse_colour(text: &str) -> Result<u32> {
 
 /// Resolve a project argument to an id, defaulting to the first active one.
 ///
-/// Matches either the id or (case-insensitively) the name: `timetrack quick
-/// -p p1` should work the same as `-p Work`, since ids are what every other
-/// command prints back.
+/// Matches the id, then (case-insensitively) the name, then a unique id
+/// prefix among active projects (ADR 0018): `timetrack quick -p Work`
+/// works the same as `-p` with the id, since ids are what every other
+/// command prints back. Only active projects are candidates throughout.
 fn pick_project(snap: &Snapshot, requested: Option<&str>) -> Result<String> {
     let active: Vec<&ProjectView> = snap.projects.iter().filter(|p| !p.archived).collect();
     match requested {
-        Some(want) => active
-            .iter()
-            .find(|p| p.id == want)
-            .or_else(|| active.iter().find(|p| p.name.eq_ignore_ascii_case(want)))
-            .map(|p| p.id.clone())
-            .ok_or_else(|| {
-                let names: Vec<&str> = active.iter().map(|p| p.name.as_str()).collect();
-                anyhow::anyhow!("no active project named '{want}'. Active: {names:?}")
-            }),
+        Some(want) => {
+            if let Some(found) = active
+                .iter()
+                .find(|p| p.id == want)
+                .or_else(|| active.iter().find(|p| p.name.eq_ignore_ascii_case(want)))
+            {
+                return Ok(found.id.clone());
+            }
+            match timetrack_core::resolve_id_prefix(want, active.iter().map(|p| p.id.as_str())) {
+                // Exact was checked above, so this is a unique prefix.
+                timetrack_core::IdResolution::Resolved(id) => Ok(id.to_string()),
+                timetrack_core::IdResolution::Ambiguous => Err(anyhow::Error::new(
+                    timetrack_core::RuleError::AmbiguousProject(want.to_string()),
+                )),
+                timetrack_core::IdResolution::Unknown => {
+                    let names: Vec<&str> = active.iter().map(|p| p.name.as_str()).collect();
+                    Err(anyhow::anyhow!(
+                        "no active project named '{want}'. Active: {names:?}"
+                    ))
+                }
+            }
+        }
         None => active.first().map(|p| p.id.clone()).ok_or_else(|| {
             anyhow::anyhow!("no projects yet. Create one with:  timetrack project \"Work\"")
         }),
@@ -1566,6 +1884,61 @@ mod tests {
     }
 
     #[test]
+    fn the_credential_secret_is_never_an_argument() {
+        // #149: `source-set-credential` takes an id and an optional
+        // (non-secret) username; the secret arrives via prompt or stdin,
+        // so it can never appear in argv, shell history, or `ps`.
+        use clap::CommandFactory;
+        let set = Cli::command()
+            .get_subcommands()
+            .find(|c| c.get_name() == "source-set-credential")
+            .expect("source-set-credential must exist")
+            .clone();
+        for arg in set.get_arguments() {
+            let id = arg.get_id();
+            assert!(
+                id != "password" && id != "secret",
+                "the secret must not be an argument: {id}"
+            );
+        }
+        let cli = Cli::try_parse_from(["timetrack", "source-set-credential", "src-1"])
+            .expect("id-only must parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::SourceSetCredential { .. })
+        ));
+        assert!(Cli::try_parse_from(["timetrack", "source-remove-credential", "src-1"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "source-remove", "src-1"]).is_ok());
+    }
+
+    #[test]
+    fn locator_userinfo_detection_matches_the_service_rule() {
+        assert!(locator_has_userinfo("https://alice@cal.test/u/"));
+        assert!(locator_has_userinfo("http://alice@127.0.0.1:8080/cal/"));
+        assert!(!locator_has_userinfo("https://cal.test/u/"));
+        // An @ in the path is not userinfo.
+        assert!(!locator_has_userinfo("https://cal.test/a@b.ics"));
+        // A password is not a username either (the service refuses it).
+        assert!(!locator_has_userinfo("https://alice:s3cr3t@cal.test/u/"));
+        assert!(!locator_has_userinfo("/tmp/cal.ics"));
+    }
+
+    #[test]
+    fn piped_secrets_read_one_line_verbatim() {
+        use std::io::BufReader;
+        let mut piped = BufReader::new("s3cr3t\nignored-rest\n".as_bytes());
+        assert_eq!(read_piped_secret(&mut piped).unwrap(), "s3cr3t");
+        // CRLF trims; a password's own spaces stay significant.
+        let mut piped = BufReader::new("  padded  \r\n".as_bytes());
+        assert_eq!(read_piped_secret(&mut piped).unwrap(), "  padded  ");
+        // Empty stdin refuses instead of storing an empty secret.
+        let mut piped = BufReader::new("".as_bytes());
+        assert!(read_piped_secret(&mut piped).is_err());
+        let mut piped = BufReader::new("\n".as_bytes());
+        assert!(read_piped_secret(&mut piped).is_err());
+    }
+
+    #[test]
     fn quick_minutes_are_checked_before_the_bucket_whitelist() {
         // #98: the buckets still map, everything else refuses — including
         // values whose `minutes * 60_000` overflows i64 outright.
@@ -1921,6 +2294,76 @@ mod tests {
             cli.command,
             Some(Command::Suggestions { json: true })
         ));
+        // #150: discovery takes an endpoint, an optional lending source,
+        // and an optional JSON switch.
+        let cli = Cli::try_parse_from([
+            "timetrack",
+            "source-discover",
+            "https://cal.test/",
+            "--source",
+            "src-1",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::SourceDiscover { json: true, .. })
+        ));
+        let cli =
+            Cli::try_parse_from(["timetrack", "source-discover", "https://cal.test/"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::SourceDiscover {
+                source: None,
+                json: false,
+                ..
+            })
+        ));
+        // #153: update takes an id plus optional new values; setting
+        // and clearing the mapping together is refused by clap.
+        let cli = Cli::try_parse_from([
+            "timetrack",
+            "source-update",
+            "src-1",
+            "--kind",
+            "caldav",
+            "--locator",
+            "https://cal.test/u/",
+            "-p",
+            "Work",
+            "--label",
+            "Cal",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::SourceUpdate {
+                clear_project: false,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["timetrack", "source-update", "src-1", "--clear-project"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::SourceUpdate {
+                project: None,
+                clear_project: true,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "timetrack",
+                "source-update",
+                "src-1",
+                "-p",
+                "Work",
+                "--clear-project",
+            ])
+            .is_err(),
+            "setting and clearing the mapping conflict"
+        );
     }
 
     #[test]
@@ -1942,5 +2385,137 @@ mod tests {
         assert_eq!(v[0]["id"], "e0");
         assert_eq!(v[0]["description"], "task 0");
         assert_eq!(v[1]["id"], "e1");
+    }
+
+    /// A snapshot with ambiguous and unique id prefixes (ADR 0018).
+    fn prefixed_snapshot() -> Snapshot {
+        let mut snap = Snapshot::default();
+        for (id, name, archived) in [
+            ("aaaaaaaa-0000-4000-8000-000000000001", "Work", false),
+            ("aaaaaaaa-0000-4000-8000-000000000002", "Home", false),
+            ("cccccccc-0000-4000-8000-000000000001", "Solo", false),
+            ("dddddddd-0000-4000-8000-000000000001", "Old", true),
+        ] {
+            snap.projects.push(timetrack_proto::ProjectView {
+                id: id.into(),
+                name: name.into(),
+                colour: None,
+                archived,
+            });
+        }
+        for (id, project_id) in [
+            (
+                "bbbbbbbb-0000-4000-8000-000000000001",
+                "aaaaaaaa-0000-4000-8000-000000000001",
+            ),
+            (
+                "bbbbbbbb-0000-4000-8000-000000000002",
+                "aaaaaaaa-0000-4000-8000-000000000002",
+            ),
+            (
+                "eeeeeeee-0000-4000-8000-000000000001",
+                "cccccccc-0000-4000-8000-000000000001",
+            ),
+        ] {
+            snap.entries.push(timetrack_proto::EntryView {
+                id: id.into(),
+                project_id: project_id.into(),
+                description: String::new(),
+                started_at: 0,
+                ended_at: 1,
+                source: timetrack_proto::EntrySource::Manual,
+                note: None,
+            });
+        }
+        snap
+    }
+
+    #[test]
+    fn find_entry_resolves_exact_then_unique_prefix() {
+        let snap = prefixed_snapshot();
+        assert_eq!(
+            find_entry(&snap, "eeeeeeee-0000-4000-8000-000000000001")
+                .unwrap()
+                .id,
+            "eeeeeeee-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            find_entry(&snap, "eeeeeeee").unwrap().id,
+            "eeeeeeee-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            find_entry(&snap, "bbbbbbbb").unwrap_err().to_string(),
+            "ambiguous entry id prefix 'bbbbbbbb'"
+        );
+        assert_eq!(
+            find_entry(&snap, "nope").unwrap_err().to_string(),
+            "no entry with id 'nope'"
+        );
+        assert_eq!(
+            find_entry(&snap, "").unwrap_err().to_string(),
+            "no entry with id ''",
+            "empty never resolves"
+        );
+    }
+
+    #[test]
+    fn find_project_prefers_exact_then_name_then_prefix() {
+        let snap = prefixed_snapshot();
+        // Exact id first.
+        assert_eq!(
+            find_project(&snap, "aaaaaaaa-0000-4000-8000-000000000002")
+                .unwrap()
+                .name,
+            "Home"
+        );
+        // Name second, case-insensitively, archived included.
+        assert_eq!(find_project(&snap, "work").unwrap().name, "Work");
+        assert_eq!(find_project(&snap, "OLD").unwrap().name, "Old");
+        // Unique prefix third.
+        assert_eq!(find_project(&snap, "cccccccc").unwrap().name, "Solo");
+        // Ambiguous and unknown refuse in the service's words.
+        assert_eq!(
+            find_project(&snap, "aaaaaaaa").unwrap_err().to_string(),
+            "ambiguous project id prefix 'aaaaaaaa'"
+        );
+        assert_eq!(
+            find_project(&snap, "nope").unwrap_err().to_string(),
+            "no project with id 'nope'"
+        );
+    }
+
+    #[test]
+    fn pick_project_offers_active_ids_names_and_prefixes() {
+        let snap = prefixed_snapshot();
+        // Exact, name, and unique prefix all resolve to the id.
+        assert_eq!(
+            pick_project(&snap, Some("cccccccc-0000-4000-8000-000000000001")).unwrap(),
+            "cccccccc-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            pick_project(&snap, Some("home")).unwrap(),
+            "aaaaaaaa-0000-4000-8000-000000000002"
+        );
+        assert_eq!(
+            pick_project(&snap, Some("cccccccc")).unwrap(),
+            "cccccccc-0000-4000-8000-000000000001"
+        );
+        // Archived projects are not candidates, even by exact id.
+        assert!(pick_project(&snap, Some("dddddddd-0000-4000-8000-000000000001")).is_err());
+        assert!(pick_project(&snap, Some("Old")).is_err());
+        // Ambiguity is named; the unknown wording is unchanged.
+        assert_eq!(
+            pick_project(&snap, Some("aaaaaaaa"))
+                .unwrap_err()
+                .to_string(),
+            "ambiguous project id prefix 'aaaaaaaa'"
+        );
+        let err = pick_project(&snap, Some("nope")).unwrap_err().to_string();
+        assert!(err.contains("no active project named 'nope'"), "got: {err}");
+        // No request still defaults to the first active project.
+        assert_eq!(
+            pick_project(&snap, None).unwrap(),
+            "aaaaaaaa-0000-4000-8000-000000000001"
+        );
     }
 }

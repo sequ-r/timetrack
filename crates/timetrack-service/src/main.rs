@@ -20,6 +20,7 @@
 //! protocol); that is the tray's own surface, not this service's.
 
 mod caldav;
+mod credentials;
 mod interface;
 mod platform;
 mod socket;

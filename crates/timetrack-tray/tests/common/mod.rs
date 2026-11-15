@@ -6,6 +6,11 @@
 //! Each integration test is its own binary holding a single `#[test]`; the
 //! `DBUS_SESSION_BUS_ADDRESS` switch below is safe only under that shape --
 //! a second test in either binary would race it. Keep it that way.
+//!
+//! Linux only: the dbusmenu helpers need a session bus. The fake service
+//! itself (`common/fake_service.rs`) is cross-platform and is included
+//! directly by its users (`quick_add.rs`, `dispatch.rs`) without this
+//! module, so bus-less suites never compile the bus helpers.
 
 use std::collections::HashMap;
 use std::process::{Child, Command};

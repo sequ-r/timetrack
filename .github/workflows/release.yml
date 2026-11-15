@@ -1,9 +1,16 @@
 name: release
 
-# Publishes the desktop app as a self-contained AppImage bundling
+# Publishes the desktop app three ways: a self-contained AppImage bundling
 # `timetrack-gui`, `timetrack-service` and the `timetrack` CLI
-# (see build-appimage.sh). The image is the install: it writes nothing to
-# the host, so uninstall is deleting the file.
+# (see build-appimage.sh), a Windows installer bundling those plus the
+# tray (see packaging/windows/), and a macOS disk image holding
+# TimeTrack.app with the same four (see packaging/macos/). The image is
+# the Linux install: it writes nothing to the host, so uninstall is
+# deleting the file. The installer is the Windows equivalent: a per-user
+# Inno Setup package that preserves %LOCALAPPDATA%\timetrack across
+# install, upgrade and uninstall. The DMG is the macOS equivalent: a
+# drag-to-Applications image that preserves
+# ~/Library/Application Support/timetrack the same way.
 #
 # Every run mints its own version: `version` takes the greater of the
 # workspace manifest and the latest `v*` tag, patch-bumping when the
@@ -34,6 +41,8 @@ on:
       - 'Cargo.lock'
       - 'build-appimage.sh'
       - 'data/**'
+      - 'packaging/windows/**'
+      - 'packaging/macos/**'
       - 'scripts/mint-version.sh'
   workflow_dispatch:
     inputs:
@@ -151,15 +160,145 @@ jobs:
             TimeTrack-x86_64.AppImage
             TimeTrack-x86_64.AppImage.zsync
 
-  # One job publishes, and it runs only once the build has finished.
+  # The Windows half of the release (#158): the same four binaries the CI
+  # cross job proves, packaged by the Inno Setup script in
+  # packaging/windows/ instead of shipped raw. The job mints the run's
+  # version into its own checkout exactly like `appimage` does, for the same
+  # reason: the installer must report the version its tag names.
+  windows-installer:
+    name: TimeTrack-Setup-x86_64.exe
+    needs: [checks, version]
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      INNO_VERSION: 7.1.1
+      # Pinned like the AppImage tools: bump URL and sum together, verified
+      # by a dispatch dry run.
+      INNO_SHA256: 8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: Mint the release version
+        shell: bash
+        run: ./scripts/mint-version.sh ${{ needs.version.outputs.version }}
+      - uses: ./.github/actions/setup
+      - name: Install pinned Inno Setup
+        shell: pwsh
+        run: |
+          $tag = "is-$($env:INNO_VERSION.Replace('.', '_'))"
+          $url = "https://github.com/jrsoftware/issrc/releases/download/$tag/innosetup-$env:INNO_VERSION-x64.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\innosetup.exe"
+          $sha = (Get-FileHash "$env:RUNNER_TEMP\innosetup.exe" -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne $env:INNO_SHA256) { throw "Inno Setup checksum mismatch: $sha" }
+          Start-Process "$env:RUNNER_TEMP\innosetup.exe" `
+            -ArgumentList '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+      # The signing secrets are maintainer-supplied and optional: without
+      # them the script prints an UNSIGNED warning and the installer ships
+      # unsigned, which the release notes must then say explicitly
+      # (packaging/windows/README.md, "the unsigned fallback").
+      - name: Build the installer
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+          WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: .\packaging\windows\build-installer.ps1 -Version '${{ needs.version.outputs.version }}' -OutputDir dist
+      # A per-user install touches only the runner's own profile, so the
+      # installer can prove itself end to end here: silent install, the
+      # installed CLI answers (clap replies before any bus traffic, same as
+      # the AppImage check above), then silent uninstall leaves no program
+      # dir behind. Data preservation needs a seeded store on a clean VM and
+      # stays a manual acceptance step (#158).
+      - name: Silent install and uninstall smoke check
+        shell: pwsh
+        run: |
+          $exe = "dist\TimeTrack-Setup-${{ needs.version.outputs.version }}.exe"
+          if (-not (Test-Path $exe)) { throw "missing installer: $exe" }
+          Start-Process $exe -ArgumentList '/VERYSILENT', '/NORESTART' -Wait
+          $app = "$env:LOCALAPPDATA\Programs\TimeTrack"
+          foreach ($b in @('timetrack-gui.exe', 'timetrack-service.exe', 'timetrack.exe', 'timetrack-tray.exe')) {
+            if (-not (Test-Path "$app\$b")) { throw "missing installed binary: $b" }
+          }
+          & "$app\timetrack.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'installed CLI did not answer --version' }
+          Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/NORESTART' -Wait
+          if (Test-Path $app) { throw "uninstall left $app behind" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: TimeTrack-Setup-x86_64
+          path: dist/TimeTrack-Setup-*.exe
+
+  # The macOS third of the release (#159): the same four binaries the CI
+  # cross and gui-native jobs prove, laid out as TimeTrack.app by
+  # packaging/macos/build-bundle.sh and shipped as a drag-to-Applications
+  # DMG. The job mints the run's version into its own checkout exactly
+  # like `appimage` does, for the same reason: the bundle must report
+  # the version its tag names. Single-arch v1: the runner's own arch
+  # (Apple silicon on macos-latest), named into the artifact by the
+  # script; universal2 waits for a proven Intel half.
+  macos-dmg:
+    name: TimeTrack-macos.dmg
+    needs: [checks, version]
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: Mint the release version
+        run: ./scripts/mint-version.sh ${{ needs.version.outputs.version }}
+      - uses: ./.github/actions/setup
+      # The Apple secrets are maintainer-supplied and optional, same as
+      # the Windows PFX: without the certificate the script prints an
+      # UNSIGNED warning and the DMG ships unsigned (Gatekeeper refuses
+      # it until a right-click-Open), which the release notes must then
+      # say explicitly (packaging/macos/README.md, "the unsigned
+      # fallback"). Without only the API secrets the DMG ships
+      # signed-but-unnotarized, which the notes must say instead.
+      - name: Build the disk image
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: ./packaging/macos/build-bundle.sh --version '${{ needs.version.outputs.version }}' --output-dir dist
+      # The DMG proves itself end to end here: mount it, check the bundle
+      # layout (all four binaries co-located for the sibling spawn), run
+      # the bundled CLI (clap replies before any bus traffic, same as the
+      # AppImage check above), verify a signature when one was made, then
+      # detach. Data preservation and the clean-account walkthrough stay
+      # manual acceptance steps (#159).
+      - name: Mount the image and smoke-check the bundle
+        run: |
+          shopt -s nullglob
+          dmg=(dist/TimeTrack-*.dmg)
+          if [ "${#dmg[@]}" -ne 1 ]; then echo "::error::expected one DMG, found ${#dmg[@]}"; exit 1; fi
+          hdiutil attach -nobrowse -readonly "${dmg[0]}"
+          app=/Volumes/TimeTrack/TimeTrack.app
+          test -x "$app/Contents/MacOS/timetrack-gui"
+          test -x "$app/Contents/MacOS/timetrack-service"
+          test -x "$app/Contents/MacOS/timetrack"
+          test -x "$app/Contents/MacOS/timetrack-tray"
+          test -f "$app/Contents/Info.plist"
+          "$app/Contents/MacOS/timetrack" --version
+          if codesign -dv "$app" 2>/dev/null; then codesign --verify --deep --strict "$app"; else echo "unsigned build: no signature to verify"; fi
+          hdiutil detach /Volumes/TimeTrack
+      - uses: actions/upload-artifact@v7
+        with:
+          name: TimeTrack-macos-dmg
+          path: dist/TimeTrack-*.dmg
+
+  # One job publishes, and it runs only once the builds have finished.
   # Publishing from two jobs once generated the release notes twice and a
   # checksum file listing only half the artifacts; the publish job downloads
-  # the build, writes one `SHA256SUMS` over every file, and is the only
-  # caller of the release action. A dry run stops before the
+  # all three builds, writes one `SHA256SUMS` over every file, and is the
+  # only caller of the release action. A dry run stops before the
   # last step and keeps exactly the files a release would carry.
   publish:
     name: publish
-    needs: [appimage, version]
+    needs: [appimage, windows-installer, macos-dmg, version]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -172,7 +311,7 @@ jobs:
           merge-multiple: true
       - name: Write one checksum file for everything published
         working-directory: dist
-        run: sha256sum *.AppImage *.zsync > SHA256SUMS
+        run: sha256sum *.AppImage *.zsync *.exe *.dmg > SHA256SUMS
       - name: Show what would be published
         working-directory: dist
         run: ls -l
@@ -196,5 +335,7 @@ jobs:
           files: |
             dist/*.AppImage
             dist/*.zsync
+            dist/*.exe
+            dist/*.dmg
             dist/SHA256SUMS
           generate_release_notes: true

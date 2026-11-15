@@ -12,7 +12,7 @@
 //! the outcome as one message. Runs off the service thread, so the save
 //! dialog never stops that thread from serving.
 
-use super::super::service::{ExportRequest, Msg};
+use super::super::service::{ExportRequest, Msg, RangeExportRequest};
 use super::super::status::{StatusKind, StatusMsg};
 use std::sync::mpsc::Sender;
 use timetrack_proto::Snapshot;
@@ -23,20 +23,53 @@ use timetrack_proto::Snapshot;
 /// from serving: the window keeps painting and refreshing, and a quick-add
 /// made while the dialog is open still lands in the store.
 pub(crate) async fn save_export(tx: Sender<Msg>, csv: String, req: ExportRequest) {
-    // The dialog opens after the fetch, so a service refusal never prompts
-    // for a location. Cancel is a quiet status that writes nothing; no
-    // portal falls back to the direct home-directory write.
-    let outcome = portal_save_file(&req.suggested_name).await;
+    let ExportRequest {
+        scope,
+        path,
+        suggested_name,
+        period_id,
+        ..
+    } = req;
+    save_fetched_csv(tx, csv, &suggested_name, &path, |csv, dest, via_portal| {
+        export_write_msg(csv, dest, scope, &period_id, via_portal)
+    })
+    .await;
+}
+
+/// Ask where to put a custom-range export and write it there (#133).
+///
+/// The scoped save above stays untouched: the range carries no
+/// `ExportScope`, so it names its own status parts instead of borrowing
+/// the scope's.
+pub(crate) async fn save_range_export(tx: Sender<Msg>, csv: String, req: RangeExportRequest) {
+    let RangeExportRequest {
+        path,
+        suggested_name,
+        period_id,
+        ..
+    } = req;
+    save_fetched_csv(tx, csv, &suggested_name, &path, |csv, dest, via_portal| {
+        export_range_write_msg(csv, dest, &period_id, via_portal)
+    })
+    .await;
+}
+
+/// The dialog plus fallback shared by every export save: the dialog opens
+/// after the fetch, so a service refusal never prompts for a location.
+/// Cancel is a quiet status that writes nothing; no portal falls back to
+/// the direct home-directory write.
+async fn save_fetched_csv(
+    tx: Sender<Msg>,
+    csv: String,
+    suggested_name: &str,
+    fallback_path: &str,
+    make_msg: impl FnOnce(&str, &str, bool) -> Msg,
+) {
+    let outcome = portal_save_file(suggested_name).await;
     let via_portal = matches!(outcome, PortalOutcome::Granted(_));
-    match resolve_export_destination(outcome, &req.path) {
+    match resolve_export_destination(outcome, fallback_path) {
         Some(dest) => {
-            let _ = tx.send(export_write_msg(
-                &csv,
-                &dest,
-                req.scope,
-                &req.period_id,
-                via_portal,
-            ));
+            let _ = tx.send(make_msg(&csv, &dest, via_portal));
         }
         None => {
             let _ = tx.send(export_cancel_msg());
@@ -140,10 +173,11 @@ pub(crate) fn stubbed_outcome(_current_name: &str) -> Option<PortalOutcome> {
 /// Ask the system save dialog where to write an export (ticket 27).
 ///
 /// The period-stamped `current_name` is prefilled so one week never silently
-/// overwrites the last; the portal's own overwrite question governs existing
+/// overwrites the last; the dialog's own overwrite question governs existing
 /// files, so there is exactly one prompt. Cancel is quiet (`Cancelled`);
-/// anything but a confirm or a cancel — no portal frontend, no session bus
-/// — counts as unavailable and the direct fallback runs.
+/// anything but a confirm or a cancel — no portal frontend, no session bus,
+/// a native backend that panicked instead of answering — counts as
+/// unavailable and the direct fallback runs.
 pub(crate) async fn portal_save_file(current_name: &str) -> PortalOutcome {
     if let Some(outcome) = stubbed_outcome(current_name) {
         return outcome;
@@ -151,10 +185,50 @@ pub(crate) async fn portal_save_file(current_name: &str) -> PortalOutcome {
     platform_portal_save_file(current_name).await
 }
 
-/// Freedesktop portals are the Linux system dialog (§16): other
-/// desktops take the direct home-directory fallback below until
-/// their native dialog lands, which is what Unavailable requests.
-#[cfg(not(target_os = "linux"))]
+/// The native OS save panel on Windows and macOS (#154).
+///
+/// The same period-stamped `current_name` Linux prefills, the same title,
+/// and the same contract: the OS owns the one overwrite prompt, cancel is
+/// quiet, and a granted path is labelled as a chosen path downstream. The
+/// blocking wait runs on the export's own thread off the service thread
+/// (see the `Action::ExportCsv` arm), so snapshots and quick-adds keep
+/// flowing while the dialog is open — rfd marshals to the main thread
+/// itself where the OS needs it (macOS), so no main-thread plumbing is
+/// owed here. `async` only shares the platform function's signature.
+///
+/// rfd's blocking save folds cancel and backend errors into one `None`,
+/// so `None` is quiet-cancel; only a backend panic — caught, never
+/// propagated — asks for the direct fallback.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+async fn platform_portal_save_file(current_name: &str) -> PortalOutcome {
+    let name = current_name.to_string();
+    let picked = std::panic::catch_unwind(move || {
+        rfd::FileDialog::new()
+            .set_title("Save export")
+            .set_file_name(name)
+            .save_file()
+    });
+    native_save_outcome(picked)
+}
+
+/// Fold a finished native dialog into the shared outcome (#154): a picked
+/// path is granted, a dismissal is quiet-cancel, and a backend panic (the
+/// only failure rfd surfaces distinctly) asks for the direct fallback.
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
+pub(crate) fn native_save_outcome(
+    picked: std::thread::Result<Option<std::path::PathBuf>>,
+) -> PortalOutcome {
+    match picked {
+        Ok(Some(path)) => PortalOutcome::Granted(path.to_string_lossy().into_owned()),
+        Ok(None) => PortalOutcome::Cancelled,
+        Err(_) => PortalOutcome::Unavailable,
+    }
+}
+
+/// Freedesktop portals are the Linux system dialog (§16), rfd the native
+/// one on Windows and macOS (#154): remaining targets take the direct
+/// home-directory fallback, which is what Unavailable requests.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 async fn platform_portal_save_file(_current_name: &str) -> PortalOutcome {
     PortalOutcome::Unavailable
 }
@@ -222,17 +296,38 @@ pub(crate) fn export_write_msg(
     period_id: &str,
     via_portal: bool,
 ) -> Msg {
+    let basename = export_basename(dest);
+    let status = export_saved_status(entry_count(csv), scope, period_id, basename);
+    write_export_csv(dest, csv, status, via_portal)
+}
+
+/// Write fetched range CSV bytes to `dest` and report the outcome as one
+/// message (#133). The status is the CLI's range wording verbatim —
+/// `exported {count} entries ({from}..{to}) to {basename}` — so one range
+/// reads the same in both clients; a failed write stays a local note with
+/// path and reason, exactly like the scoped save.
+pub(crate) fn export_range_write_msg(
+    csv: &str,
+    dest: &str,
+    period_id: &str,
+    via_portal: bool,
+) -> Msg {
+    let basename = export_basename(dest);
+    let status = export_range_saved_status(entry_count(csv), period_id, basename);
+    write_export_csv(dest, csv, status, via_portal)
+}
+
+/// The shared write behind both saves: the bytes go through, success
+/// reports the given status, and a failed write stays a local note naming
+/// path plus reason. An existing destination is overwritten: the portal's
+/// own overwrite question already governed it.
+fn write_export_csv(dest: &str, csv: &str, status: String, via_portal: bool) -> Msg {
     match std::fs::write(dest, csv) {
-        Ok(()) => {
-            let count = csv.lines().count().saturating_sub(1);
-            let basename = dest.rsplit('/').next().unwrap_or(dest);
-            let status = export_saved_status(count, scope, period_id, basename);
-            Msg::ExportSaved {
-                status,
-                dest: dest.to_string(),
-                via_portal,
-            }
-        }
+        Ok(()) => Msg::ExportSaved {
+            status,
+            dest: dest.to_string(),
+            via_portal,
+        },
         Err(e) => Msg::Error(StatusMsg {
             text: format!("could not write {dest}: {e}"),
             kind: StatusKind::Local,
@@ -240,10 +335,15 @@ pub(crate) fn export_write_msg(
     }
 }
 
+/// Rows in a fetched CSV: the header plus one row per entry.
+fn entry_count(csv: &str) -> usize {
+    csv.lines().count().saturating_sub(1)
+}
+
 /// Where a GUI export lands while the portal is unreachable (ticket 27
 /// fallback).
 ///
-/// The app runs unsandboxed, so `$HOME` is the real home directory.
+/// The app runs unsandboxed, so the home directory below is the real one.
 /// The name carries the week or month id so one week never silently
 /// overwrites the last; all time ignores the anchor and keeps the plain
 /// name.
@@ -252,9 +352,100 @@ pub(crate) fn default_export_path(
     anchor_ms: i64,
     tz: &timetrack_core::Tz,
 ) -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let name = export_suggested_name(scope, anchor_ms, tz);
-    format!("{home}/{name}")
+    format!("{}/{}", fallback_home_dir(), name)
+}
+
+/// Where a custom-range export lands while the portal is unreachable
+/// (#133): the same home-directory fallback, with the range id in the
+/// name so ranges never overwrite each other or a scoped export.
+pub(crate) fn default_export_range_path(
+    from_ms: i64,
+    to_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
+    let name = export_range_suggested_name(from_ms, to_ms, tz);
+    format!("{}/{}", fallback_home_dir(), name)
+}
+
+/// The home directory the direct-save fallback writes into (#154).
+///
+/// `HOME` everywhere except Windows, where `HOME` is usually unset and
+/// `USERPROFILE` names the real home; the old code fell through to `/tmp`
+/// there, which does not exist, so every fallback save failed. Last resort
+/// keeps the old answers: `/tmp` off Windows (byte-identical), the temp
+/// dir on Windows. The `windows` flag is `cfg!(target_os = "windows")` at
+/// the one call site and a test knob everywhere else.
+pub(crate) fn fallback_home_dir() -> String {
+    let home = std::env::var("HOME").ok();
+    let profile = std::env::var("USERPROFILE").ok();
+    fallback_home_from_env(
+        home.as_deref(),
+        profile.as_deref(),
+        cfg!(target_os = "windows"),
+    )
+}
+
+/// Pick the fallback home from the environment (#154): `USERPROFILE` wins
+/// on Windows (where `HOME` is usually unset), `HOME` elsewhere; with
+/// neither, the temp dir on Windows, `/tmp` elsewhere.
+pub(crate) fn fallback_home_from_env(
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    windows: bool,
+) -> String {
+    if windows {
+        userprofile
+            .or(home)
+            .map(str::to_string)
+            .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned())
+    } else {
+        home.map(str::to_string)
+            .unwrap_or_else(|| "/tmp".to_string())
+    }
+}
+
+/// The file base name of a saved export path, for the status line (#154).
+///
+/// The native Windows dialog hands back `\`-separated paths, so both
+/// separators cut there; elsewhere `/` alone, byte-identical to the old
+/// inline split. The `windows` flag is `cfg!(target_os = "windows")` at
+/// the one call site and a test knob everywhere else.
+pub(crate) fn export_basename(dest: &str) -> &str {
+    export_basename_impl(dest, cfg!(target_os = "windows"))
+}
+
+/// Cut the base name off a saved export path (#154).
+pub(crate) fn export_basename_impl(dest: &str, windows: bool) -> &str {
+    if windows {
+        dest.rsplit(['/', '\\']).next().unwrap_or(dest)
+    } else {
+        dest.rsplit('/').next().unwrap_or(dest)
+    }
+}
+
+/// The name prefilled in the system save dialog for a custom range
+/// (#133): the range id, so one range never silently overwrites another.
+pub(crate) fn export_range_suggested_name(
+    from_ms: i64,
+    to_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> String {
+    format!(
+        "timetrack-export-range-{}.csv",
+        export_range_period_id(from_ms, to_ms, tz)
+    )
+}
+
+/// Stable identity of a custom range (#133): the two local days joined by
+/// `..`, e.g. `2026-10-01..2026-10-15` — the period semantics the issue
+/// asks for, and the same pair the CLI prints in its range status line.
+pub(crate) fn export_range_period_id(from_ms: i64, to_ms: i64, tz: &timetrack_core::Tz) -> String {
+    format!(
+        "{}..{}",
+        timetrack_core::anchor_day_string(from_ms, tz),
+        timetrack_core::anchor_day_string(to_ms, tz)
+    )
 }
 
 /// The label for the export buttons: without a portal the app writes
@@ -283,6 +474,18 @@ pub(crate) fn export_saved_status(
     basename: &str,
 ) -> String {
     timetrack_core::format_export_status(entry_count, scope, period_id, basename)
+}
+
+/// Status line after a saved range export (#133): entry count, the range
+/// id, and file base name. The CLI's `--out` status wording verbatim —
+/// `exported {count} entries ({from}..{to}) to {basename}` — so one range
+/// reads the same in both clients.
+pub(crate) fn export_range_saved_status(
+    entry_count: usize,
+    period_id: &str,
+    basename: &str,
+) -> String {
+    format!("exported {entry_count} entries ({period_id}) to {basename}")
 }
 
 /// Which service call an interim save uses: `None` is the old scope-only
@@ -326,11 +529,38 @@ pub(crate) fn export_preview_entries<'a>(
     out
 }
 
+/// The rows a custom-range export will hold, oldest first (#133).
+///
+/// The same predicate core's [`timetrack_core::export_csv_between`] uses —
+/// each entry buckets by its `started_at` local day, inclusive at both
+/// ends — so the preview shows what the file will hold without a second
+/// service call and cannot disagree with it.
+pub(crate) fn export_preview_entries_between<'a>(
+    snapshot: &'a Snapshot,
+    from_ms: i64,
+    to_ms: i64,
+    tz: &timetrack_core::Tz,
+) -> Vec<&'a timetrack_proto::EntryView> {
+    let (from_day, to_day) = (tz.day_of(from_ms), tz.day_of(to_ms));
+    let mut out: Vec<&timetrack_proto::EntryView> = snapshot
+        .entries
+        .iter()
+        .filter(|e| {
+            let day = tz.day_of(e.started_at);
+            day >= from_day && day <= to_day
+        })
+        .collect();
+    out.sort_by_key(|e| e.started_at);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::picker::export_period_label;
     use super::*;
-    use crate::app::testsupport::{day_anchor, preview_ids, preview_snapshot, utc_tz};
+    use crate::app::testsupport::{
+        day_anchor, preview_ids, preview_range_ids, preview_snapshot, utc_tz,
+    };
 
     #[test]
     fn location_line_names_a_portal_grant_path() {
@@ -849,5 +1079,223 @@ mod tests {
         );
         let _ = std::fs::remove_file(&log);
         let _ = std::fs::remove_file(format!("{}.fail", log.to_string_lossy()));
+    }
+
+    #[test]
+    fn range_names_status_and_file_in_cli_wording() {
+        // File naming (#133): the range id — the `..` pair the issue asks
+        // for — so one range never silently overwrites another or a scoped
+        // export. The literals are the independent truth, not a recompute.
+        let from = day_anchor("2026-10-01");
+        let to = day_anchor("2026-10-15");
+        assert_eq!(
+            export_range_period_id(from, to, &utc_tz()),
+            "2026-10-01..2026-10-15"
+        );
+        assert_eq!(
+            export_range_suggested_name(from, to, &utc_tz()),
+            "timetrack-export-range-2026-10-01..2026-10-15.csv"
+        );
+        let path = default_export_range_path(from, to, &utc_tz());
+        assert!(
+            path.ends_with("timetrack-export-range-2026-10-01..2026-10-15.csv"),
+            "the fallback path carries the range id: {path}"
+        );
+        // Status: the CLI's `--out` wording verbatim, so one range reads
+        // the same in both clients.
+        assert_eq!(
+            export_range_saved_status(
+                2,
+                "2026-10-01..2026-10-15",
+                "timetrack-export-range-2026-10-01..2026-10-15.csv"
+            ),
+            "exported 2 entries (2026-10-01..2026-10-15) to timetrack-export-range-2026-10-01..2026-10-15.csv"
+        );
+    }
+
+    #[test]
+    fn range_preview_agrees_with_core_export_between() {
+        // Preview parity (#133): the preview holds exactly the rows the
+        // file will hold — the same ids in the same oldest-first order as
+        // core's `export_csv_between` over the same days, starting at win.
+        let snap = preview_snapshot();
+        let from = day_anchor("2026-09-30");
+        let to = day_anchor("2026-10-15");
+        let store = timetrack_core::Store {
+            version: timetrack_core::STORE_VERSION,
+            projects: vec![],
+            entries: snap
+                .entries
+                .iter()
+                .map(|e| timetrack_core::Entry {
+                    id: e.id.clone(),
+                    project_id: e.project_id.clone(),
+                    description: e.description.clone(),
+                    started_at: e.started_at,
+                    ended_at: e.ended_at,
+                    source: match e.source {
+                        timetrack_proto::EntrySource::Manual => timetrack_core::EntrySource::Manual,
+                        timetrack_proto::EntrySource::QuickAdd => {
+                            timetrack_core::EntrySource::QuickAdd
+                        }
+                        timetrack_proto::EntrySource::External => {
+                            timetrack_core::EntrySource::External
+                        }
+                    },
+                    note: e.note.clone(),
+                })
+                .collect(),
+        };
+        let csv = timetrack_core::export_csv_between(&store, from, to, &utc_tz());
+        let file_ids: Vec<String> = csv
+            .lines()
+            .skip(1)
+            .map(|line| line.split(',').next().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            preview_range_ids(&snap, from, to),
+            file_ids,
+            "the preview shows what the file will hold"
+        );
+        assert_eq!(
+            preview_range_ids(&snap, from, to),
+            vec!["e1".to_string(), "e2".to_string(), "e3".to_string()]
+        );
+        // Boundary days are inclusive by start day, like the scoped
+        // exports: an entry starting before the range stays out even when
+        // it ends inside it.
+        assert_eq!(
+            preview_range_ids(&snap, day_anchor("2026-10-06"), day_anchor("2026-10-06")),
+            vec!["e2".to_string()]
+        );
+        assert_eq!(
+            preview_range_ids(&snap, day_anchor("2026-10-07"), day_anchor("2026-09-30")),
+            Vec::<String>::new(),
+            "a backwards range previews nothing, like the empty file"
+        );
+    }
+
+    #[test]
+    fn range_write_reports_cli_wording() {
+        // A confirmed range save writes the fetched range CSV and reports
+        // count, range id and file base name in the CLI's wording.
+        let csv = format!(
+            "{}\ne2,p1,review,2026-10-06T12:00:00,2026-10-06T13:00:00,01:00:00,60,manual,\n",
+            timetrack_core::CSV_HEADER
+        );
+        let dest = std::env::temp_dir().join(format!(
+            "tt-portal-granted-{}-range.csv",
+            std::process::id()
+        ));
+        let dest_str = dest.to_string_lossy().into_owned();
+        let basename = dest.file_name().unwrap().to_string_lossy().into_owned();
+        match export_range_write_msg(&csv, &dest_str, "2026-10-01..2026-10-15", true) {
+            Msg::ExportSaved {
+                status,
+                dest: saved_dest,
+                via_portal,
+            } => {
+                assert_eq!(
+                    status,
+                    format!("exported 1 entries (2026-10-01..2026-10-15) to {basename}")
+                );
+                assert_eq!(saved_dest, dest_str);
+                assert!(via_portal);
+            }
+            _ => panic!("a granted range write reports success"),
+        }
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), csv);
+        std::fs::remove_file(&dest).unwrap();
+    }
+
+    #[test]
+    fn native_dialog_folds_pick_cancel_and_panic() {
+        // The native-dialog outcome fold (#154): a picked path is granted
+        // (and resolves to the picked destination, never the fallback), a
+        // dismissal is quiet-cancel (no destination, writes nothing), and
+        // a backend panic asks for the direct fallback. rfd folds cancel
+        // and backend errors into one `None`, so only the panic arm can
+        // request the fallback.
+        let picked: std::thread::Result<Option<std::path::PathBuf>> =
+            Ok(Some(std::path::PathBuf::from("/home/user/chosen.csv")));
+        assert_eq!(
+            native_save_outcome(picked),
+            PortalOutcome::Granted("/home/user/chosen.csv".to_string())
+        );
+        let dismissed: std::thread::Result<Option<std::path::PathBuf>> = Ok(None);
+        assert_eq!(native_save_outcome(dismissed), PortalOutcome::Cancelled);
+        assert_eq!(
+            resolve_export_destination(PortalOutcome::Cancelled, "/home/user/fallback.csv"),
+            None
+        );
+        let panicked: std::thread::Result<Option<std::path::PathBuf>> =
+            Err(Box::new("backend blew up"));
+        assert_eq!(
+            resolve_export_destination(native_save_outcome(panicked), "/home/user/fallback.csv"),
+            Some("/home/user/fallback.csv".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_home_prefers_userprofile_on_windows() {
+        // Windows has no `HOME` in practice: `USERPROFILE` names the real
+        // home, `HOME` is the backup, and the temp dir is the last resort
+        // — never `/tmp`, which does not exist there.
+        assert_eq!(
+            fallback_home_from_env(None, Some("C:\\Users\\ada"), true),
+            "C:\\Users\\ada"
+        );
+        assert_eq!(
+            fallback_home_from_env(Some("/home/ada"), Some("C:\\Users\\ada"), true),
+            "C:\\Users\\ada"
+        );
+        assert_eq!(
+            fallback_home_from_env(Some("/home/ada"), None, true),
+            "/home/ada"
+        );
+        let last_resort = fallback_home_from_env(None, None, true);
+        assert_eq!(
+            last_resort,
+            std::env::temp_dir().to_string_lossy().into_owned()
+        );
+        assert!(!last_resort.is_empty());
+    }
+
+    #[test]
+    fn fallback_home_keeps_home_and_tmp_off_windows() {
+        // Off Windows the fallback is byte-identical to before #154: `HOME`
+        // when set (a stray `USERPROFILE` is ignored), `/tmp` when not.
+        assert_eq!(
+            fallback_home_from_env(Some("/home/ada"), Some("C:\\Users\\ada"), false),
+            "/home/ada"
+        );
+        assert_eq!(fallback_home_from_env(None, None, false), "/tmp");
+        assert_eq!(
+            fallback_home_from_env(None, Some("C:\\Users\\ada"), false),
+            "/tmp"
+        );
+    }
+
+    #[test]
+    fn basename_cuts_backslash_only_on_windows() {
+        // The native Windows dialog hands back `\`-separated paths, so the
+        // status line cuts both separators there — and `/` alone elsewhere,
+        // where a backslash is an ordinary filename character.
+        assert_eq!(
+            export_basename_impl("C:\\Users\\ada\\timetrack-export-week-2026-W41.csv", true),
+            "timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            export_basename_impl("C:/Users/ada/timetrack-export-week-2026-W41.csv", true),
+            "timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            export_basename_impl("/home/ada/timetrack-export-week-2026-W41.csv", false),
+            "timetrack-export-week-2026-W41.csv"
+        );
+        assert_eq!(
+            export_basename_impl("weird\\name.csv", false),
+            "weird\\name.csv"
+        );
     }
 }

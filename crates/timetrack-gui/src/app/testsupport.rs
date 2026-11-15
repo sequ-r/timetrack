@@ -15,7 +15,7 @@
 use super::dialogs::entry::EntryDialog;
 use super::dialogs::project::ProjectPrompt;
 use super::dialogs::split::SplitPrompt;
-use super::export::save::export_preview_entries;
+use super::export::save::{export_preview_entries, export_preview_entries_between};
 use super::status::StatusMsg;
 use timetrack_proto::{ClientError, EntrySource, EntryView, ProjectView, Snapshot};
 
@@ -128,6 +128,14 @@ pub(super) fn preview_ids(
         .collect()
 }
 
+/// The ids the range export preview holds, oldest first (#133).
+pub(super) fn preview_range_ids(snap: &Snapshot, from_ms: i64, to_ms: i64) -> Vec<String> {
+    export_preview_entries_between(snap, from_ms, to_ms, &utc_tz())
+        .iter()
+        .map(|e| e.id.clone())
+        .collect()
+}
+
 /// A new-entry dialog for `p1` ("Work").
 pub(super) fn new_dialog() -> EntryDialog {
     EntryDialog::new("p1".into(), "Work".into())
@@ -153,5 +161,19 @@ pub(super) fn project_prompt(edit_id: Option<&str>, name: &str) -> ProjectPrompt
         caret: crate::app::textline::Caret::at_end(name),
         name: name.into(),
         error: None,
+    }
+}
+
+/// One registered external source (#153): an `.ics` file with no
+/// mapping and no credential.
+pub(super) fn source_view(id: &str, label: &str) -> timetrack_proto::SourceView {
+    timetrack_proto::SourceView {
+        id: id.into(),
+        kind: "ics_file".into(),
+        locator: format!("/tmp/{label}.ics"),
+        project_id: None,
+        label: label.into(),
+        has_credential: false,
+        username: None,
     }
 }

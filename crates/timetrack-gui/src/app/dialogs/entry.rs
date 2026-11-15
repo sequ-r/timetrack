@@ -19,7 +19,7 @@
 /// fixed when the dialog opens, while an edit may move the entry. Tab
 /// cycling goes through `EntryDialog::next_field`, which skips it for new
 /// entries; `next`/`prev` here are the raw four-field order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DialogField {
     Description,
     Project,
@@ -226,6 +226,19 @@ impl EntryDialog {
         Some((text, &mut self.caret))
     }
 
+    /// The focused text field and its caret, read-only: what the input
+    /// handler reports to the platform. `None` on the project field,
+    /// which takes no text — and so draws no input handler.
+    pub(crate) fn focused_text(&self) -> Option<(&str, &crate::app::textline::Caret)> {
+        let text = match self.field {
+            DialogField::Description => &self.description,
+            DialogField::Project => return None,
+            DialogField::Start => &self.start,
+            DialogField::End => &self.end,
+        };
+        Some((text, &self.caret))
+    }
+
     /// Put the caret at the end of the newly focused field: where
     /// append-style typing used to put it, and the least surprising
     /// place to arrive.
@@ -239,6 +252,7 @@ impl EntryDialog {
         self.caret = crate::app::textline::Caret {
             pos: len,
             anchor: None,
+            marked: None,
         };
     }
 
@@ -300,6 +314,53 @@ impl EntryDialog {
         };
         crate::app::textline::backspace(text, caret);
         self.error = None;
+    }
+
+    /// Apply a platform text-input edit (IME preedit or commit, #126)
+    /// to the focused field, clearing a stale error like any edit.
+    /// False on the project field, which takes no text.
+    pub(crate) fn ime_edit(&mut self, edit: crate::app::textline::ImeEdit) -> bool {
+        let Some((text, caret)) = self.focused_text_mut() else {
+            return false;
+        };
+        crate::app::textline::apply_ime_edit(text, caret, edit);
+        self.error = None;
+        true
+    }
+
+    /// Press the mouse at a text offset in `field` (#127): focuses the
+    /// field like Tab, then places the caret — or extends to it with
+    /// shift held in the already-focused field. A press never clears
+    /// the error: it edits no text.
+    pub(crate) fn mouse_down(&mut self, field: DialogField, at: usize, shift: bool) {
+        if field != self.field {
+            self.focus_field(field);
+            if self.field != field {
+                return;
+            }
+            // A newly focused field has no selection to extend.
+            if let Some((text, caret)) = self.focused_text_mut() {
+                crate::app::textline::place_caret(text, caret, at);
+            }
+            return;
+        }
+        let Some((text, caret)) = self.focused_text_mut() else {
+            return;
+        };
+        if shift {
+            crate::app::textline::extend_caret_to(text, caret, at);
+        } else {
+            crate::app::textline::place_caret(text, caret, at);
+        }
+    }
+
+    /// Drag the mouse to a text offset in the focused field (#127):
+    /// extends the press point's selection.
+    pub(crate) fn mouse_drag(&mut self, at: usize) {
+        let Some((text, caret)) = self.focused_text_mut() else {
+            return;
+        };
+        crate::app::textline::extend_caret_to(text, caret, at);
     }
 }
 
@@ -697,10 +758,80 @@ mod tests {
     }
 
     #[test]
+    fn ime_edits_land_in_the_focused_field_and_clear_errors() {
+        use crate::app::textline::ImeEdit;
+        let mut dlg = new_dialog();
+        dlg.error = Some("stale".into());
+        assert!(dlg.ime_edit(ImeEdit::Mark {
+            range: None,
+            text: "caf",
+            selected: None,
+        }));
+        assert_eq!(dlg.description, "caf");
+        assert_eq!(dlg.error, None);
+        assert!(dlg.ime_edit(ImeEdit::Commit {
+            range: None,
+            text: "caffè",
+        }));
+        assert_eq!(dlg.description, "caffè");
+        assert_eq!(dlg.caret.marked, None);
+    }
+
+    #[test]
+    fn ime_edits_refuse_the_project_field() {
+        use crate::app::textline::ImeEdit;
+        let mut dlg = edit_dialog("kept", 0, 3_600_000);
+        dlg.field = DialogField::Project;
+        assert_eq!(dlg.focused_text(), None);
+        assert!(!dlg.ime_edit(ImeEdit::Commit {
+            range: None,
+            text: "x",
+        }));
+        assert_eq!(dlg.description, "kept");
+        assert_eq!(
+            dlg.chosen_project().0,
+            "p1",
+            "composition never moves the entry"
+        );
+    }
+
+    #[test]
     fn the_keep_hints_use_the_named_zone() {
         // 22:30 UTC is 00:30 the next day in Rome (summer, +2).
         let rome = timetrack_core::Tz::parse("Europe/Rome").unwrap();
         let dlg = edit_dialog("", 1_783_290_600_000, 1_783_290_600_000 + 3_600_000);
         assert_eq!(dlg.start_hint(&rome), "(empty keeps 00:30)");
+    }
+
+    #[test]
+    fn a_press_focuses_the_row_and_places_the_caret() {
+        // #127: the mouse route to where Tab goes, plus the click
+        // offset — and a drag from there selects.
+        use crate::app::textline::selected_text;
+        let mut dlg = new_dialog();
+        dlg.mouse_down(DialogField::Start, 1, false);
+        assert_eq!(dlg.field, DialogField::Start);
+        assert_eq!(dlg.caret.pos, 1);
+        dlg.mouse_drag(3);
+        assert_eq!(selected_text(&dlg.start, &dlg.caret), Some("60"));
+        // Shift in the focused field extends instead of placing.
+        dlg.mouse_down(DialogField::Start, 0, true);
+        assert_eq!(selected_text(&dlg.start, &dlg.caret), Some("-"));
+        // A press in another row focuses it; shift has nothing to extend.
+        dlg.mouse_down(DialogField::End, 1, true);
+        assert_eq!(dlg.field, DialogField::End);
+        assert_eq!(dlg.caret.pos, 1);
+        assert_eq!(selected_text(&dlg.end, &dlg.caret), None);
+    }
+
+    #[test]
+    fn a_press_ignores_the_project_field_and_keeps_errors() {
+        // #127: no text field there, so no placement — and a press
+        // edits no text, so the error stands.
+        let mut dlg = new_dialog();
+        dlg.error = Some("bad start".into());
+        dlg.mouse_down(DialogField::Project, 0, false);
+        assert_eq!(dlg.field, DialogField::Description);
+        assert_eq!(dlg.error.as_deref(), Some("bad start"));
     }
 }

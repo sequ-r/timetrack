@@ -30,6 +30,31 @@ pub(crate) struct SplitPrompt {
     pub(crate) error: Option<String>,
 }
 
+impl SplitPrompt {
+    /// Apply a platform text-input edit (IME preedit or commit, #126)
+    /// to the moment field, clearing a stale error like any edit.
+    pub(crate) fn ime_edit(&mut self, edit: crate::app::textline::ImeEdit) {
+        crate::app::textline::apply_ime_edit(&mut self.at, &mut self.caret, edit);
+        self.error = None;
+    }
+
+    /// Press the mouse at a text offset in the moment field (#127):
+    /// places the caret, or extends to it with shift held. A press
+    /// never clears the error: it edits no text.
+    pub(crate) fn mouse_down(&mut self, at: usize, shift: bool) {
+        if shift {
+            crate::app::textline::extend_caret_to(&self.at, &mut self.caret, at);
+        } else {
+            crate::app::textline::place_caret(&self.at, &mut self.caret, at);
+        }
+    }
+
+    /// Drag the mouse to a text offset in the moment field (#127).
+    pub(crate) fn mouse_drag(&mut self, at: usize) {
+        crate::app::textline::extend_caret_to(&self.at, &mut self.caret, at);
+    }
+}
+
 /// Resolve a split prompt to the split instant.
 ///
 /// Pure over the prompt plus an explicit clock and zone, like `resolve_save`,
@@ -84,5 +109,38 @@ mod tests {
             err.contains("outside entry 'e1'"),
             "must name the entry: {err}"
         );
+    }
+
+    #[test]
+    fn ime_edits_compose_the_moment_and_clear_errors() {
+        use crate::app::textline::ImeEdit;
+        let mut prompt = split_prompt("");
+        prompt.error = Some("stale".into());
+        prompt.ime_edit(ImeEdit::Mark {
+            range: None,
+            text: "09:",
+            selected: None,
+        });
+        assert_eq!(prompt.at, "09:");
+        assert_eq!(prompt.error, None);
+        prompt.ime_edit(ImeEdit::Commit {
+            range: None,
+            text: "09:30",
+        });
+        assert_eq!(prompt.at, "09:30");
+        assert_eq!(prompt.caret.marked, None);
+    }
+
+    #[test]
+    fn a_press_places_and_a_drag_selects() {
+        // #127: place, drag from the press point, shift-extend.
+        use crate::app::textline::selected_text;
+        let mut prompt = split_prompt("09:30");
+        prompt.mouse_down(3, false);
+        assert_eq!(prompt.caret.pos, 3);
+        prompt.mouse_drag(0);
+        assert_eq!(selected_text(&prompt.at, &prompt.caret), Some("09:"));
+        prompt.mouse_down(5, true);
+        assert_eq!(selected_text(&prompt.at, &prompt.caret), Some("30"));
     }
 }
