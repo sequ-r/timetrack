@@ -244,7 +244,25 @@ jobs:
     # Making these contexts merge-blocking is a maintainer settings action,
     # not a change to this file: add `gui-native (windows-latest)` and
     # `gui-native (macos-latest)` to the branch ruleset's required checks
-    # in the repository settings once this job is green.
+    # in the repository settings once this job is green. Nothing in this
+    # workflow can add itself to that ruleset, so until a maintainer does
+    # that settings step the job only reports -- it does not block a merge.
+    #
+    # Manual matrix -- what this job does NOT drive. There is no synthetic
+    # pointer/keyboard rig on these runners (Linux has XTest; neither
+    # Windows nor macOS CI gives bash an equivalent), so one quick-add and
+    # one suggestions interaction per platform stay manual until such a
+    # rig exists. On each of Windows and macOS, against a seeded service:
+    #   1. Launch the GUI: the seeded entry and week total render.
+    #   2. Quick-add: click a 5/15/30/60 button (or press 1-4); a `+`
+    #      entry appears, the week total grows by that bucket, and `u`
+    #      undoes exactly it.
+    #   3. Suggestions: with an external source returning an item, the
+    #      "FROM YOUR CALENDARS" row renders; `add` turns the suggestion
+    #      into a tracked entry on its mapped project, and `skip` drops
+    #      it for good (it stays gone after `refresh`).
+    # The Linux gui-smoke job drives the same quick-add paths with real
+    # clicks/keys and pixels; it remains the authority for them.
     strategy:
       fail-fast: false
       matrix:

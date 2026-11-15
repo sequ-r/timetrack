@@ -7,6 +7,9 @@
 # and first-frame markers. That proves the GUI starts, reaches the
 # service, and builds a frame on the platform. Pixel truth stays with the
 # Linux gui-smoke job, which this deliberately does not duplicate.
+# Quick-add and suggestions clicks/keys are not driven here (no synthetic
+# input rig on these runners); the per-platform manual matrix for them
+# lives in the `gui-native` job comment in .github/workflows/ci.yml.
 #
 # Run it after
 #   cargo build -p timetrack-gui -p timetrack-service -p timetrack-cli
