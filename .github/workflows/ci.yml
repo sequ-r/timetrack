@@ -191,9 +191,11 @@ jobs:
     # §16 step 5: the portable stack -- core, store, proto, service, CLI --
     # must build and pass its tests on Windows and macOS natively (bundled
     # SQLite needs each runner's own C toolchain, which is exactly what a
-    # cross-compile from Linux cannot prove). The GUI and tray stay
-    # Linux-only for now, so they are deliberately absent here; their
-    # per-OS ports are separate work, not a silent skip.
+    # cross-compile from Linux cannot prove). The tray rides along since
+    # #157: its neutral core, the dispatch round-trip test and both native
+    # backends compile and pass there (the dbusmenu suites stay Linux-only
+    # behind `cfg`, like the portal code). The GUI has its own job below,
+    # because it needs a launch check, not just a test run.
     strategy:
       fail-fast: false
       matrix:
@@ -207,7 +209,7 @@ jobs:
           cargo test --locked
           --package timetrack-core --package timetrack-store
           --package timetrack-proto --package timetrack-service
-          --package timetrack-cli
+          --package timetrack-cli --package timetrack-tray
       # Per-OS packaging, v1 (§16): the portable stack as raw binaries.
       # Installers/app bundles wait for the GUI/tray ports; the AppImage
       # remains the Linux install (ADR 0008 as scoped by ADR 0013).
@@ -228,3 +230,32 @@ jobs:
           path: |
             target/release/timetrack
             target/release/timetrack-service
+
+  gui-native:
+    name: gui-native (${{ matrix.os }})
+    # #157: the GUI builds, its unit tests pass, and it launches against a
+    # seeded service on Windows and macOS natively. The launch check
+    # (`scripts/gui-launch-smoke.sh`) asserts process liveness plus log
+    # markers -- session line, service connect, first frame -- not pixels:
+    # there is no pixel rig off Linux, and the Linux gui-smoke job stays
+    # the pixel authority. Debug binaries keep this conservative: nothing
+    # here measures paint, so release buys nothing but build minutes.
+    #
+    # Making these contexts merge-blocking is a maintainer settings action,
+    # not a change to this file: add `gui-native (windows-latest)` and
+    # `gui-native (macos-latest)` to the branch ruleset's required checks
+    # in the repository settings once this job is green.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: >-
+          cargo build --locked
+          --package timetrack-gui --package timetrack-service --package timetrack-cli
+      - run: cargo test --locked --package timetrack-gui
+      - run: bash scripts/gui-launch-smoke.sh

@@ -179,6 +179,13 @@ pub enum Request {
         project_id: Option<String>,
         label: String,
     },
+    UpdateSource {
+        id: String,
+        kind: String,
+        locator: String,
+        project_id: Option<String>,
+        label: String,
+    },
     ListSources,
     RefreshSource {
         /// `None` refreshes every source.
@@ -191,6 +198,25 @@ pub enum Request {
     },
     DismissSuggestion {
         id: String,
+    },
+    SetSourceCredential {
+        id: String,
+        username: String,
+        secret: super::SecretString,
+    },
+    RemoveSourceCredential {
+        id: String,
+    },
+    RemoveSource {
+        id: String,
+    },
+    DiscoverCaldav {
+        /// A server, account, principal, or home URL to discover from.
+        endpoint: String,
+        /// Borrow this source's stored credential for the discovery
+        /// (its username and secret); without one the endpoint's
+        /// userinfo and the headless env fallback apply, as in fetch.
+        source_id: Option<String>,
     },
     SetNote {
         id: String,
@@ -213,6 +239,7 @@ pub enum Response {
     Sources(Vec<SourceView>),
     Suggestions(Vec<SuggestionView>),
     Refresh(RefreshView),
+    CaldavCollections(Vec<super::CaldavCollectionView>),
 }
 
 impl Response {
@@ -289,6 +316,13 @@ impl Response {
         match self {
             Response::Refresh(r) => Ok(r),
             other => Err(other.mismatch("a refresh tally")),
+        }
+    }
+
+    pub fn caldav_collections(self) -> Result<Vec<super::CaldavCollectionView>, ClientError> {
+        match self {
+            Response::CaldavCollections(c) => Ok(c),
+            other => Err(other.mismatch("discovered collections")),
         }
     }
 }
@@ -678,6 +712,31 @@ mod tests {
         assert_eq!(read_frame(&mut reader).unwrap(), Some(frame));
         assert_eq!(read_frame(&mut reader).unwrap(), Some(Frame::Changed));
         assert_eq!(read_frame(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn source_requests_round_trip_through_json() {
+        // The GUI source editor (#153) speaks these; a shape change
+        // that breaks the round trip would break it at runtime.
+        for request in [
+            Request::AddSource {
+                kind: "caldav".into(),
+                locator: "https://cal.test/u/".into(),
+                project_id: None,
+                label: "Cal".into(),
+            },
+            Request::UpdateSource {
+                id: "src-1".into(),
+                kind: "caldav".into(),
+                locator: "https://cal.test/u/".into(),
+                project_id: Some("p1".into()),
+                label: "Cal".into(),
+            },
+            Request::RemoveSource { id: "src-1".into() },
+        ] {
+            let text = serde_json::to_string(&request).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), request);
+        }
     }
 
     #[test]

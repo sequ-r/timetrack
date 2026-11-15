@@ -84,6 +84,15 @@ pub(super) const FOCUS_RING: u32 = 0x7fd3ffcc;
 /// here, so a 1px edge is what says "this floats above the list".
 pub(super) const BORDER_SUBTLE: u32 = 0x2a2a3acc;
 
+/// The window's own 1px edge (#163): the neutral button grey, opaque, so
+/// a visible frame survives even if the compositor drops its shadow or
+/// frame during an interactive move on Wayland. Deliberately clear of
+/// every colour the headless smoke check counts (`#11111b` and `#2ea043`
+/// at 5% fuzz, `#1a1a26` at 1%, and white), so no baseline changes with
+/// it. Same value as `NEUTRAL_BUTTON_BG` today, but a separate name: the
+/// window edge and the buttons must be free to drift apart.
+pub(super) const WINDOW_BORDER: u32 = 0x3a3a4aff;
+
 /// Whether decorative motion (fades, pulses) may run, from the
 /// `TIMETRACK_REDUCED_MOTION` environment variable.
 ///

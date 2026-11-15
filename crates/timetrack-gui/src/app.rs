@@ -33,19 +33,25 @@ use self::dialogs::entry::{EntryDialog, SaveOutcome, resolve_save};
 use self::dialogs::merge::{MergeConfirm, merge_offer};
 use self::dialogs::project::{ProjectPrompt, ProjectSave, resolve_project_prompt};
 use self::dialogs::recolour::{RecolourPrompt, RecolourSave, resolve_recolour};
+use self::dialogs::source::{
+    SourceDialog, SourceField, SourceKind, SourceRemoveConfirm, SourceSave, resolve_source_dialog,
+    source_remove_offer,
+};
 use self::dialogs::split::{SplitPrompt, resolve_split};
-use self::export::picker::ExportPicker;
+use self::export::picker::{ExportPicker, RangeEnd};
 use self::keys::printable_char;
+use self::mouse::MouseField;
 use self::service::{Action, Msg, now_ms, spawn_service_thread};
 use self::status::{StatusKind, StatusMsg, is_connection_notice};
 use self::tabs::{Tab, cycle_tab};
 use self::update::{AvailableUpdate, UpdateKey, UpdateState};
 use gpui::prelude::*;
 use gpui::{
-    AsyncApp, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Render, Styled,
-    Window, div, rgba,
+    AsyncApp, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement, Pixels,
+    Render, Styled, Window, div, rgba,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 use timetrack_core::QUICK_ADD_MS;
@@ -101,10 +107,12 @@ enum OpenPrompt {
     Entry,
     Project,
     Split,
+    Source,
     Merge,
     Delete,
     Recolour,
     DeleteProject,
+    SourceRemove,
 }
 
 /// Which prompt is open, if one is.
@@ -121,16 +129,21 @@ enum OpenPrompt {
 /// At most one prompt is open at a time (each one swallows the keys that
 /// would open another), so the order below is the priority the key handler
 /// already used: the entry dialog first, then the project prompt, the split
-/// prompt, the merge confirmation, the delete confirmation, and the two
-/// project-housekeeping prompts (#104) last.
+/// prompt, the source dialog (#153), the merge confirmation, the delete
+/// confirmation, and the three housekeeping prompts (#104, #153) last.
+// Nine flags, one per prompt: a struct would only rename the call sites'
+// positional bools without making them clearer.
+#[allow(clippy::too_many_arguments)]
 fn which_prompt(
     entry: bool,
     project: bool,
     split: bool,
+    source: bool,
     merge: bool,
     delete: bool,
     recolour: bool,
     delete_project: bool,
+    source_remove: bool,
 ) -> Option<OpenPrompt> {
     if entry {
         Some(OpenPrompt::Entry)
@@ -138,6 +151,8 @@ fn which_prompt(
         Some(OpenPrompt::Project)
     } else if split {
         Some(OpenPrompt::Split)
+    } else if source {
+        Some(OpenPrompt::Source)
     } else if merge {
         Some(OpenPrompt::Merge)
     } else if delete {
@@ -146,6 +161,8 @@ fn which_prompt(
         Some(OpenPrompt::Recolour)
     } else if delete_project {
         Some(OpenPrompt::DeleteProject)
+    } else if source_remove {
+        Some(OpenPrompt::SourceRemove)
     } else {
         None
     }
@@ -183,6 +200,12 @@ fn delete_project_action(confirm: &DeleteProjectConfirm) -> Action {
     Action::DeleteProject(confirm.id.clone())
 }
 
+/// The action a confirmed source remove sends. The banner opens from a
+/// row button only, so the Confirm button is the one route here.
+fn remove_source_action(confirm: &SourceRemoveConfirm) -> Action {
+    Action::RemoveSource(confirm.id.clone())
+}
+
 /// A project's display name for a sentence: the sanitized name when the
 /// snapshot knows it, the id when it does not (the same fallback the
 /// entry rows use).
@@ -192,6 +215,23 @@ fn project_display(snapshot: &Snapshot, id: &str) -> String {
         .iter()
         .find(|p| p.id == id)
         .map(|p| timetrack_core::sanitize_display(&p.name))
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// A source's display label for a sentence: the sanitized label when
+/// the view knows it, the id when it does not.
+fn source_display(sources: &[timetrack_proto::SourceView], id: &str) -> String {
+    sources
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| {
+            let label = timetrack_core::sanitize_display(&s.label);
+            if label.is_empty() {
+                id.to_string()
+            } else {
+                label
+            }
+        })
         .unwrap_or_else(|| id.to_string())
 }
 
@@ -205,7 +245,11 @@ fn project_display(snapshot: &Snapshot, id: &str) -> String {
 /// already. Everything else names what it did, in the user's words
 /// (project names, never ids), because a bare cleared footer left the
 /// user to spot the change in the list themselves.
-fn pending_outcome(action: &Action, snapshot: &Snapshot) -> Option<Option<String>> {
+fn pending_outcome(
+    action: &Action,
+    snapshot: &Snapshot,
+    sources: &[timetrack_proto::SourceView],
+) -> Option<Option<String>> {
     let label = match action {
         Action::Refresh | Action::ExportCsv(_) | Action::InstallUpdate { .. } => return None,
         Action::StartService => None,
@@ -252,11 +296,49 @@ fn pending_outcome(action: &Action, snapshot: &Snapshot) -> Option<Option<String
         Action::SetText { .. } => Some("entry text updated".to_string()),
         Action::SplitEntry { .. } => Some("entry split".to_string()),
         Action::MergeEntries { ids } => Some(format!("merged {} entries", ids.len())),
-        Action::RefreshSources => Some("calendars refreshed".to_string()),
+        Action::RefreshSources { id } => Some(match id {
+            None => "calendars refreshed".to_string(),
+            Some(_) => "source refreshed".to_string(),
+        }),
         Action::ConfirmSuggestion(_) => Some("suggestion added".to_string()),
         Action::DismissSuggestion(_) => Some("suggestion dismissed".to_string()),
+        Action::AddSource { label, locator, .. } => Some(format!("created source {}", {
+            let label = timetrack_core::sanitize_display(label);
+            if label.is_empty() {
+                locator.rsplit('/').next().unwrap_or(locator).to_string()
+            } else {
+                label
+            }
+        })),
+        Action::UpdateSource { id, .. } => {
+            Some(format!("updated source {}", source_display(sources, id)))
+        }
+        Action::RemoveSource(id) => Some(format!("removed source {}", source_display(sources, id))),
     };
     Some(label)
+}
+
+/// The Home entries text filter (#131): client-side over the snapshot the
+/// view already holds, so totals, undo targets and exports are never
+/// narrowed — only the entries list. `/` starts editing, typing narrows,
+/// `enter` keeps the query, `escape` clears it entirely.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct EntryFilter {
+    pub(crate) query: String,
+    pub(crate) editing: bool,
+}
+
+impl EntryFilter {
+    /// Whether a query is narrowing the list (as opposed to merely editing).
+    pub(crate) fn is_active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    /// Drop the query and leave editing mode.
+    pub(crate) fn clear(&mut self) {
+        self.query.clear();
+        self.editing = false;
+    }
 }
 
 pub struct TimetrackView {
@@ -270,6 +352,9 @@ pub struct TimetrackView {
     /// Pending external suggestions (§19), forwarded by the service
     /// thread when they change. Empty against a bus-only service.
     suggestions: Vec<timetrack_proto::SuggestionView>,
+    /// Registered external sources (#153), forwarded by the service
+    /// thread when they change. Empty against a bus-only service.
+    sources: Vec<timetrack_proto::SourceView>,
     /// Whether any snapshot has arrived yet. Until it has, `snapshot`
     /// is the empty default and the tabs say "Connecting" rather than
     /// drawing it as an empty store (see `show_connecting`).
@@ -281,8 +366,11 @@ pub struct TimetrackView {
     /// front slot. A queue, not one slot: two quick-adds in flight
     /// must not let the first answer wear the second's label.
     pending_outcomes: VecDeque<Option<String>>,
+    /// Position within the *visible* (filtered) entries list, not the
+    /// snapshot's: `visible_entry_indices` translates it (#131).
     selected: usize,
     tab: Tab,
+    entry_filter: EntryFilter,
     /// Index into the active projects, for quick-add attribution.
     project_cursor: usize,
     /// Entity handle, used to attach click handlers from inside `render`
@@ -322,6 +410,13 @@ pub struct TimetrackView {
     /// escape (cancel) and `q` (quit) do anything on the keyboard while
     /// this is `Some`; the banner's buttons do it with the mouse.
     delete_project_confirm: Option<DeleteProjectConfirm>,
+    /// The source dialog (#153), when open. Modal like the entry
+    /// dialog: `None` registers, `Some` with an id edits.
+    source_dialog: Option<SourceDialog>,
+    /// A pending source-removal confirmation (#153). The banner opens
+    /// from a row button only, so the keyboard only cancels it (escape)
+    /// or quits (`q`); the Confirm button executes.
+    source_remove_confirm: Option<SourceRemoveConfirm>,
     /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
     /// defaults to now at view creation; all time ignores it.
     export_picker: ExportPicker,
@@ -334,6 +429,20 @@ pub struct TimetrackView {
     /// The AppImage self-update state. The check runs once at startup on a
     /// background thread; `U` arms and then sends the install.
     update: UpdateState,
+    /// Whether the last paint registered the text-input handler (#126).
+    /// While set, the platform delivers field text through the handler —
+    /// plain typing included — so the key handlers stand down from
+    /// inserting it themselves. Decided and recorded in the same paint
+    /// (see `ime::ImeRoot`), so the two paths can never double-insert
+    /// or drop a key between them.
+    ime_live: bool,
+    /// The field a click-drag started in, while the button is held
+    /// (#127). Moves over any other row are ignored until release.
+    mouse_drag: Option<MouseField>,
+    /// Where each mouse field's text painted last (#127): the text
+    /// origin a click maps through. Entries go stale when their field
+    /// unmounts, so readers check the field is live first.
+    field_bounds: HashMap<MouseField, Bounds<Pixels>>,
 }
 
 impl TimetrackView {
@@ -345,11 +454,13 @@ impl TimetrackView {
             actions,
             snapshot: Snapshot::default(),
             suggestions: Vec::new(),
+            sources: Vec::new(),
             snapshot_received: false,
             status: None,
             pending_outcomes: VecDeque::new(),
             selected: 0,
             tab: Tab::Home,
+            entry_filter: EntryFilter::default(),
             project_cursor: 0,
             entity: None,
             focus: cx.focus_handle(),
@@ -360,6 +471,8 @@ impl TimetrackView {
             delete_confirm: None,
             recolour_prompt: None,
             delete_project_confirm: None,
+            source_dialog: None,
+            source_remove_confirm: None,
             export_picker: ExportPicker::new(now_ms()),
             export_last_dest: None,
             export_last_via_portal: false,
@@ -368,6 +481,9 @@ impl TimetrackView {
                 disabled: std::env::var_os(timetrack_update::NO_UPDATE_ENV).is_some(),
                 ..Default::default()
             },
+            ime_live: false,
+            mouse_drag: None,
+            field_bounds: HashMap::new(),
         };
         view.schedule_poll(cx);
         view
@@ -455,8 +571,10 @@ impl TimetrackView {
             changed = true;
         }
         // The lists can shrink under the cursor when something is
-        // removed, which would otherwise index out of bounds.
-        let entries = self.snapshot.entries.len();
+        // removed, which would otherwise index out of bounds. The
+        // entries cursor lives in filtered space (#131), so it clamps
+        // against the visible count, not the snapshot's.
+        let entries = self.visible_entry_indices().len();
         if self.selected >= entries {
             let clamped = entries.saturating_sub(1);
             if clamped != self.selected {
@@ -569,6 +687,10 @@ impl TimetrackView {
                     self.suggestions = fresh;
                     changed = true;
                 }
+                Ok(Msg::Sources(fresh)) => {
+                    self.sources = fresh;
+                    changed = true;
+                }
                 Ok(Msg::UpdateCurrent) => {
                     self.update.checked = true;
                 }
@@ -609,7 +731,7 @@ impl TimetrackView {
         // Queue the success sentence before the action can be answered:
         // the service thread answers in send order, so the queue and
         // the answers stay in step (see `pending_outcome`).
-        if let Some(outcome) = pending_outcome(&a, &self.snapshot) {
+        if let Some(outcome) = pending_outcome(&a, &self.snapshot, &self.sources) {
             self.pending_outcomes.push_back(outcome);
         }
         let _ = self.actions.send(a);
@@ -635,6 +757,42 @@ impl TimetrackView {
         self.active_projects().get(self.project_cursor).copied()
     }
 
+    /// The snapshot index under the cursor: the cursor is a position in
+    /// the filtered list, and every entry action (edit, split, merge,
+    /// delete) names a snapshot entry (#131).
+    fn selected_snapshot_index(&self) -> Option<usize> {
+        self.visible_entry_indices().get(self.selected).copied()
+    }
+
+    /// Handle a key press while the entries filter is being typed. Always
+    /// returns true: `q` types a "q" here rather than quitting, and
+    /// `escape` clears the filter.
+    fn on_filter_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.entry_filter.clear();
+                self.selected = 0;
+            }
+            "enter" => {
+                self.entry_filter.editing = false;
+                self.selected = 0;
+            }
+            "backspace" => {
+                self.entry_filter.query.pop();
+                self.selected = 0;
+            }
+            _ => {
+                // Printable text, and only that: same gate as the other
+                // prompts, so shortcuts never leak into the query.
+                if let Some(ch) = printable_char(ev) {
+                    self.entry_filter.query.push_str(ch);
+                    self.selected = 0;
+                }
+            }
+        }
+        true
+    }
+
     /// Which prompt is open, if one is.
     ///
     /// The key handler and the renderer both ask this, so a prompt that
@@ -645,18 +803,20 @@ impl TimetrackView {
             self.dialog.is_some(),
             self.project_prompt.is_some(),
             self.split_prompt.is_some(),
+            self.source_dialog.is_some(),
             self.merge_confirm.is_some(),
             self.delete_confirm.is_some(),
             self.recolour_prompt.is_some(),
             self.delete_project_confirm.is_some(),
+            self.source_remove_confirm.is_some(),
         )
     }
 
     /// Handle a key press. Returns false when the app should quit.
     /// The text field a clipboard chord would act on, if any prompt with
     /// one is open (#109). Mirrors the routing priority of `on_key`:
-    /// the entry dialog, then the project and split prompts, then the
-    /// export anchor while it is being edited.
+    /// the entry dialog, then the project, split and source prompts,
+    /// then the export anchor while it is being edited.
     fn focused_text_mut(&mut self) -> Option<(&mut String, &mut self::textline::Caret)> {
         if let Some(dlg) = self.dialog.as_mut() {
             return dlg.focused_text_mut();
@@ -667,11 +827,24 @@ impl TimetrackView {
         if let Some(prompt) = self.split_prompt.as_mut() {
             return Some((&mut prompt.at, &mut prompt.caret));
         }
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            return dlg.focused_text_mut();
+        }
         if self.export_picker.editing {
             return Some((
                 &mut self.export_picker.anchor_text,
                 &mut self.export_picker.caret,
             ));
+        }
+        // The range's open day field, if either (#133). The end copies
+        // out first: the mutable borrow below cannot go through the
+        // field it matches on.
+        if let Some(end) = self.export_picker.range.editing {
+            let range = &mut self.export_picker.range;
+            return Some(match end {
+                RangeEnd::From => (&mut range.from_text, &mut range.from_caret),
+                RangeEnd::To => (&mut range.to_text, &mut range.to_caret),
+            });
         }
         None
     }
@@ -730,21 +903,34 @@ impl TimetrackView {
             Some(OpenPrompt::Entry) => return self.on_dialog_key(ev),
             Some(OpenPrompt::Project) => return self.on_project_key(ev),
             Some(OpenPrompt::Split) => return self.on_split_key(ev),
+            Some(OpenPrompt::Source) => return self.on_source_key(ev),
             Some(OpenPrompt::Recolour) => return self.on_recolour_key(ev),
             // A merge or a delete waits its turn: the anchor field is typed
             // into first, and each is answered by its own key handler below.
             _ => {}
+        }
+        // The filter field owns the keyboard while it is being typed
+        // in, like the modal prompts do.
+        if self.entry_filter.editing {
+            return self.on_filter_key(ev);
         }
         // The anchor day field owns the keyboard while it is being typed
         // in, like the modal prompts do.
         if self.export_picker.editing {
             return self.on_anchor_key(ev);
         }
+        // The range's open day field, if either (#133). Anchor and range
+        // never edit together: selecting one choice closes the other's
+        // fields.
+        if self.export_picker.range.editing.is_some() {
+            return self.on_range_key(ev);
+        }
         // A pending merge or delete only listens for its own answer.
         match self.open_prompt() {
             Some(OpenPrompt::Merge) => return self.on_merge_key(ev),
             Some(OpenPrompt::Delete) => return self.on_delete_key(ev),
             Some(OpenPrompt::DeleteProject) => return self.on_delete_project_key(ev),
+            Some(OpenPrompt::SourceRemove) => return self.on_source_remove_key(ev),
             _ => {}
         }
         // Tab cycles the three tabs (§11); shift goes backward. The Tab key
@@ -752,6 +938,15 @@ impl TimetrackView {
         // dialog's field cycling does.
         if ev.keystroke.key.as_str() == "tab" {
             self.tab = cycle_tab(self.tab, ev.keystroke.modifiers.shift);
+            return true;
+        }
+        // Escape clears an active filter (#131); with no filter it is
+        // swallowed like any other unbound key.
+        if ev.keystroke.key.as_str() == "escape" {
+            if self.entry_filter.is_active() {
+                self.entry_filter.clear();
+                self.selected = 0;
+            }
             return true;
         }
         let Some(ch) = ev.keystroke.key_char.as_deref() else {
@@ -793,6 +988,10 @@ impl TimetrackView {
             "s" => self.open_split_prompt(),
             "m" => self.open_merge_confirm(),
 
+            // External sources (#153): `o` registers a new one; the
+            // SOURCES section's rows edit, refresh and remove.
+            "o" => self.open_source_dialog(),
+
             // Self-update (AppImage only): the first press arms the
             // install, the second one downloads it.
             "U" => self.on_update_key(),
@@ -812,10 +1011,21 @@ impl TimetrackView {
             }
             "t" => {
                 if self.tab == Tab::Export {
-                    self.export_picker.start_editing();
+                    // Under the range choice `t` opens the from day; the
+                    // to day opens by clicking it.
+                    if self.export_picker.is_range() {
+                        self.export_picker.start_range_editing(RangeEnd::From);
+                    } else {
+                        self.export_picker.start_editing();
+                    }
                 }
             }
 
+            // The entries filter (#131): `/` types a query over the
+            // snapshot, narrowing only the list — totals stay whole.
+            "/" => {
+                self.entry_filter.editing = true;
+            }
             "h" => self.project_cursor = self.project_cursor.saturating_sub(1),
             "l" => {
                 if self.project_cursor + 1 < self.active_projects().len() {
@@ -823,7 +1033,7 @@ impl TimetrackView {
                 }
             }
             "j" => {
-                if self.selected + 1 < self.snapshot.entries.len() {
+                if self.selected + 1 < self.visible_entry_indices().len() {
                     self.selected += 1;
                 }
             }
@@ -879,7 +1089,10 @@ impl TimetrackView {
                             "l" => dlg.cycle_project(1),
                             _ => {}
                         }
-                    } else {
+                    // While the input handler is live the platform
+                    // delivers the key through it (#126) — inserting
+                    // here too would double every character.
+                    } else if !self.ime_live {
                         dlg.type_text(ch);
                     }
                 }
@@ -910,7 +1123,12 @@ impl TimetrackView {
     /// text, or a new project, or any of them. Empty times keep the
     /// current endpoints.
     fn open_edit_dialog(&mut self) {
-        match self.snapshot.entries.get(self.selected).cloned() {
+        // The cursor is filtered (#131): the dialog edits the snapshot
+        // entry under the visible position.
+        let picked = self
+            .selected_snapshot_index()
+            .and_then(|i| self.snapshot.entries.get(i).cloned());
+        match picked {
             Some(e) => {
                 // The move targets are the active projects; the dialog
                 // itself keeps the entry's current project representable
@@ -1012,9 +1230,13 @@ impl TimetrackView {
             }
             _ => {
                 // Printable text, and only that: same gate as the other
-                // prompts, so shortcuts never leak into the name.
+                // prompts, so shortcuts never leak into the name. While
+                // the input handler is live the platform delivers the
+                // key through it (#126) — inserting here too would
+                // double every character.
                 if let Some(ch) = printable_char(ev)
                     && let Some(prompt) = self.project_prompt.as_mut()
+                    && !self.ime_live
                 {
                     self::textline::insert_text(&mut prompt.name, &mut prompt.caret, ch);
                     prompt.error = None;
@@ -1185,7 +1407,12 @@ impl TimetrackView {
 
     /// Open the split prompt for the selected entry, if there is one.
     fn open_split_prompt(&mut self) {
-        match self.snapshot.entries.get(self.selected).cloned() {
+        // The cursor is filtered (#131): the split names the snapshot
+        // entry under the visible position.
+        let picked = self
+            .selected_snapshot_index()
+            .and_then(|i| self.snapshot.entries.get(i).cloned());
+        match picked {
             Some(e) => {
                 self.status = None;
                 self.split_prompt = Some(SplitPrompt {
@@ -1231,8 +1458,12 @@ impl TimetrackView {
             _ => {
                 // Printable text, and only that: same gate as the dialog, so
                 // shortcuts and special keys never leak into the moment.
+                // While the input handler is live the platform delivers
+                // the key through it (#126) — inserting here too would
+                // double every character.
                 if let Some(ch) = printable_char(ev)
                     && let Some(prompt) = self.split_prompt.as_mut()
+                    && !self.ime_live
                 {
                     self::textline::insert_text(&mut prompt.at, &mut prompt.caret, ch);
                     prompt.error = None;
@@ -1273,10 +1504,241 @@ impl TimetrackView {
         }
     }
 
+    /// Open the source dialog to register a new source (`o`).
+    fn open_source_dialog(&mut self) {
+        let choices: Vec<(String, String)> = self
+            .active_projects()
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .collect();
+        self.status = None;
+        self.source_dialog = Some(SourceDialog::new(choices));
+    }
+
+    /// Open the source dialog to edit a source, from its row's button.
+    /// A kind this GUI does not know refuses in the footer rather than
+    /// opening a dialog that would re-save it as something else.
+    pub(crate) fn open_source_edit(&mut self, source_id: &str) {
+        let found = self.sources.iter().find(|s| s.id == source_id).cloned();
+        match found {
+            Some(src) => match SourceKind::parse(&src.kind) {
+                Some(kind) => {
+                    let choices: Vec<(String, String)> = self
+                        .active_projects()
+                        .iter()
+                        .map(|p| (p.id.clone(), p.name.clone()))
+                        .collect();
+                    self.status = None;
+                    self.source_dialog = Some(SourceDialog::edit(
+                        src.id,
+                        kind,
+                        src.locator,
+                        src.label,
+                        src.project_id,
+                        choices,
+                    ));
+                }
+                None => {
+                    self.status = Some(StatusMsg::local(format!(
+                        "source kind '{}' is newer than this GUI; update to edit it",
+                        src.kind
+                    )));
+                }
+            },
+            None => self.status = Some(StatusMsg::local("that source is gone; refresh")),
+        }
+    }
+
+    /// Handle a key press while the source dialog is open. Always returns
+    /// true: `q` types a "q" here rather than quitting, and `escape` cancels.
+    fn on_source_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        // Caret and selection keys (#109) edit the focused field; the
+        // cycling fields report false and keep their keys below.
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            let m = &ev.keystroke.modifiers;
+            if dlg.edit_key(&ev.keystroke.key, m.shift, m.control) {
+                return true;
+            }
+        }
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.source_dialog = None;
+            }
+            "enter" => self.source_save(),
+            "tab" => {
+                if let Some(dlg) = self.source_dialog.as_mut() {
+                    if ev.keystroke.modifiers.shift {
+                        dlg.prev_field();
+                    } else {
+                        dlg.next_field();
+                    }
+                }
+            }
+            "backspace" => {
+                if let Some(dlg) = self.source_dialog.as_mut() {
+                    dlg.backspace();
+                }
+            }
+            _ => {
+                // Printable text, and only that: with control, alt or the
+                // platform modifier held the keystroke is a shortcut, not
+                // input, and key_char of a special key must not leak in.
+                if let Some(ch) = printable_char(ev)
+                    && let Some(dlg) = self.source_dialog.as_mut()
+                {
+                    // The cycling fields step instead of taking text:
+                    // `h`/`l`, the project keys everywhere else (#104).
+                    match dlg.field {
+                        SourceField::Kind => match ch {
+                            "h" => dlg.cycle_kind(-1),
+                            "l" => dlg.cycle_kind(1),
+                            _ => {}
+                        },
+                        SourceField::Project => match ch {
+                            "h" => dlg.cycle_project(-1),
+                            "l" => dlg.cycle_project(1),
+                            _ => {}
+                        },
+                        // While the input handler is live the platform
+                        // delivers the key through it (#126) — inserting
+                        // here too would double every character.
+                        _ => {
+                            if !self.ime_live {
+                                dlg.type_text(ch);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Validate the source dialog and send it. Stays open with an error
+    /// on a blank locator; closes on success. Duplicates and the harder
+    /// refusals travel to the service, which owns source validity and
+    /// reports them typed into the footer.
+    fn source_save(&mut self) {
+        let Some(dlg) = self.source_dialog.as_ref() else {
+            return;
+        };
+        match resolve_source_dialog(dlg) {
+            Err(msg) => {
+                if let Some(open) = self.source_dialog.as_mut() {
+                    open.error = Some(msg);
+                }
+            }
+            Ok(SourceSave::Create {
+                kind,
+                locator,
+                project_id,
+                label,
+            }) => {
+                self.send(Action::AddSource {
+                    kind,
+                    locator,
+                    project_id,
+                    label,
+                });
+                self.source_dialog = None;
+            }
+            Ok(SourceSave::Update {
+                id,
+                kind,
+                locator,
+                project_id,
+                label,
+            }) => {
+                self.send(Action::UpdateSource {
+                    id,
+                    kind,
+                    locator,
+                    project_id,
+                    label,
+                });
+                self.source_dialog = None;
+            }
+        }
+    }
+
+    /// Cycle the source dialog's kind from a mouse click: the keyboard
+    /// path is `h`/`l` in the field, the click steps forward.
+    pub(crate) fn cycle_source_kind(&mut self, delta: i32) {
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            dlg.cycle_kind(delta);
+        }
+    }
+
+    /// Cycle the source dialog's mapping from a mouse click, like the kind.
+    pub(crate) fn cycle_source_project(&mut self, delta: i32) {
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            dlg.cycle_project(delta);
+        }
+    }
+
+    /// Focus one source-dialog field from a mouse click on its row: the
+    /// click route to the same focus Tab moves.
+    pub(crate) fn focus_source_field(&mut self, field: SourceField) {
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            dlg.focus_field(field);
+        }
+    }
+
+    /// Offer the source-removal confirmation for a source, from its row's
+    /// button. The banner names what goes with it; the service
+    /// re-validates on execute.
+    pub(crate) fn open_source_remove_confirm(&mut self, source_id: &str) {
+        match self.sources.iter().find(|s| s.id == source_id).cloned() {
+            Some(src) => {
+                let pending = self
+                    .suggestions
+                    .iter()
+                    .filter(|s| s.source_id == source_id)
+                    .count();
+                self.status = None;
+                self.source_remove_confirm =
+                    Some(source_remove_offer(&src.label, &src.id, pending));
+            }
+            None => self.status = Some(StatusMsg::local("that source is gone; refresh")),
+        }
+    }
+
+    /// Execute the pending source removal: the banner's Confirm button
+    /// lands here.
+    pub(crate) fn confirm_source_remove(&mut self) {
+        if let Some(confirm) = self.source_remove_confirm.take() {
+            self.send(remove_source_action(&confirm));
+        }
+    }
+
+    /// Dismiss the pending source removal without removing: Escape and
+    /// the banner's Cancel button both land here.
+    pub(crate) fn cancel_source_remove(&mut self) {
+        self.source_remove_confirm = None;
+    }
+
+    /// Handle a key press while a source-removal confirmation is pending.
+    /// The banner opens from a row button only, so the keyboard only
+    /// cancels it; anything else is swallowed.
+    fn on_source_remove_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if ev.keystroke.key.as_str() == "escape" {
+            self.cancel_source_remove();
+            return true;
+        }
+        !matches!(ev.keystroke.key_char.as_deref(), Some("q"))
+    }
+
     /// Offer the merge confirmation for the selection, if the selected entry
     /// overlaps or touches anything on its project.
     fn open_merge_confirm(&mut self) {
-        match merge_offer(&self.snapshot, self.selected) {
+        // The cursor is filtered (#131): merge names snapshot entries,
+        // so the visible position is translated first. The merge itself
+        // still scans the whole snapshot — touching entries outside the
+        // filter join too.
+        let offered = self
+            .selected_snapshot_index()
+            .and_then(|index| merge_offer(&self.snapshot, index));
+        match offered {
             Some(confirm) => {
                 self.status = None;
                 self.merge_confirm = Some(confirm);
@@ -1323,7 +1785,12 @@ impl TimetrackView {
     /// Offer the delete confirmation for the selection, if there is one.
     /// The first `d` only opens the banner; a second `d` executes it.
     fn open_delete_confirm(&mut self) {
-        match delete_offer(&self.snapshot, self.selected) {
+        // The cursor is filtered (#131): delete names the snapshot entry
+        // under the visible position.
+        let offered = self
+            .selected_snapshot_index()
+            .and_then(|index| delete_offer(&self.snapshot, index));
+        match offered {
             Some(confirm) => {
                 self.status = None;
                 self.delete_confirm = Some(confirm);
@@ -1478,9 +1945,61 @@ impl TimetrackView {
             "tab" => {}
             _ => {
                 // Printable text, and only that: same gate as the dialogs, so
-                // shortcuts and special keys never leak into the day.
-                if let Some(ch) = printable_char(ev) {
+                // shortcuts and special keys never leak into the day. While
+                // the input handler is live the platform delivers the key
+                // through it (#126) — inserting here too would double
+                // every character.
+                if let Some(ch) = printable_char(ev)
+                    && !self.ime_live
+                {
                     self.export_picker.type_text(ch);
+                }
+            }
+        }
+        true
+    }
+
+    /// Handle a key press while one of the range's day fields is open
+    /// (#133). Always returns true, like the anchor field: `q` types a
+    /// "q" here rather than quitting, and `escape` cancels.
+    fn on_range_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        let m = &ev.keystroke.modifiers;
+        if self
+            .export_picker
+            .range
+            .edit_key(&ev.keystroke.key, m.shift, m.control)
+        {
+            return true;
+        }
+        match ev.keystroke.key.as_str() {
+            "escape" => match snapshot_tz(&self.snapshot) {
+                Ok(tz) => self.export_picker.range.cancel_editing(&tz),
+                // No usable zone to re-mirror the days from (#102): close
+                // the field anyway and say why in the footer.
+                Err(e) => {
+                    self.export_picker.range.editing = None;
+                    self.status = Some(StatusMsg::local(e.to_string()));
+                }
+            },
+            "enter" => match snapshot_tz(&self.snapshot) {
+                Ok(tz) => {
+                    self.export_picker.range.commit(&tz);
+                }
+                Err(e) => self.export_picker.range.error = Some(e.to_string()),
+            },
+            "backspace" => self.export_picker.range.backspace(),
+            // Tab stays in the field: enter sets the day, escape cancels.
+            "tab" => {}
+            _ => {
+                // Printable text, and only that: same gate as the dialogs, so
+                // shortcuts and special keys never leak into the day. While
+                // the input handler is live the platform delivers the key
+                // through it (#126) — inserting here too would double
+                // every character.
+                if let Some(ch) = printable_char(ev)
+                    && !self.ime_live
+                {
+                    self.export_picker.range.type_text(ch);
                 }
             }
         }
@@ -1546,11 +2065,16 @@ impl TimetrackView {
                 "d to confirm the delete · esc to cancel".to_string()
             } else if self.project_prompt.is_some() {
                 "type a name · enter save · esc cancel".to_string()
-            } else if self.export_picker.editing {
+            } else if self.source_dialog.is_some() {
+                "type to edit · tab next field · h/l cycle kind and project · enter save · esc cancel"
+                    .to_string()
+            } else if self.source_remove_confirm.is_some() {
+                "Confirm to remove the source · esc to cancel".to_string()
+            } else if self.export_picker.is_typing() {
                 "type a day YYYY-MM-DD · enter set · esc cancel".to_string()
             } else {
                 let mut hints =
-                    "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · tab tabs · j/k move · h/l project · q quit"
+                    "1-4 quick add · a add · e edit · s split · m merge · n project · r rename · u undo · d delete · o source · / filter · tab tabs · j/k move · h/l project · q quit"
                         .to_string();
                 // Offer the update exactly while there is one to install:
                 // armed, installed and downloading states speak through the
@@ -1564,8 +2088,21 @@ impl TimetrackView {
     }
 }
 
+/// Whether the first-frame launch marker has been logged (#157).
+///
+/// A static, not a view field: the unit tests construct views without
+/// ever rendering, so a field would churn every fixture for a line only
+/// the native launch smoke check reads.
+static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
+
 impl Render for TimetrackView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The launch smoke check (`scripts/gui-launch-smoke.sh`) asserts on
+        // this line plus process liveness: it proves gpui built a frame on
+        // this platform. Pixel truth stays with the Linux gui-smoke job.
+        if !FIRST_FRAME_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!("timetrack-gui: first frame rendered");
+        }
         // Drain here as well as in the poll loop: a frame already being built
         // for an event should pick up any snapshot waiting in the channel
         // rather than painting one frame stale.
@@ -1589,6 +2126,7 @@ impl Render for TimetrackView {
 
         let this = cx.entity();
         self.entity = Some(this.clone());
+        let ime_entity = this.clone();
         let maximized = window.is_maximized();
 
         // The titlebar is the only chrome above the content, and it is chrome
@@ -1603,8 +2141,12 @@ impl Render for TimetrackView {
         // the panel below rounds all four corners; the titlebar rounds
         // its own top because the panel clip does not round children. A
         // maximized window stays square and full-bleed: rounded corners
-        // would leave gaps at the screen edges.
-        div()
+        // would leave gaps at the screen edges. The 1px client border
+        // follows the same shape (rounded when floating, square when
+        // maximized): with client decorations the compositor may drop its
+        // own shadow/frame during an interactive move on Wayland (#163),
+        // and this edge is what stays visible through it.
+        let root = div()
             .id("root")
             .track_focus(&self.focus)
             .flex()
@@ -1634,6 +2176,8 @@ impl Render for TimetrackView {
                     .flex_1()
                     .w_full()
                     .bg(rgba(theme::WINDOW_BG))
+                    .border_1()
+                    .border_color(rgba(theme::WINDOW_BORDER))
                     .when(!maximized, |el| el.rounded_xl().overflow_hidden())
                     .child(self.render_titlebar(window))
                     // The tab content and the prompts share one relative
@@ -1658,13 +2202,17 @@ impl Render for TimetrackView {
                             .child(self.render_prompts()),
                     )
                     .child(self.render_footer()),
-            )
+            );
+        // The input-handler wrapper (#126) is paint-phase only: it
+        // registers the view's text-input handler while a field is
+        // focused and otherwise passes the root straight through.
+        self::ime::ImeRoot::wrap(root.into_any_element(), ime_entity, self.focus.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::service::export_request;
+    use super::service::{ExportCall, export_request};
     use super::testsupport::*;
     use super::*;
     use timetrack_proto::EntrySource;
@@ -1732,7 +2280,9 @@ mod tests {
     #[test]
     fn no_open_prompt_means_no_prompt() {
         assert_eq!(
-            which_prompt(false, false, false, false, false, false, false),
+            which_prompt(
+                false, false, false, false, false, false, false, false, false
+            ),
             None
         );
     }
@@ -1740,32 +2290,40 @@ mod tests {
     #[test]
     fn each_open_prompt_is_the_one_that_owns_the_keyboard() {
         assert_eq!(
-            which_prompt(true, false, false, false, false, false, false),
+            which_prompt(true, false, false, false, false, false, false, false, false),
             Some(OpenPrompt::Entry)
         );
         assert_eq!(
-            which_prompt(false, true, false, false, false, false, false),
+            which_prompt(false, true, false, false, false, false, false, false, false),
             Some(OpenPrompt::Project)
         );
         assert_eq!(
-            which_prompt(false, false, true, false, false, false, false),
+            which_prompt(false, false, true, false, false, false, false, false, false),
             Some(OpenPrompt::Split)
         );
         assert_eq!(
-            which_prompt(false, false, false, true, false, false, false),
+            which_prompt(false, false, false, true, false, false, false, false, false),
+            Some(OpenPrompt::Source)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, false, true, false, false, false, false),
             Some(OpenPrompt::Merge)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, true, false, false),
+            which_prompt(false, false, false, false, false, true, false, false, false),
             Some(OpenPrompt::Delete)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, false, true, false),
+            which_prompt(false, false, false, false, false, false, true, false, false),
             Some(OpenPrompt::Recolour)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, false, false, true),
+            which_prompt(false, false, false, false, false, false, false, true, false),
             Some(OpenPrompt::DeleteProject)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, false, false, false, false, false, true),
+            Some(OpenPrompt::SourceRemove)
         );
     }
 
@@ -1774,21 +2332,40 @@ mod tests {
         // The key handler used to check the prompts one by one, in this
         // order; the shared question has to keep it.
         assert_eq!(
-            which_prompt(true, true, true, true, true, true, true),
+            which_prompt(true, true, true, true, true, true, true, true, true),
             Some(OpenPrompt::Entry)
         );
         assert_eq!(
-            which_prompt(false, true, true, true, true, true, true),
+            which_prompt(false, true, true, true, true, true, true, true, true),
             Some(OpenPrompt::Project)
         );
         assert_eq!(
-            which_prompt(false, false, true, true, true, true, true),
+            which_prompt(false, false, true, true, true, true, true, true, true),
             Some(OpenPrompt::Split)
         );
         assert_eq!(
-            which_prompt(false, false, false, true, true, true, true),
+            which_prompt(false, false, false, true, true, true, true, true, true),
+            Some(OpenPrompt::Source)
+        );
+        assert_eq!(
+            which_prompt(false, false, false, false, true, true, true, true, true),
             Some(OpenPrompt::Merge)
         );
+    }
+
+    #[test]
+    fn the_entries_filter_clears_query_and_editing_together() {
+        // #131: Esc leaves no residue — the list is whole again and `/`
+        // restarts from a blank field.
+        let mut filter = EntryFilter {
+            query: "review".into(),
+            editing: true,
+        };
+        assert!(filter.is_active());
+        filter.clear();
+        assert!(!filter.is_active());
+        assert!(!filter.editing);
+        assert!(!EntryFilter::default().is_active());
     }
 
     // --- connecting, confirmations and success feedback ---
@@ -1849,7 +2426,8 @@ mod tests {
                     project: "p1".into(),
                     ms: 3_600_000
                 },
-                &snap
+                &snap,
+                &[]
             ),
             Some(Some("added 1h to Work".to_string()))
         );
@@ -1857,20 +2435,24 @@ mod tests {
         // is tracked (its outcome must consume a queue slot) but has no
         // success sentence of its own: the arriving snapshot is the
         // feedback.
-        assert_eq!(pending_outcome(&Action::StartService, &snap), Some(None));
+        assert_eq!(
+            pending_outcome(&Action::StartService, &snap, &[]),
+            Some(None)
+        );
         // Exports, updates and refreshes report through their own
         // messages, never `ActionOk`, so they take no slot: a slot here
         // would steal the next real action's label.
-        assert_eq!(pending_outcome(&Action::Refresh, &snap), None);
+        assert_eq!(pending_outcome(&Action::Refresh, &snap, &[]), None);
         assert_eq!(
             pending_outcome(
-                &Action::ExportCsv(export_request(
+                &Action::ExportCsv(ExportCall::Scoped(export_request(
                     timetrack_core::ExportScope::All,
                     0,
                     0,
                     &utc_tz()
-                )),
-                &snap
+                ))),
+                &snap,
+                &[]
             ),
             None
         );
@@ -1880,10 +2462,93 @@ mod tests {
                     url: "https://example.invalid/x".into(),
                     version: "9.9".into()
                 },
-                &snap
+                &snap,
+                &[]
             ),
             None
         );
+    }
+
+    #[test]
+    fn source_outcomes_name_the_label_not_the_id() {
+        // #153: source actions report the label the user reads in the
+        // SOURCES section, falling back to the id only when the view
+        // does not know the source.
+        let snap = merge_snapshot();
+        let sources = vec![source_view("src-1", "Cal")];
+        assert_eq!(
+            pending_outcome(
+                &Action::AddSource {
+                    kind: "ics_file".into(),
+                    locator: "/tmp/cal.ics".into(),
+                    project_id: None,
+                    label: "Cal".into(),
+                },
+                &snap,
+                &sources
+            ),
+            Some(Some("created source Cal".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(
+                &Action::AddSource {
+                    kind: "ics_file".into(),
+                    locator: "/tmp/other.ics".into(),
+                    project_id: None,
+                    label: String::new(),
+                },
+                &snap,
+                &sources
+            ),
+            Some(Some("created source other.ics".to_string())),
+            "an empty label derives like the service does"
+        );
+        assert_eq!(
+            pending_outcome(
+                &Action::UpdateSource {
+                    id: "src-1".into(),
+                    kind: "ics_file".into(),
+                    locator: "/tmp/cal.ics".into(),
+                    project_id: None,
+                    label: "Cal".into(),
+                },
+                &snap,
+                &sources
+            ),
+            Some(Some("updated source Cal".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::RemoveSource("src-1".into()), &snap, &sources),
+            Some(Some("removed source Cal".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::RemoveSource("src-gone".into()), &snap, &sources),
+            Some(Some("removed source src-gone".to_string())),
+            "an unknown source falls back to its id"
+        );
+        assert_eq!(
+            pending_outcome(&Action::RefreshSources { id: None }, &snap, &sources),
+            Some(Some("calendars refreshed".to_string())),
+            "the all-sources refresh keeps its sentence"
+        );
+        assert_eq!(
+            pending_outcome(
+                &Action::RefreshSources {
+                    id: Some("src-1".into()),
+                },
+                &snap,
+                &sources
+            ),
+            Some(Some("source refreshed".to_string()))
+        );
+        let remove = SourceRemoveConfirm {
+            id: "src-1".into(),
+            summary: String::new(),
+        };
+        match remove_source_action(&remove) {
+            Action::RemoveSource(id) => assert_eq!(id, "src-1"),
+            other => panic!("expected RemoveSource, got {other:?}"),
+        }
     }
 
     // --- tabs and bars (§11) ---
@@ -1937,6 +2602,38 @@ mod tests {
         assert_eq!(request.suggested_name, "timetrack-export-all.csv");
         assert_eq!(request.anchor_ms, None, "all time uses the old call");
     }
+
+    #[test]
+    fn a_range_request_names_both_days_everywhere() {
+        // #133: like the scoped request, everything is derived together
+        // from one zone at the click site — and the range travels as its
+        // own call, never as an `ExportScope`.
+        use super::service::export_range_request;
+        let from = day_anchor("2026-10-01");
+        let to = day_anchor("2026-10-15");
+        let request = export_range_request(from, to, &utc_tz());
+        assert_eq!(request.from_ms, from);
+        assert_eq!(request.to_ms, to);
+        assert_eq!(request.period_id, "2026-10-01..2026-10-15");
+        assert_eq!(
+            request.suggested_name,
+            "timetrack-export-range-2026-10-01..2026-10-15.csv"
+        );
+        assert!(
+            request
+                .path
+                .ends_with("timetrack-export-range-2026-10-01..2026-10-15.csv"),
+            "the fallback path names the same range: {}",
+            request.path
+        );
+        // The range reports through its own message like every export, so
+        // it takes no outcome slot either.
+        let snap = merge_snapshot();
+        assert_eq!(
+            pending_outcome(&Action::ExportCsv(ExportCall::Range(request)), &snap, &[]),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1951,6 +2648,10 @@ mod update;
 mod chrome;
 
 mod keys;
+
+mod ime;
+
+mod mouse;
 
 mod service;
 

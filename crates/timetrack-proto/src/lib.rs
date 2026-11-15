@@ -130,6 +130,37 @@ pub struct SourceView {
     pub locator: String,
     pub project_id: Option<String>,
     pub label: String,
+    /// Whether the OS credential store holds this source's secret
+    /// (#149). A service too old to send the field leaves it false.
+    #[serde(default)]
+    pub has_credential: bool,
+    /// The non-secret login name the credential authenticates as, if any.
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
+/// A secret crossing the socket (#149): the wire bytes are the plain
+/// string, but `Debug` never prints it, so a logged request cannot
+/// leak a credential into a log file.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(secret: impl Into<String>) -> Self {
+        SecretString(secret.into())
+    }
+
+    /// The secret itself, for the one place that stores it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(redacted)")
+    }
 }
 
 /// A fetched event/task awaiting (or past) decision (§19).
@@ -149,12 +180,31 @@ pub struct SuggestionView {
 }
 
 /// What one refresh fetched: items seen, newly stored, and skipped by
-/// the parser (no interval, no UID, unparseable).
+/// the parser (no interval, no UID, unparseable). CalDAV refreshes
+/// (#151) also update still-pending suggestions in place and withdraw
+/// the ones their resource no longer holds; `.ics` refreshes leave
+/// both at zero. A service too old to send a field leaves it zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RefreshView {
     pub fetched: usize,
     pub inserted: usize,
     pub skipped: usize,
+    #[serde(default)]
+    pub updated: usize,
+    #[serde(default)]
+    pub withdrawn: usize,
+}
+
+/// One CalDAV collection found by account discovery (#150): a URL the
+/// user can register with `source-add --kind caldav` instead of
+/// hand-constructing it, with the name and component kinds the server
+/// advertises for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaldavCollectionView {
+    pub url: String,
+    pub display_name: String,
+    /// Supported components (`VEVENT`, `VTODO`, ...), uppercased.
+    pub components: Vec<String>,
 }
 
 /// Totals for one period, mirroring `timetrack_core::aggregate::Totals`.
@@ -686,6 +736,24 @@ impl Client {
         .source()
     }
 
+    pub async fn update_source(
+        &self,
+        id: &str,
+        kind: &str,
+        locator: &str,
+        project_id: Option<&str>,
+        label: &str,
+    ) -> Result<SourceView, ClientError> {
+        self.call(SocketRequest::UpdateSource {
+            id: id.into(),
+            kind: kind.into(),
+            locator: locator.into(),
+            project_id: project_id.map(str::to_string),
+            label: label.into(),
+        })?
+        .source()
+    }
+
     pub async fn sources(&self) -> Result<Vec<SourceView>, ClientError> {
         self.call(SocketRequest::ListSources)?.sources()
     }
@@ -716,6 +784,46 @@ impl Client {
     pub async fn dismiss_suggestion(&self, id: &str) -> Result<(), ClientError> {
         self.call(SocketRequest::DismissSuggestion { id: id.into() })?
             .unit()
+    }
+
+    pub async fn set_source_credential(
+        &self,
+        id: &str,
+        username: &str,
+        secret: &str,
+    ) -> Result<SourceView, ClientError> {
+        self.call(SocketRequest::SetSourceCredential {
+            id: id.into(),
+            username: username.into(),
+            secret: SecretString::new(secret),
+        })?
+        .source()
+    }
+
+    pub async fn remove_source_credential(&self, id: &str) -> Result<SourceView, ClientError> {
+        self.call(SocketRequest::RemoveSourceCredential { id: id.into() })?
+            .source()
+    }
+
+    pub async fn remove_source(&self, id: &str) -> Result<(), ClientError> {
+        self.call(SocketRequest::RemoveSource { id: id.into() })?
+            .unit()
+    }
+
+    /// Discover an account's CalDAV collections from a server, account,
+    /// principal, or home URL (#150). `source_id` lends a registered
+    /// source's stored credential to the discovery; without one the
+    /// endpoint's userinfo and the headless env fallback apply.
+    pub async fn discover_caldav(
+        &self,
+        endpoint: &str,
+        source_id: Option<&str>,
+    ) -> Result<Vec<CaldavCollectionView>, ClientError> {
+        self.call(SocketRequest::DiscoverCaldav {
+            endpoint: endpoint.into(),
+            source_id: source_id.map(str::to_string),
+        })?
+        .caldav_collections()
     }
 
     pub async fn set_note(&self, id: &str, note: Option<&str>) -> Result<EntryView, ClientError> {
@@ -994,6 +1102,71 @@ mod tests {
             .to_string(),
             "an entry must not end before it starts"
         );
+    }
+
+    // --- source credentials (#149) ---
+
+    #[test]
+    fn a_secret_never_prints_but_still_travels() {
+        let secret = SecretString::new("s3cr3t");
+        assert_eq!(format!("{secret:?}"), "SecretString(redacted)");
+        assert_eq!(secret.expose(), "s3cr3t");
+        // The wire bytes are the plain string, transparently.
+        let text = serde_json::to_string(&secret).unwrap();
+        assert_eq!(text, "\"s3cr3t\"");
+        assert_eq!(serde_json::from_str::<SecretString>(&text).unwrap(), secret);
+        // And a request carrying one is safe to log.
+        let request = SocketRequest::SetSourceCredential {
+            id: "src-1".into(),
+            username: "alice".into(),
+            secret,
+        };
+        let debug = format!("{request:?}");
+        assert!(
+            !debug.contains("s3cr3t"),
+            "a logged request must not leak the secret: {debug}"
+        );
+        assert!(debug.contains("alice"), "non-secrets still print: {debug}");
+        let back: SocketRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(back, request);
+    }
+
+    // --- CalDAV discovery (#150) ---
+
+    #[test]
+    fn discovered_collections_round_trip() {
+        let view = CaldavCollectionView {
+            url: "https://cal.test/u/work/".into(),
+            display_name: "Work".into(),
+            components: vec!["VEVENT".into()],
+        };
+        let text = serde_json::to_string(&view).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CaldavCollectionView>(&text).unwrap(),
+            view
+        );
+        let request = SocketRequest::DiscoverCaldav {
+            endpoint: "https://cal.test/".into(),
+            source_id: Some("src-1".into()),
+        };
+        let back: SocketRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(back, request);
+        let response = socket::Response::CaldavCollections(vec![view.clone()]);
+        assert_eq!(response.caldav_collections().unwrap(), [view]);
+    }
+
+    #[test]
+    fn a_source_view_without_credential_fields_reads_as_unset() {
+        // An old service's JSON has no `has_credential`/`username`: it
+        // reads as no credential, never as a defaulted something.
+        let back: SourceView = serde_json::from_str(
+            r#"{"id":"src-1","kind":"caldav","locator":"https://x/","project_id":null,"label":"Cal"}"#,
+        )
+        .unwrap();
+        assert!(!back.has_credential);
+        assert_eq!(back.username, None);
     }
 
     // --- the call timeout ---

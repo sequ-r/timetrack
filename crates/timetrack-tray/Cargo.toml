@@ -14,10 +14,30 @@ path = "src/main.rs"
 [dependencies]
 timetrack-core = { workspace = true }
 timetrack-proto = { workspace = true }
-zbus = { workspace = true }
-ksni = { workspace = true }
 anyhow = { workspace = true }
 async-io = { workspace = true }
+
+# Linux-only tray backend (StatusNotifier via ksni, single-instance via
+# zbus): the neutral core above compiles on every target, and the
+# Windows/macOS backends (#155/#156) add their own gated deps below.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true }
+ksni = { workspace = true }
+
+# Windows-only notification-area backend (#155): a native icon plus menu
+# via tray-icon, and a named mutex via windows-sys. Both are tokio-free,
+# like everything else in this workspace.
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = { version = "0.21", default-features = false }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
+# macOS-only menu-bar backend (#156): the same tray-icon family as Windows
+# (NSStatusItem plus title via objc2, menu via muda), and libc for the
+# flock single-instance claim. Both are tokio-free, like everything else
+# in this workspace.
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.21", default-features = false }
+libc = { version = "0.2" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

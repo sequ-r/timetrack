@@ -125,9 +125,11 @@ service rig and the GUI smoke check, each job on its own so a red run names the
 one that failed). A failed smoke check uploads the screenshots and logs it took
 (`TT_SMOKE_ARTIFACTS`) as a run artifact. A push to `main` that touches the
 app (`crates/`, the manifests, the lockfile, `build-appimage.sh`, `data/`,
-`scripts/mint-version.sh`) then runs `release.yml`, which calls that workflow
-first and only afterwards mints the run's version, builds the AppImage from
-it, tags the commit and publishes the release. Anything else runs the checks
+`packaging/windows/`, `packaging/macos/`, `scripts/mint-version.sh`) then
+runs `release.yml`, which calls that workflow first and only afterwards
+mints the run's version, builds the AppImage, the Windows installer and
+the macOS disk image from it, tags the
+commit and publishes the release. Anything else runs the checks
 but mints no version. The version is the workspace manifest
 bumped past the latest tag -- ordinary runs only ever move the patch, so to
 ship a minor or major, bump `version` in the root `Cargo.toml` yourself and
@@ -192,6 +194,29 @@ into the database and leaves both files untouched as your backup.
 Host `cargo build` binaries are a development fallback only (see
 "Building" above): they need a service on the bus exactly like the tests
 do, and they never take part in an install.
+
+On Windows the same release carries `TimeTrack-Setup-<version>.exe`, a
+per-user Inno Setup installer (no UAC prompt) bundling the GUI, the CLI,
+the service and the tray: a Start Menu entry, an optional desktop icon,
+`timetrack` on the user `PATH`, and tray autostart at logon. The service
+is not registered as a Windows service — any client auto-spawns the
+sibling `timetrack-service.exe`, as on every OS. Upgrade and uninstall go
+through Add/Remove Programs, and `%LOCALAPPDATA%\timetrack` (your data)
+survives all of install, upgrade, repair and uninstall. Until a
+maintainer signing certificate is configured the installer is unsigned
+and SmartScreen says "unknown publisher"; releases say so explicitly —
+see `packaging/windows/README.md` for the full contract.
+
+On macOS the same release carries `TimeTrack-<version>-macos-<arch>.dmg`,
+a drag-to-Applications disk image holding `TimeTrack.app` with the GUI,
+the CLI, the service and the menu-bar tray: opening the app auto-spawns
+the sibling service, as on every OS. Upgrade is drag-replace and
+uninstall is Trash, and `~/Library/Application Support/timetrack` (your
+data) survives install, upgrade and uninstall. Until a maintainer Apple
+certificate is configured the image is unsigned and Gatekeeper refuses it
+until a right-click-Open; releases say so explicitly — see
+`packaging/macos/README.md` for the full contract. The v1 image is Apple
+silicon only; Intel Macs wait for a universal build.
 
 The CLI is one-shot only (§18): `timetrack quick -m 15` between other
 terminal work, `timetrack status` for the glance, `timetrack project

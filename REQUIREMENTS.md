@@ -137,10 +137,10 @@ Notes on the choices:
 - `source` exists so that hand-entered time is distinguishable from measured
   time. For billing, that distinction may matter; for personal tracking it is
   useful to sanity-check yourself.
-- **v2 additions (§17, §20):** `id` becomes a UUID in a dedicated later
-  migration (the sequential `e{n}` / `p{n}` counters collide across
-  machines; §17 preserves ids through the storage swap itself), and both
-  records gain `created_at`, `updated_at`, `deleted_at` (a tombstone:
+- **v2 additions (§17, §20):** `id` is a UUID (ADR 0018 landed the
+  dedicated migration off the sequential `e{n}` / `p{n}` counters, which
+  collide across machines; §17 preserved ids through the storage swap
+  itself), and both records gain `created_at`, `updated_at`, `deleted_at` (a tombstone:
   deletion sync needs to be able to say "gone", not just be absent), and
   `device_id` of the last writer — carried as store metadata (§17) until
   the sync design needs them in the model itself. `EntrySource` gains
@@ -574,6 +574,8 @@ specification and the implementation do not quietly diverge.
 | §19 `.ics` external sources, CLI surface: core parser (VEVENT/VTODO, TZID/floating/UTC, folding, durations; all-day/no-UID skipped, RRULE first occurrence only), store schema v2 (sources + suggestions), service fetch (file + capped HTTPS, read-only), socket wire, `source-add`/`sources`/`refresh`/`suggestions`/`confirm`/`dismiss`; confirm creates an `External` entry | `core/src/ics.rs`, `store/src/lib.rs`, `service/src/interface.rs`, `cli/src/main.rs` | core parser tests, store dedupe/decide tests, service-seam socket round-trip (refresh/confirm/dismiss/set-note), e2e .ics section |
 | §16 recurrence expansion (windowed RRULE: FREQ/INTERVAL/COUNT/UNTIL/BYDAY/BYMONTHDAY/BYMONTH/EXDATE, wall-clock across DST, refresh window −31d…+93d), CalDAV read-only collections (PROPFIND+GET, Basic auth from userinfo + `TIMETRACK_CALDAV_PASSWORD`, passwords refused in locators), GUI suggestions section on Home, custom date-range export (#133, started-at-wins) | `core/src/ics.rs`, `service/src/caldav.rs`, `gui/src/app/render/home.rs`, `core/src/export.rs` | core recurrence/DST tests, CalDAV local-server tests, GUI unit tests 126/126 and a headless-backend launch against a seeded service (no virtual display exists in the dev container, so rendered pixels remain CI's gui-smoke job to verify), e2e range section |
 | #129 D-Bus service transport retired: socket-only service and client, tray fake re-served over socket frames, e2e oracle is `timetrack snapshot`, service/CLI drop zbus (notifications and the tray menu remain D-Bus protocols, as they are) | ADR 0017, `proto/src/lib.rs`, `service/src/main.rs`, `scripts/e2e.sh` | all crate tests green after removal, e2e 159 checks with no session bus started |
+| §16 Windows installer (#158): per-user Inno Setup package (GUI+CLI+service+tray, Start Menu/desktop/PATH, tray autostart), `%LOCALAPPDATA%\timetrack` preserved on install/upgrade/repair/uninstall, Authenticode signing via maintainer secrets with an explicit unsigned fallback | `packaging/windows/` (`timetrack.iss`, `build-installer.ps1`), `.github/workflows/release.yml` (`windows-installer`) | Linux-verifiable checks only (script structure, icon, workflow parse, checksum wiring); ISCC compile, signing, and the clean-VM install→upgrade→uninstall walkthrough stay open until a Windows run |
+| §16 macOS bundle (#159): drag-to-Applications DMG holding `TimeTrack.app` (GUI+CLI+service+tray co-located in `Contents/MacOS` for the sibling spawn, `Info.plist`, generated `.icns`, Hardened Runtime, single-arch Apple-silicon v1), `~/Library/Application Support/timetrack` preserved on install/upgrade/uninstall, Developer-ID signing + notarization + stapling via maintainer secrets with an explicit unsigned fallback | `packaging/macos/` (`Info.plist`, `TimeTrack.entitlements`, `build-bundle.sh`), `.github/workflows/release.yml` (`macos-dmg`) | Linux-verifiable checks only (plist syntax, script checks, workflow parse, checksum wiring); native build, signing, notarization, and the clean-account install→upgrade→uninstall walkthrough stay open until a macOS run |
 
 ### Specified but not built
 
@@ -586,18 +588,20 @@ specification and the implementation do not quietly diverge.
   3. ~~§17 SQLite store + automatic migration~~ — **landed**, see the
      table above. (The core's JSON `storage` module remains as the
      legacy import reader, and `Journal` remains the diff type the store
-     applies; the UUID remint is §20's separate migration, not landed.)
+     applies; the UUID remint is §20's separate migration, since landed
+     as ADR 0018.)
   4. ~~§16 portable local-socket IPC~~ — **landed** (see the table
      above), and the D-Bus service interfaces are since retired
      outright (#129, ADR 0017): the socket is the service's only wire.
   5. §16 Windows/macOS: **data dirs, CI matrix + artifacts, named-pipe
-     transport, and GUI portal gating landed** (table above); still
-     open — native save dialogs/tray per OS and installers/app bundles.
+     transport, GUI portal gating, the Windows installer (#158) and the
+     macOS app bundle (#159) landed** (table above); still open —
+     native save dialogs/tray per OS.
   6. §19: **search (#131), CSV import (#132, incl. notes), `.ics` and
      CalDAV suggestions with recurrence expansion, the GUI
      suggestions surface, and custom ranges (#133) landed** (table
-     above); still open — provider-specific APIs if CalDAV proves
-     insufficient, and a GUI editor for source registration.
+     above); provider-specific APIs **decided: do not build** (ADR
+     0019, #152); still open — a GUI editor for source registration.
 
 ### Known defects and gaps
 
@@ -721,6 +725,71 @@ with one confirmation.
   suggestions (`timetrack suggestions` lists, `confirm`/`dismiss` act)
   and a closed GUI never pauses fetching.
 
+**Landed (#149):** each source's secret lives in the native store
+(Secret Service on Linux, Credential Manager on Windows, Keychain on
+macOS) behind an injectable service seam; SQLite holds only the
+credential reference and the non-secret login name (schema v4), and
+the secret never reaches the database, logs, argv, or exports. Set and
+removal are service operations shared by the CLI
+(`source-set-credential` prompts or reads stdin, never argv;
+`source-remove-credential`) and the future GUI source editor;
+deleting a source (`source-remove`) purges its secret. A source with
+no stored credential still reads `TIMETRACK_CALDAV_PASSWORD` — the
+explicitly documented fallback for headless setups — but the moment a
+credential is stored the fallback stops applying to that source, and a
+missing entry errors instead of silently downgrading.
+
+**Landed (#150):** CalDAV account discovery resolves
+`/.well-known/caldav` and redirects, then current-user-principal and
+`calendar-home-set`, and lists the home's calendar/task collections
+with display names and supported components (`VEVENT`/`VTODO`), so
+each found URL can be registered with `source-add --kind caldav`
+instead of hand-constructed. Partial servers (no well-known, no
+principal, no home-set) fall back to listing the principal or the
+endpoint itself; auth-required servers error actionably unless a
+source's stored credential is lent (`--source`) or the headless env
+fallback applies. Every remote operation stays read-only
+(`PROPFIND`/`GET` only); direct collection URLs refresh unchanged.
+Exposed via the service, the socket protocol, and `timetrack
+source-discover` (the GUI surface is #153's).
+
+**Landed (#151):** CalDAV refresh is incremental. Each source keeps
+its sync state (sync token and/or CTag) and each fetched resource its
+validators (ETag and/or content hash) in SQLite (schema v5), and each
+CalDAV suggestion records the resource it came from. A refresh
+REPORTs `sync-collection` when the server advertises it, else probes
+the CTag (a match ends the refresh with no downloads) and lists with
+ETags plus conditional GETs. Changed resources reconcile into pending
+suggestions in place, remotely deleted ones withdraw their
+still-pending suggestions, and confirmed entries plus dismissed rows
+are never touched; a dead sync token falls back to one bounded full
+resync. Direct `.ics` file/URL refresh behavior is unchanged, and
+every remote operation stays read-only.
+
+**Decided (#152, ADR 0019):** no per-vendor Google/Microsoft
+calendar/task APIs. Evaluated against what CalDAV already covers,
+neither integration clears the §19 bar — no concrete user workflow
+with evidence outlives `.ics`/CalDAV — while each would add an OAuth
+platform, a token lifecycle, a second task-semantics mapping, and
+verification/review overhead for a read-only suggestion feed. The
+question reopens only on a concrete trigger: a provider breaks the
+CalDAV path, a user files a named workflow needing Google Tasks or
+Outlook/To Do content, or CalDAV authentication becomes unusable
+(OAuth-for-CalDAV first, then).
+
+**Landed (#153):** sources are managed without the CLI. A service
+`update-source` rewrites kind, locator, label, and project mapping
+under registration's validation (bad kind, empty locator, a CalDAV
+password in the URL, another source's identity), and removal is
+explicit: pending suggestions go with the source in the same
+transaction, decided rows stay as history, confirmed entries stay as
+tracked time, and the OS credential entry is purged; add, edit, and
+removal all announce `Changed`. The GUI gains a SOURCES section on
+Home (add/edit/refresh/remove, with a CalDAV credential badge) and a
+registration/edit dialog with no password field — CalDAV secrets stay
+in the CLI credential flows, named by an in-dialog hint. The CLI gains
+`source-update`, and the Home suggestions section is unchanged.
+
 ## 20. Sync-ready, not sync **[DECIDED — v2]**
 
 v2 ships **no sync, no account, no server** (§12) — but it stops making
@@ -737,3 +806,22 @@ sync impossible, which the v1 model was quietly doing:
 That is the whole v2 commitment: when one person's sync is designed
 later, it reconciles records that already know their identity and
 history, instead of needing a third storage migration first.
+
+**Landed (#148, ADR 0018):** entry and project ids are UUIDv4,
+lowercase hyphenated, minted only at the service/store boundary — the
+core stays randomness-free behind its `Ids` trait. A v2→v3 store
+migration remints every sequential id one way (references, suggestion
+links, and tombstones follow; already-UUID ids are untouched), and the
+legacy JSON import converges to the same UUID-only state. Wherever a
+full id is accepted, an unambiguous prefix is accepted too: exact
+wins, empty never resolves, ambiguous refuses without mutating. CSV
+import stays match-by-content, so re-importing an export is still a
+no-op.
+
+**Designed (#161, ADR 0020):** one-person sync over a user-held
+folder — one encrypted snapshot per device, per-record
+last-writer-wins on (`updated_at`, `device_id`), tombstones with
+watermark-plus-horizon compaction, source configs synced without
+secrets, offline-first with pull-before-publish recovery. Design
+only: no implementation ships yet, and the build is split into the
+follow-ups ADR 0020 names (not filed).

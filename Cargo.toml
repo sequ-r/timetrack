@@ -62,6 +62,10 @@ async-io = "2"
 # having to learn a futures crate.
 futures-lite = "2"
 anyhow = "1"
+# UUIDv4 identities for entries and projects (ADR 0018). Only the
+# service-owned boundary crates (service, store) mint them; the core
+# stays randomness-free behind its `Ids` trait.
+uuid = { version = "1", features = ["v4"] }
 
 # Upstream gpui, as published from Zed. The community fork (gpui-ce) was only
 # ever needed because the published crate carried no platform backend and had

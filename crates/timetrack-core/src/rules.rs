@@ -81,6 +81,17 @@ pub enum RuleError {
     /// to be able to say so.
     #[error("entry '{0}' was not created by a quick add, so it cannot be undone")]
     NotQuickAdd(String),
+    /// An entry id prefix matching several entries (ADR 0018).
+    ///
+    /// Its own variant rather than reusing `UnknownEntry`: the caller gave
+    /// a real prefix of real entries, and guessing which one it meant
+    /// would mutate the wrong entry. The payload is the input as given.
+    #[error("ambiguous entry id prefix '{0}'")]
+    AmbiguousEntry(String),
+    /// A project id prefix matching several projects (ADR 0018).
+    /// See [`RuleError::AmbiguousEntry`].
+    #[error("ambiguous project id prefix '{0}'")]
+    AmbiguousProject(String),
 }
 
 pub type RuleResult<T> = Result<T, RuleError>;
@@ -117,11 +128,21 @@ fn check_text(what: &str, text: &str, max_chars: usize) -> RuleResult<()> {
 }
 
 /// Source of identifiers. Kept abstract so tests can pin them.
+///
+/// Entry and project ids mint from separate methods on the one
+/// generator: production mints UUIDs for both at the service boundary
+/// (ADR 0018), while [`Counter`] keeps minting sequential ids as the
+/// deterministic test fake. The core itself stays randomness-free.
 pub trait Ids {
     fn next(&mut self) -> String;
+    fn next_project(&mut self) -> String;
 }
 
 /// Sequential ids, `e1`, `p1`, ...
+///
+/// The deterministic test fake: every rule test pins its ids through
+/// this, while production mints UUIDs at the service/store boundary
+/// (ADR 0018) and never touches this type.
 // Clone lets the service snapshot the counter before a mutation and
 // restore it if the save fails (#100).
 #[derive(Debug, Clone)]
@@ -168,20 +189,93 @@ impl Ids for Counter {
         self.next_entry += 1;
         id
     }
+
+    fn next_project(&mut self) -> String {
+        let id = format!("p{}", self.next_project);
+        self.next_project += 1;
+        id
+    }
 }
 
-/// Mints project ids from the same counter.
-pub fn next_project_id(counter: &mut Counter) -> String {
-    let id = format!("p{}", counter.next_project);
-    counter.next_project += 1;
-    id
+/// Outcome of resolving a user-supplied id against the ids a store holds.
+///
+/// Prefixes exist so UUIDs stay typeable (ADR 0018): wherever a full
+/// entry or project id is accepted, an unambiguous prefix is accepted
+/// too, and it resolves before anything is read or written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdResolution<'a> {
+    /// The full id to use: the input itself when it matches exactly, or
+    /// the one stored id it prefixes.
+    Resolved(&'a str),
+    /// Nothing equals or starts with the input — including every empty
+    /// input, which never resolves even though all strings start with it.
+    Unknown,
+    /// Several stored ids share the prefix and none equals it: the
+    /// caller refuses without mutating anything.
+    Ambiguous,
+}
+
+/// Resolve `want` against known ids: an exact match wins outright, an
+/// empty input never resolves, a prefix of exactly one id resolves to
+/// it, and a prefix of several refuses as ambiguous.
+///
+/// Pure over an iterator so every layer (rules, service, CLI) shares
+/// the one semantics; each maps [`IdResolution`] to its own errors.
+pub fn resolve_id_prefix<'a>(want: &str, ids: impl Iterator<Item = &'a str>) -> IdResolution<'a> {
+    if want.is_empty() {
+        return IdResolution::Unknown;
+    }
+    let mut candidate: Option<&'a str> = None;
+    let mut ambiguous = false;
+    for id in ids {
+        if id == want {
+            return IdResolution::Resolved(id);
+        }
+        if id.starts_with(want) {
+            if candidate.is_some() {
+                ambiguous = true;
+            } else {
+                candidate = Some(id);
+            }
+        }
+    }
+    match (candidate, ambiguous) {
+        (_, true) => IdResolution::Ambiguous,
+        (Some(id), false) => IdResolution::Resolved(id),
+        (None, false) => IdResolution::Unknown,
+    }
+}
+
+/// Resolve an entry id argument against the store, mapping the outcome
+/// to the rule error the caller reports.
+///
+/// Every rule that looks an entry up goes through here, so prefixes
+/// work uniformly and the resolved (full) id is what the rule then
+/// uses. The error payloads carry the input as given, so the caller
+/// can repeat back what was actually typed.
+pub fn resolve_entry_id(store: &Store, want: &str) -> RuleResult<String> {
+    match resolve_id_prefix(want, store.entries.iter().map(|e| e.id.as_str())) {
+        IdResolution::Resolved(id) => Ok(id.to_string()),
+        IdResolution::Unknown => Err(RuleError::UnknownEntry(want.to_string())),
+        IdResolution::Ambiguous => Err(RuleError::AmbiguousEntry(want.to_string())),
+    }
+}
+
+/// Resolve a project id argument against the store.
+/// See [`resolve_entry_id`].
+pub fn resolve_project_id(store: &Store, want: &str) -> RuleResult<String> {
+    match resolve_id_prefix(want, store.projects.iter().map(|p| p.id.as_str())) {
+        IdResolution::Resolved(id) => Ok(id.to_string()),
+        IdResolution::Unknown => Err(RuleError::UnknownProject(want.to_string())),
+        IdResolution::Ambiguous => Err(RuleError::AmbiguousProject(want.to_string())),
+    }
 }
 
 // --- projects ---------------------------------------------------------------
 
 /// Create a project. Names need not be unique in general, but an exact
 /// duplicate is almost always a double-click rather than intent.
-pub fn create_project(store: &mut Store, counter: &mut Counter, name: &str) -> RuleResult<Project> {
+pub fn create_project(store: &mut Store, ids: &mut dyn Ids, name: &str) -> RuleResult<Project> {
     let name = name.trim();
     if name.is_empty() {
         return Err(RuleError::BlankProjectName);
@@ -191,7 +285,7 @@ pub fn create_project(store: &mut Store, counter: &mut Counter, name: &str) -> R
         return Err(RuleError::DuplicateProject(name.to_string()));
     }
     let project = Project {
-        id: next_project_id(counter),
+        id: ids.next_project(),
         name: name.to_string(),
         colour: None,
         archived: false,
@@ -207,9 +301,10 @@ pub fn update_project(
     name: Option<&str>,
     colour: Option<Option<u32>>,
 ) -> RuleResult<Project> {
-    if !store.projects.iter().any(|p| p.id == id) {
-        return Err(RuleError::UnknownProject(id.to_string()));
-    }
+    // Resolve first: a prefix names its entry, and everything below
+    // (the self-exclusion in the uniqueness scan included) uses the
+    // resolved id.
+    let id = resolve_project_id(store, id)?;
     // Validate the name before taking the mutable borrow, otherwise the
     // uniqueness scan cannot also borrow `store.projects`.
     let trimmed = name.map(str::trim);
@@ -230,7 +325,7 @@ pub fn update_project(
         .projects
         .iter_mut()
         .find(|p| p.id == id)
-        .expect("checked above");
+        .expect("resolved above");
     if let Some(new_name) = trimmed {
         project.name = new_name.to_string();
     }
@@ -243,11 +338,12 @@ pub fn update_project(
 /// Archive or unarchive a project. Archiving never deletes entries and never
 /// removes it from historical totals (REQUIREMENTS §14).
 pub fn set_archived(store: &mut Store, id: &str, archived: bool) -> RuleResult<Project> {
+    let id = resolve_project_id(store, id)?;
     let project = store
         .projects
         .iter_mut()
         .find(|p| p.id == id)
-        .ok_or_else(|| RuleError::UnknownProject(id.to_string()))?;
+        .expect("resolved above");
     project.archived = archived;
     Ok(project.clone())
 }
@@ -255,17 +351,18 @@ pub fn set_archived(store: &mut Store, id: &str, archived: bool) -> RuleResult<P
 /// Delete a project. Refused when it is the last one, or when it still has
 /// entries — deleting a project with history would silently orphan them.
 pub fn delete_project(store: &mut Store, id: &str) -> RuleResult<Project> {
+    let id = resolve_project_id(store, id)?;
     if store.projects.len() <= 1 {
         return Err(RuleError::LastProject);
     }
     if store.entries.iter().any(|e| e.project_id == id) {
-        return Err(RuleError::ProjectHasEntries(id.to_string()));
+        return Err(RuleError::ProjectHasEntries(id.clone()));
     }
     let idx = store
         .projects
         .iter()
         .position(|p| p.id == id)
-        .ok_or_else(|| RuleError::UnknownProject(id.to_string()))?;
+        .expect("resolved above");
     Ok(store.projects.remove(idx))
 }
 
@@ -306,9 +403,7 @@ fn build_entry(
     ended_at: i64,
     source: EntrySource,
 ) -> RuleResult<Entry> {
-    if store.project(project_id).is_none() {
-        return Err(RuleError::UnknownProject(project_id.to_string()));
-    }
+    let project_id = resolve_project_id(store, project_id)?;
     check_interval(started_at, ended_at)?;
     if ended_at < started_at {
         return Err(RuleError::NegativeDuration);
@@ -320,7 +415,7 @@ fn build_entry(
     check_text("description", description, MAX_DESCRIPTION_CHARS)?;
     Ok(Entry {
         id: ids.next(),
-        project_id: project_id.to_string(),
+        project_id,
         description: description.to_string(),
         started_at,
         ended_at,
@@ -441,9 +536,8 @@ pub fn set_times(store: &mut Store, id: &str, started_at: i64, ended_at: i64) ->
     if ended_at < started_at {
         return Err(RuleError::NegativeDuration);
     }
-    let entry = store
-        .get_mut(id)
-        .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
+    let id = resolve_entry_id(store, id)?;
+    let entry = store.get_mut(&id).expect("resolved above");
     entry.started_at = started_at;
     entry.ended_at = ended_at;
     Ok(entry.clone())
@@ -451,13 +545,10 @@ pub fn set_times(store: &mut Store, id: &str, started_at: i64, ended_at: i64) ->
 
 /// Reassign an entry to another project.
 pub fn set_project(store: &mut Store, id: &str, project_id: &str) -> RuleResult<Entry> {
-    if store.project(project_id).is_none() {
-        return Err(RuleError::UnknownProject(project_id.to_string()));
-    }
-    let entry = store
-        .get_mut(id)
-        .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
-    entry.project_id = project_id.to_string();
+    let project_id = resolve_project_id(store, project_id)?;
+    let id = resolve_entry_id(store, id)?;
+    let entry = store.get_mut(&id).expect("resolved above");
+    entry.project_id = project_id;
     Ok(entry.clone())
 }
 
@@ -480,9 +571,8 @@ pub fn set_text(
     if let Some(Some(n)) = note {
         check_text("note", n, MAX_NOTE_CHARS)?;
     }
-    let entry = store
-        .get_mut(id)
-        .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
+    let id = resolve_entry_id(store, id)?;
+    let entry = store.get_mut(&id).expect("resolved above");
     if let Some(d) = description {
         entry.description = d.to_string();
     }
@@ -494,11 +584,12 @@ pub fn set_text(
 
 /// Delete an entry outright. Distinct from shortening, which never deletes.
 pub fn delete_entry(store: &mut Store, id: &str) -> RuleResult<Entry> {
+    let id = resolve_entry_id(store, id)?;
     let idx = store
         .entries
         .iter()
         .position(|e| e.id == id)
-        .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
+        .expect("resolved above");
     Ok(store.entries.remove(idx))
 }
 
@@ -517,10 +608,8 @@ pub fn split_entry(
     id: &str,
     at_ms: i64,
 ) -> RuleResult<(Entry, Entry)> {
-    let original = store
-        .get(id)
-        .cloned()
-        .ok_or_else(|| RuleError::UnknownEntry(id.to_string()))?;
+    let id = resolve_entry_id(store, id)?;
+    let original = store.get(&id).cloned().expect("resolved above");
     // The split point becomes an endpoint of both halves, so it is held to
     // the same range as any other endpoint (#97).
     check_instant(at_ms)?;
@@ -548,7 +637,7 @@ pub fn split_entry(
         started_at: at_ms,
         ..original
     };
-    *store.get_mut(id).expect("checked above") = first.clone();
+    *store.get_mut(&id).expect("resolved above") = first.clone();
     store.entries.push(second.clone());
     Ok((first, second))
 }
@@ -577,14 +666,24 @@ pub fn merge_entries(store: &mut Store, ids: &[String]) -> RuleResult<Entry> {
             )));
         }
     }
-    let mut chosen = Vec::with_capacity(ids.len());
+    // Resolve each spelling before the merge reads anything: a prefix
+    // names its entry, and two spellings of one entry (a full id plus
+    // its own prefix) are still "listed twice".
+    let mut resolved = Vec::with_capacity(ids.len());
     for id in ids {
-        chosen.push(
-            store
-                .get(id)
-                .cloned()
-                .ok_or_else(|| RuleError::UnknownEntry(id.clone()))?,
-        );
+        resolved.push(resolve_entry_id(store, id)?);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(resolved.len());
+    for id in &resolved {
+        if !seen.insert(id) {
+            return Err(RuleError::InvalidMerge(format!(
+                "entry '{id}' is listed twice"
+            )));
+        }
+    }
+    let mut chosen = Vec::with_capacity(resolved.len());
+    for id in &resolved {
+        chosen.push(store.get(id).cloned().expect("resolved above"));
     }
     if chosen.iter().any(|e| e.project_id != chosen[0].project_id) {
         return Err(RuleError::InvalidMerge(
@@ -1365,5 +1464,217 @@ mod tests {
         .unwrap();
         let flagged = days_exceeding_24h(&s, &rome);
         assert_eq!(flagged, vec![rome.day_of(base)]);
+    }
+
+    // --- id prefix resolution (ADR 0018) ---
+
+    #[test]
+    fn resolve_id_prefix_exact_wins_empty_never_resolves() {
+        use IdResolution::*;
+        let ids = ["abc", "abd", "xyz"];
+        let resolve = |want: &str| resolve_id_prefix(want, ids.iter().copied());
+        assert_eq!(resolve("abc"), Resolved("abc"));
+        assert_eq!(resolve("ab"), Ambiguous);
+        assert_eq!(resolve("x"), Resolved("xyz"));
+        assert_eq!(resolve("nope"), Unknown);
+        assert_eq!(resolve(""), Unknown, "empty never resolves");
+        assert_eq!(
+            resolve("abcdef"),
+            Unknown,
+            "longer than any id is unknown, not a prefix"
+        );
+    }
+
+    #[test]
+    fn resolve_id_prefix_exact_wins_over_prefix_matches() {
+        // "ab" is both an exact id and a prefix of "abc": the exact id
+        // wins rather than refusing as ambiguous.
+        use IdResolution::*;
+        let ids = ["abc", "ab"];
+        assert_eq!(resolve_id_prefix("ab", ids.iter().copied()), Resolved("ab"));
+    }
+
+    #[test]
+    fn entry_lookups_accept_a_unique_prefix_and_use_the_resolved_id() {
+        let mut s = Store::default();
+        s.projects.push(Project {
+            id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        s.entries.push(Entry {
+            id: "bbbbbbbb-0000-4000-8000-000000000001".into(),
+            project_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            description: "review".into(),
+            started_at: 0,
+            ended_at: 1_000,
+            source: EntrySource::Manual,
+            note: None,
+        });
+        // Every entry lookup resolves the prefix and returns the entry
+        // under its full id.
+        let e = set_times(&mut s, "bbbbbbbb-0000", 0, 2_000).unwrap();
+        assert_eq!(e.id, "bbbbbbbb-0000-4000-8000-000000000001");
+        assert_eq!(e.ended_at, 2_000);
+        let e = set_text(&mut s, "bbbbbbbb", Some("edited"), None).unwrap();
+        assert_eq!(e.description, "edited");
+        let (a, b) = split_entry(&mut s, &mut Counter::default(), "bbbbbbbb", 1_000).unwrap();
+        assert_eq!(a.id, "bbbbbbbb-0000-4000-8000-000000000001");
+        assert_eq!(b.id, "e1", "the test fake still mints sequentially");
+        let merged = merge_entries(&mut s, &[a.id.clone(), "e".to_string()]).unwrap();
+        assert_eq!(merged.id, a.id);
+        // Creation attributes to the resolved project, not the prefix.
+        let mut c = Counter::default();
+        let e = create_entry(&mut s, &mut c, "aaaaaaaa-0000", "new", 0, 1).unwrap();
+        assert_eq!(e.project_id, "aaaaaaaa-0000-4000-8000-000000000001");
+        delete_entry(&mut s, "bbbbbbbb").unwrap();
+        assert!(s.get("bbbbbbbb-0000-4000-8000-000000000001").is_none());
+    }
+
+    #[test]
+    fn project_lookups_accept_a_unique_prefix() {
+        let mut s = Store::default();
+        s.projects.push(Project {
+            id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+            name: "Work".into(),
+            colour: None,
+            archived: false,
+        });
+        s.projects.push(Project {
+            id: "cccccccc-0000-4000-8000-000000000001".into(),
+            name: "Home".into(),
+            colour: None,
+            archived: false,
+        });
+        let p = update_project(&mut s, "aaaaaaaa", Some("Deep Work"), None).unwrap();
+        assert_eq!(p.id, "aaaaaaaa-0000-4000-8000-000000000001");
+        assert_eq!(p.name, "Deep Work");
+        set_archived(&mut s, "aaaaaaaa", true).unwrap();
+        assert!(
+            s.project("aaaaaaaa-0000-4000-8000-000000000001")
+                .unwrap()
+                .archived
+        );
+        delete_project(&mut s, "aaaaaaaa").unwrap();
+        assert_eq!(s.projects.len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_prefixes_refuse_without_mutating() {
+        let mut s = Store::default();
+        for (pid, name) in [
+            ("aaaaaaaa-0000-4000-8000-000000000001", "Work"),
+            ("aaaaaaaa-0000-4000-8000-000000000002", "Home"),
+        ] {
+            s.projects.push(Project {
+                id: pid.into(),
+                name: name.into(),
+                colour: None,
+                archived: false,
+            });
+        }
+        for (eid, pid) in [
+            (
+                "bbbbbbbb-0000-4000-8000-000000000001",
+                "aaaaaaaa-0000-4000-8000-000000000001",
+            ),
+            (
+                "bbbbbbbb-0000-4000-8000-000000000002",
+                "aaaaaaaa-0000-4000-8000-000000000002",
+            ),
+        ] {
+            s.entries.push(Entry {
+                id: eid.into(),
+                project_id: pid.into(),
+                description: String::new(),
+                started_at: 0,
+                ended_at: 1,
+                source: EntrySource::Manual,
+                note: None,
+            });
+        }
+        let before = s.clone();
+        let mut c = Counter::default();
+        assert_eq!(
+            set_times(&mut s, "bbbbbbbb", 0, 1).unwrap_err(),
+            RuleError::AmbiguousEntry("bbbbbbbb".into())
+        );
+        assert_eq!(
+            delete_entry(&mut s, "bbbbbbbb").unwrap_err(),
+            RuleError::AmbiguousEntry("bbbbbbbb".into())
+        );
+        assert_eq!(
+            update_project(&mut s, "aaaaaaaa", Some("X"), None).unwrap_err(),
+            RuleError::AmbiguousProject("aaaaaaaa".into())
+        );
+        assert_eq!(
+            create_entry(&mut s, &mut c, "aaaaaaaa", "", 0, 1).unwrap_err(),
+            RuleError::AmbiguousProject("aaaaaaaa".into())
+        );
+        assert_eq!(
+            merge_entries(
+                &mut s,
+                &[
+                    "bbbbbbbb-0000-4000-8000-000000000001".to_string(),
+                    "bbbbbbbb".to_string()
+                ]
+            )
+            .unwrap_err(),
+            RuleError::AmbiguousEntry("bbbbbbbb".into())
+        );
+        assert_eq!(s, before, "ambiguous refusals mutate nothing");
+        assert_eq!(c.next_entry, 1, "a refused create consumes no id");
+    }
+
+    #[test]
+    fn merge_treats_two_spellings_of_one_entry_as_listed_twice() {
+        let mut s = store_with_project();
+        let mut c = ids();
+        let e = create_entry(&mut s, &mut c, "p1", "", 0, 1_000).unwrap();
+        // A full id plus its own unique prefix is the same entry twice.
+        assert_eq!(
+            merge_entries(&mut s, &[e.id.clone(), e.id[..1].to_string()]).unwrap_err(),
+            RuleError::InvalidMerge(format!("entry '{}' is listed twice", e.id))
+        );
+        // ...while two spellings of two entries merge normally.
+        let other = create_entry(&mut s, &mut c, "p1", "", 0, 1_000).unwrap();
+        let merged = merge_entries(&mut s, &[e.id.clone(), other.id.clone()]).unwrap();
+        assert_eq!(merged.id, e.id);
+    }
+
+    #[test]
+    fn unknown_prefixes_keep_the_unknown_errors_with_the_input() {
+        let mut s = store_with_project();
+        let mut c = ids();
+        assert_eq!(
+            set_times(&mut s, "zzz", 0, 1).unwrap_err(),
+            RuleError::UnknownEntry("zzz".into())
+        );
+        assert_eq!(
+            update_project(&mut s, "zzz", Some("X"), None).unwrap_err(),
+            RuleError::UnknownProject("zzz".into())
+        );
+        assert_eq!(
+            set_times(&mut s, "", 0, 1).unwrap_err(),
+            RuleError::UnknownEntry(String::new()),
+            "empty never resolves, even with entries present"
+        );
+        create_entry(&mut s, &mut c, "p1", "", 0, 1).unwrap();
+        assert_eq!(
+            delete_entry(&mut s, "").unwrap_err(),
+            RuleError::UnknownEntry(String::new())
+        );
+    }
+
+    #[test]
+    fn counter_mints_sequential_entry_and_project_ids() {
+        // The deterministic fake behind every rule test: entries from
+        // `next`, projects from `next_project`, each on its own counter.
+        let mut c = Counter::default();
+        assert_eq!(c.next(), "e1");
+        assert_eq!(c.next_project(), "p1");
+        assert_eq!(c.next(), "e2");
+        assert_eq!(c.next_project(), "p2");
     }
 }

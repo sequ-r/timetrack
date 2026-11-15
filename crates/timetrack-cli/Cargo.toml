@@ -18,3 +18,4 @@ serde_json = { workspace = true }
 async-io = { workspace = true }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+rpassword = "7.5.5"

@@ -72,8 +72,12 @@ pub fn parse_ics(text: &str, tz: &Tz) -> Result<IcsParse, NotIcs> {
 /// 10:00 across DST. The supported rule subset covers what calendar
 /// UIs actually emit: `FREQ` daily/weekly/monthly/yearly, `INTERVAL`,
 /// `COUNT`, `UNTIL`, `BYDAY` (with month ordinals), `BYMONTHDAY`,
-/// `BYMONTH`, and `EXDATE` exclusions. Anything richer degrades to
-/// the occurrences this subset generates, never to a failed fetch.
+/// `BYMONTH`, `WKST=MO` (the default week start), and `EXDATE`
+/// exclusions. Anything else in the rule — another `FREQ`, `BYSETPOS`,
+/// `BYHOUR`, `BYMINUTE`, `BYSECOND`, `BYYEARDAY`, `BYWEEKNO`, a
+/// non-Monday `WKST`, an unknown `BY*` part, or a malformed token —
+/// refuses the whole component into [`IcsParse::skipped`], never
+/// silently mis-expanding an ignored rule into wrong occurrences.
 pub fn parse_ics_in_window(
     text: &str,
     tz: &Tz,
@@ -249,7 +253,10 @@ fn items_from_props(
             }
         }
     }
-    let starts = expand_recurrence(&rrule.value, started, &zone, until_ms);
+    // An unsupported or malformed rule refuses the component (it
+    // counts as skipped by the caller) instead of expanding to
+    // occurrences the rule never described.
+    let starts = expand_recurrence(&rrule.value, started, &zone, until_ms)?;
     Some(
         starts
             .into_iter()
@@ -327,8 +334,16 @@ fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
                 };
                 have_freq = true;
             }
-            "INTERVAL" => rule.interval = val.parse::<i64>().ok().filter(|n| *n >= 1)?,
-            "COUNT" => rule.count = Some(val.parse().ok()?),
+            "INTERVAL" => {
+                rule.interval = val.trim().parse::<i64>().ok().filter(|n| *n >= 1)?;
+            }
+            "COUNT" => {
+                let n: usize = val.trim().parse().ok()?;
+                if n < 1 {
+                    return None;
+                }
+                rule.count = Some(n);
+            }
             "UNTIL" => {
                 let v = val.trim();
                 if let Some((date, _)) = v.split_once('T') {
@@ -343,13 +358,16 @@ fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
                     let day = format!("{}-{}-{}", &v[0..4], &v[4..6], &v[6..8]);
                     let midday = crate::parse_anchor_day(&day, "until", zone).ok()?;
                     rule.until_day = Some(zone.day_of(midday));
+                } else {
+                    // Neither a DATE-TIME nor a DATE: malformed.
+                    return None;
                 }
             }
             "BYDAY" => {
                 for token in val.split(',') {
                     let token = token.trim();
                     if token.len() < 2 {
-                        continue;
+                        return None;
                     }
                     let (ord, wd) = token.split_at(token.len() - 2);
                     let weekday = match wd.to_ascii_uppercase().as_str() {
@@ -360,24 +378,62 @@ fn parse_rrule(value: &str, zone: &Tz) -> Option<RRule> {
                         "FR" => 4,
                         "SA" => 5,
                         "SU" => 6,
-                        _ => continue,
+                        _ => return None,
                     };
-                    rule.byday.push((ord.parse::<i64>().ok(), weekday));
+                    let ordinal = if ord.is_empty() {
+                        None
+                    } else {
+                        let n: i64 = ord.parse().ok()?;
+                        // RFC 5545 ordinals run 1..=53; zero never
+                        // matches and out-of-range never occurs.
+                        if n == 0 || n.abs() > 53 {
+                            return None;
+                        }
+                        Some(n)
+                    };
+                    rule.byday.push((ordinal, weekday));
                 }
             }
             "BYMONTHDAY" => {
-                rule.bymonthday = val
-                    .split(',')
-                    .filter_map(|n| n.trim().parse().ok())
-                    .collect();
+                let mut days = Vec::new();
+                for n in val.split(',') {
+                    let m: i64 = n.trim().parse().ok()?;
+                    if m == 0 || m.abs() > 31 {
+                        return None;
+                    }
+                    days.push(m);
+                }
+                rule.bymonthday = days;
             }
             "BYMONTH" => {
-                rule.bymonth = val
-                    .split(',')
-                    .filter_map(|n| n.trim().parse().ok())
-                    .collect();
+                let mut months = Vec::new();
+                for n in val.split(',') {
+                    let m: u32 = n.trim().parse().ok()?;
+                    if !(1..=12).contains(&m) {
+                        return None;
+                    }
+                    months.push(m);
+                }
+                rule.bymonth = months;
             }
-            _ => {}
+            // Supported explicitly as "refused": the subset has no
+            // expansion for these, so their presence vetoes the rule.
+            "BYSETPOS" | "BYHOUR" | "BYMINUTE" | "BYSECOND" | "BYYEARDAY" | "BYWEEKNO" => {
+                return None;
+            }
+            "WKST" => {
+                // Weekly arithmetic assumes Monday week starts.
+                if !val.trim().eq_ignore_ascii_case("MO") {
+                    return None;
+                }
+            }
+            other => {
+                // Unknown BY* parts may silently change the set the
+                // rule describes; refuse those, ignore the rest.
+                if other.starts_with("BY") {
+                    return None;
+                }
+            }
         }
     }
     have_freq.then_some(rule)
@@ -438,10 +494,8 @@ fn month_candidates(rule: &RRule, year: i64, month: u32, base_day: i64, zone: &T
 /// All occurrence starts for a rule, ascending, capped. The base
 /// occurrence is in the zone's wall clock (`day_start + time-of-day`),
 /// so DST transitions move the UTC instant, not the shown time.
-fn expand_recurrence(rule_text: &str, started: i64, zone: &Tz, until_ms: i64) -> Vec<i64> {
-    let Some(rule) = parse_rrule(rule_text, zone) else {
-        return vec![started];
-    };
+fn expand_recurrence(rule_text: &str, started: i64, zone: &Tz, until_ms: i64) -> Option<Vec<i64>> {
+    let rule = parse_rrule(rule_text, zone)?;
     let base_day = zone.day_of(started);
     let tod = started - zone.day_start(base_day);
     let mut out: Vec<i64> = Vec::new();
@@ -564,7 +618,7 @@ fn expand_recurrence(rule_text: &str, started: i64, zone: &Tz, until_ms: i64) ->
     }
     out.sort_unstable();
     out.dedup();
-    out
+    Some(out)
 }
 
 /// One DATE-TIME property to an instant. Date-only values (all-day
@@ -712,6 +766,127 @@ mod tests {
             7 * 86_400_000 - 3_600_000
         );
         assert_eq!(out.items[0].ended_at - out.items[0].started_at, 3_600_000);
+    }
+
+    /// RFC 5545 golden fixtures for the supported subset: every
+    /// occurrence is an absolute instant, so a zone or arithmetic
+    /// regression moves a number here, not just a delta.
+    #[test]
+    fn supported_subset_matches_rfc5545_golden_dates() {
+        // All starts are 10:00Z on the named day; each event lasts an hour.
+        let text = "BEGIN:VCALENDAR\n\
+            BEGIN:VEVENT\nUID:daily-interval\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=DAILY;INTERVAL=2;COUNT=3\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:weekly-byday\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=WEEKLY;BYDAY=TU,TH;COUNT=4\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:weekly-wkst-mo\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=WEEKLY;WKST=MO;BYDAY=MO;COUNT=2\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:monthly-bymonthday\nDTSTART:20260115T100000Z\nDTEND:20260115T110000Z\nRRULE:FREQ=MONTHLY;BYMONTHDAY=15,-1;COUNT=4\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:monthly-ordinal\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=MONTHLY;BYDAY=1MO;COUNT=3\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:yearly\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=YEARLY;BYMONTH=1;BYMONTHDAY=5;COUNT=2\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:until-date\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=DAILY;UNTIL=20260107\nEND:VEVENT\n\
+            BEGIN:VEVENT\nUID:until-instant\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:FREQ=DAILY;UNTIL=20260106T100000Z\nEND:VEVENT\n\
+            END:VCALENDAR\n";
+        let out = parse_ics(text, &Tz::utc()).unwrap();
+        assert_eq!(out.skipped, 0, "{out:?}");
+        let starts = |uid: &str| -> Vec<i64> {
+            let mut v: Vec<i64> = out
+                .items
+                .iter()
+                .filter(|i| i.uid == uid)
+                .map(|i| i.started_at)
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        // Every other day: Jan 5, 7, 9.
+        assert_eq!(
+            starts("daily-interval"),
+            vec![1_767_607_200_000, 1_767_780_000_000, 1_767_952_800_000]
+        );
+        // Tue+Thu from Mon Jan 5: Jan 6, 8, 13, 15 (the base Monday
+        // itself is not in the BYDAY set).
+        assert_eq!(
+            starts("weekly-byday"),
+            vec![
+                1_767_693_600_000,
+                1_767_866_400_000,
+                1_768_298_400_000,
+                1_768_471_200_000
+            ]
+        );
+        // An explicit default WKST=MO still expands: Jan 5 and 12.
+        assert_eq!(
+            starts("weekly-wkst-mo"),
+            vec![1_767_607_200_000, 1_768_212_000_000]
+        );
+        // 15th and last day: Jan 15, Jan 31, Feb 15, Feb 28 (2026 is
+        // not a leap year).
+        assert_eq!(
+            starts("monthly-bymonthday"),
+            vec![
+                1_768_471_200_000,
+                1_769_853_600_000,
+                1_771_149_600_000,
+                1_772_272_800_000
+            ]
+        );
+        // First Mondays: Jan 5, Feb 2, Mar 2.
+        assert_eq!(
+            starts("monthly-ordinal"),
+            vec![1_767_607_200_000, 1_770_026_400_000, 1_772_445_600_000]
+        );
+        // Same month-day next year.
+        assert_eq!(starts("yearly"), vec![1_767_607_200_000, 1_799_143_200_000]);
+        // Date UNTIL is inclusive: Jan 5, 6, 7.
+        assert_eq!(
+            starts("until-date"),
+            vec![1_767_607_200_000, 1_767_693_600_000, 1_767_780_000_000]
+        );
+        // Instant UNTIL is inclusive: Jan 5, 6.
+        assert_eq!(
+            starts("until-instant"),
+            vec![1_767_607_200_000, 1_767_693_600_000]
+        );
+        for item in &out.items {
+            assert!(item.recurring, "{item:?}");
+            assert_eq!(item.ended_at - item.started_at, 3_600_000, "{item:?}");
+        }
+    }
+
+    /// Unsupported or malformed rules refuse the component into
+    /// `skipped` instead of expanding wrong occurrences.
+    #[test]
+    fn unsupported_rrule_parts_refuse_the_component() {
+        let rules = [
+            "FREQ=HOURLY;COUNT=2",
+            "FREQ=MINUTELY;COUNT=2",
+            "FREQ=SECONDLY;COUNT=2",
+            "FREQ=WEEKLY;BYDAY=MO;COUNT=2;BYSETPOS=1",
+            "FREQ=DAILY;COUNT=2;BYHOUR=10",
+            "FREQ=DAILY;COUNT=2;BYMINUTE=0",
+            "FREQ=DAILY;COUNT=2;BYSECOND=0",
+            "FREQ=YEARLY;COUNT=2;BYYEARDAY=32",
+            "FREQ=YEARLY;COUNT=2;BYWEEKNO=3",
+            "FREQ=WEEKLY;BYDAY=MO;COUNT=2;WKST=SU",
+            "FREQ=DAILY;COUNT=2;BYEASTER=1",
+            "FREQ=WEEKLY;BYDAY=XX;COUNT=2",
+            "FREQ=MONTHLY;BYDAY=0MO;COUNT=2",
+            "FREQ=YEARLY;BYMONTH=13;COUNT=2",
+            "FREQ=MONTHLY;BYMONTHDAY=0;COUNT=2",
+            "FREQ=MONTHLY;BYMONTHDAY=xx;COUNT=2",
+            "FREQ=DAILY;UNTIL=soon",
+            "FREQ=DAILY;INTERVAL=0;COUNT=2",
+            "FREQ=DAILY;COUNT=0",
+            "FREQ=DAILY;COUNT=lots",
+        ];
+        let mut text = String::from("BEGIN:VCALENDAR\n");
+        for (n, rule) in rules.iter().enumerate() {
+            text.push_str(&format!(
+                "BEGIN:VEVENT\nUID:bad{n}@x\nDTSTART:20260105T100000Z\nDTEND:20260105T110000Z\nRRULE:{rule}\nEND:VEVENT\n"
+            ));
+        }
+        text.push_str("END:VCALENDAR\n");
+        let out = parse_ics(&text, &Tz::utc()).unwrap();
+        assert_eq!(out.items.len(), 0, "{out:?}");
+        assert_eq!(out.skipped, rules.len(), "{out:?}");
     }
 
     #[test]

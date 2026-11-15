@@ -18,42 +18,42 @@ use timetrack_proto::Snapshot;
 /// "More projects". Tray menus must stay short; the aggregates behind them
 /// still cover every project -- here it is the menu, not the data, that is
 /// capped.
-pub(crate) const MAX_PROJECTS: usize = 8;
+pub const MAX_PROJECTS: usize = 8;
 
 /// One unarchived project as the menu sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectItem {
-    pub(crate) id: String,
-    pub(crate) name: String,
+pub struct ProjectItem {
+    pub id: String,
+    pub name: String,
     /// This ISO week's total, from the service aggregate -- never re-summed
     /// from entries, which may carry only recent ones.
-    pub(crate) week_ms: i64,
+    pub week_ms: i64,
     /// The entry the delete row would remove: the most recent one for this
     /// project in the snapshot (tray-7, #11).
-    pub(crate) last_entry: Option<LastEntry>,
+    pub last_entry: Option<LastEntry>,
 }
 
 /// The most recent entry for a project: its id plus its duration for the
 /// confirm row. The snapshot arrives newest-first, so the first match per
 /// project is the target.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LastEntry {
-    pub(crate) id: String,
-    pub(crate) duration_ms: i64,
+pub struct LastEntry {
+    pub id: String,
+    pub duration_ms: i64,
 }
 
 /// What the menu shows. Compared by value each tick so the item only
 /// rebuilds (and the host only re-renders) when something actually changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct MenuModel {
-    pub(crate) visible: Vec<ProjectItem>,
-    pub(crate) overflow: Vec<ProjectItem>,
+pub struct MenuModel {
+    pub visible: Vec<ProjectItem>,
+    pub overflow: Vec<ProjectItem>,
 }
 
 /// Build the menu model from a snapshot. Archived projects are filtered out
 /// of the menu but stay in the totals (REQUIREMENTS §14); beyond
 /// `MAX_PROJECTS` the remainder moves under an overflow submenu.
-pub(crate) fn build_menu_model(snapshot: &Snapshot) -> MenuModel {
+pub fn build_menu_model(snapshot: &Snapshot) -> MenuModel {
     let mut active: Vec<ProjectItem> = snapshot
         .projects
         .iter()

@@ -47,3 +47,12 @@ url = "2"
 version = "0.13"
 default-features = false
 features = ["async-io", "file_chooser"]
+
+# Native save dialogs on Windows and macOS (#154): rfd wraps the OS save
+# panel (IFileSaveDialog / NSSavePanel) and marshals to the main thread
+# itself on macOS, so the blocking call runs on the export's own thread
+# with no async runtime involved — and no tokio anywhere (see the
+# workspace manifest). Linux keeps the portal above.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies.rfd]
+version = "0.18"
+default-features = false
