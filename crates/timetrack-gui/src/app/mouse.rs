@@ -36,10 +36,11 @@ use super::textline::{self, Caret};
 
 /// A text field the mouse can place the caret in (#127): the entry
 /// dialog's three text rows, the two single-field prompts, the source
-/// dialog's two text rows (#153), the export anchor day and the two
-/// range days. The entry project row, the source kind/project rows,
-/// the entries filter query (#131) and the recolour hex prompt have no
-/// caret, so they are not fields here.
+/// dialog's locator/label/user-name rows (#153), the export anchor day
+/// and the two range days. The entry project row, the source
+/// kind/project rows, the entries filter query (#131) and the
+/// recolour hex prompt have no caret, so they are not fields here;
+/// the source password row is masked, so it only takes focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MouseField {
     Entry(DialogField),
@@ -278,10 +279,17 @@ impl TimetrackView {
             }
             MouseField::Source(want) => {
                 let dlg = self.source_dialog.as_ref()?;
+                if !dlg.field_applies(want) {
+                    return None;
+                }
                 match want {
-                    SourceField::Kind | SourceField::Project => None,
+                    SourceField::Kind
+                    | SourceField::Project
+                    | SourceField::Secret
+                    | SourceField::RemoveCredential => None,
                     SourceField::Locator => Some((&dlg.locator, &dlg.caret)),
                     SourceField::Label => Some((&dlg.label, &dlg.caret)),
+                    SourceField::Username => Some((&dlg.username, &dlg.caret)),
                 }
             }
             MouseField::Project => {
@@ -338,7 +346,14 @@ impl TimetrackView {
             fields.push(MouseField::Split);
         }
         if self.source_dialog.is_some() {
-            fields.extend([SourceField::Locator, SourceField::Label].map(MouseField::Source));
+            fields.extend(
+                [
+                    SourceField::Locator,
+                    SourceField::Label,
+                    SourceField::Username,
+                ]
+                .map(MouseField::Source),
+            );
         }
         if self.export_picker.is_active() && !self.export_picker.is_range() {
             fields.push(MouseField::Anchor);
@@ -374,7 +389,10 @@ impl TimetrackView {
         }
         if let Some(dlg) = self.source_dialog.as_ref() {
             return match dlg.field {
-                SourceField::Kind | SourceField::Project => None,
+                SourceField::Kind
+                | SourceField::Project
+                | SourceField::Secret
+                | SourceField::RemoveCredential => None,
                 field => Some(MouseField::Source(field)),
             };
         }

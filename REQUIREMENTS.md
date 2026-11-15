@@ -786,8 +786,10 @@ transaction, decided rows stay as history, confirmed entries stay as
 tracked time, and the OS credential entry is purged; add, edit, and
 removal all announce `Changed`. The GUI gains a SOURCES section on
 Home (add/edit/refresh/remove, with a CalDAV credential badge) and a
-registration/edit dialog with no password field — CalDAV secrets stay
-in the CLI credential flows, named by an in-dialog hint. The CLI gains
+registration/edit dialog whose CalDAV credential rows — a login name
+and a masked password, plus a remove toggle for a stored secret —
+send the secret through the #149 service operations into the OS
+credential store, so setup finishes without the CLI. The CLI gains
 `source-update`, and the Home suggestions section is unchanged.
 
 ## 20. Sync-ready, not sync **[DECIDED — v2]**

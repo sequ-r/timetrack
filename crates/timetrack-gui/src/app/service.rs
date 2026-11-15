@@ -15,6 +15,7 @@
 //! context, and zbus' `spawn_blocking` panics there.
 
 use super::REFRESH;
+use super::dialogs::source::CredentialSave;
 use super::export::picker::export_period_label;
 use super::export::save::{
     default_export_path, default_export_range_path, export_anchor_for_save, export_range_period_id,
@@ -247,21 +248,26 @@ pub(super) enum Action {
     /// Dismiss a suggestion for good.
     DismissSuggestion(String),
     /// Register an external source (#153). The service validates and
-    /// derives an empty label from the locator, as for the CLI.
+    /// derives an empty label from the locator, as for the CLI. A
+    /// credential set follows on the new source's id, here on the
+    /// service thread, so CalDAV setup finishes in one save and the
+    /// secret goes straight to the OS store (#149).
     AddSource {
         kind: String,
         locator: String,
         project_id: Option<String>,
         label: String,
+        credential: CredentialSave,
     },
     /// Rewrite a source (#153): the dialog's full new state, replaced
-    /// wholesale on the wire.
+    /// wholesale on the wire, with its credential change applied after.
     UpdateSource {
         id: String,
         kind: String,
         locator: String,
         project_id: Option<String>,
         label: String,
+        credential: CredentialSave,
     },
     /// Delete a source, its pending suggestions, and its stored secret.
     /// Decided suggestions and confirmed entries stay (#153).
@@ -600,14 +606,23 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                             locator,
                             project_id,
                             label,
+                            credential,
                         }) => {
-                            report(
-                                &tx,
-                                client
-                                    .add_source(&kind, &locator, project_id.as_deref(), &label)
-                                    .await
-                                    .map(|_| ()),
-                            );
+                            // The credential needs the new id, so the two
+                            // calls chain here. If the second refuses
+                            // (a locked OS store), the source stands and
+                            // the refusal reports typed — the row's
+                            // "no credential" badge shows the gap.
+                            let outcome = match client
+                                .add_source(&kind, &locator, project_id.as_deref(), &label)
+                                .await
+                            {
+                                Ok(created) => {
+                                    apply_credential(&client, &created.id, &credential).await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            report(&tx, outcome);
                         }
                         Ok(Action::UpdateSource {
                             id,
@@ -615,20 +630,16 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                             locator,
                             project_id,
                             label,
+                            credential,
                         }) => {
-                            report(
-                                &tx,
-                                client
-                                    .update_source(
-                                        &id,
-                                        &kind,
-                                        &locator,
-                                        project_id.as_deref(),
-                                        &label,
-                                    )
-                                    .await
-                                    .map(|_| ()),
-                            );
+                            let outcome = match client
+                                .update_source(&id, &kind, &locator, project_id.as_deref(), &label)
+                                .await
+                            {
+                                Ok(_) => apply_credential(&client, &id, &credential).await,
+                                Err(e) => Err(e),
+                            };
+                            report(&tx, outcome);
                         }
                         Ok(Action::RemoveSource(id)) => {
                             report(&tx, client.remove_source(&id).await.map(|_| ()));
@@ -710,6 +721,24 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
     (snapshot_rx, rx, action_tx)
 }
 
+/// Apply a source save's credential half (#153): the secret travels
+/// as a redacted `SecretString` on the socket and lands in the OS
+/// credential store service-side (#149) — SQLite never sees it.
+async fn apply_credential(
+    client: &timetrack_proto::Client,
+    id: &str,
+    credential: &CredentialSave,
+) -> std::result::Result<(), ClientError> {
+    match credential {
+        CredentialSave::Keep => Ok(()),
+        CredentialSave::Set { username, secret } => client
+            .set_source_credential(id, username, secret.expose())
+            .await
+            .map(|_| ()),
+        CredentialSave::Remove => client.remove_source_credential(id).await.map(|_| ()),
+    }
+}
+
 /// Forward a command outcome to the UI, keeping the error typed.
 ///
 /// The kind travels with the text so the view never has to recognise a
@@ -775,6 +804,26 @@ mod tests {
         );
         let stale = refresh_wait(Some(std::time::Instant::now() - REFRESH * 2));
         assert_eq!(stale, Duration::ZERO, "overdue refreshes do not wait");
+    }
+
+    #[test]
+    fn a_source_action_never_debug_prints_its_secret() {
+        // #153: the secret crosses this channel as a redacted
+        // SecretString, so an action logged for any reason cannot
+        // leak the CalDAV password.
+        let action = Action::AddSource {
+            kind: "caldav".into(),
+            locator: "https://cal.test/u/".into(),
+            project_id: None,
+            label: String::new(),
+            credential: CredentialSave::Set {
+                username: "alice".into(),
+                secret: timetrack_proto::SecretString::new("s3cr3t-153"),
+            },
+        };
+        let debug = format!("{action:?}");
+        assert!(!debug.contains("s3cr3t-153"), "{debug}");
+        assert!(debug.contains("alice"), "{debug}");
     }
 
     #[test]

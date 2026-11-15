@@ -22,7 +22,10 @@ use super::super::dialogs::entry::{DialogField, EntryDialog};
 use super::super::dialogs::merge::MergeConfirm;
 use super::super::dialogs::project::ProjectPrompt;
 use super::super::dialogs::recolour::RecolourPrompt;
-use super::super::dialogs::source::{SourceDialog, SourceField, SourceRemoveConfirm};
+use super::super::dialogs::source::{
+    SourceDialog, SourceField, SourceKind, SourceRemoveConfirm, masked_secret,
+    masked_secret_with_caret,
+};
 use super::super::dialogs::split::SplitPrompt;
 use super::super::mouse::{FieldHit, MouseField, field_mouse};
 use super::super::{display_tz, theme};
@@ -626,9 +629,11 @@ impl TimetrackView {
 
     /// The source dialog (#153): kind and project cycle (`h`/`l`, or a
     /// click), locator and label take text with caret and selection
-    /// like every other field. No password row anywhere: CalDAV
-    /// secrets stay in the OS store via the CLI, and the hint line
-    /// says exactly that.
+    /// like every other field. A CalDAV dialog also shows its
+    /// credential rows — a user name and a masked password (bullets
+    /// only, never the secret) — plus the removal toggle when a
+    /// credential is stored; the secret goes to the OS store via the
+    /// service, never into the app database.
     fn render_source_dialog(&self, dlg: &SourceDialog) -> impl IntoElement {
         let title = match &dlg.edit_id {
             None => "NEW SOURCE".to_string(),
@@ -750,6 +755,9 @@ impl TimetrackView {
                                         match field {
                                             SourceField::Kind => view.cycle_source_kind(1),
                                             SourceField::Project => view.cycle_source_project(1),
+                                            SourceField::RemoveCredential => {
+                                                view.toggle_source_remove_credential()
+                                            }
                                             _ => {}
                                         }
                                         cx.notify();
@@ -764,6 +772,71 @@ impl TimetrackView {
                             .child(hint.to_string()),
                     )
             };
+
+        // The password row: like a text row in shape, but only bullets
+        // are ever drawn, and a click just focuses it — a pixel offset
+        // into mask glyphs names no secret character, so there is no
+        // caret placement (and no selection) from the mouse.
+        let secret_row = |hint: &str| {
+            let focused = current_field == SourceField::Secret;
+            let entity = self.entity.clone();
+            let drawn = if focused {
+                masked_secret_with_caret(&dlg.secret, &dlg.caret)
+            } else {
+                masked_secret(&dlg.secret)
+            };
+            div()
+                .id("source-field-secret")
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_1()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .text_color(if focused {
+                            rgba(theme::SELECTED_TEXT)
+                        } else {
+                            rgba(theme::MUTED_TEXT)
+                        })
+                        .child(format!("{} password", if focused { ">" } else { " " })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if focused {
+                            rgba(theme::FOCUS_RING)
+                        } else {
+                            rgba(theme::TRANSPARENT)
+                        })
+                        .bg(if focused {
+                            rgba(theme::RAISED_BG)
+                        } else {
+                            rgba(theme::TRANSPARENT)
+                        })
+                        .text_color(rgba(theme::BODY_TEXT))
+                        .child(drawn),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(theme::HINT_TEXT))
+                        .child(hint.to_string()),
+                )
+                .when_some(entity, move |this, entity| {
+                    this.on_click(move |_ev, _window, cx| {
+                        entity.update(cx, |view, cx| {
+                            view.focus_source_field(SourceField::Secret);
+                            cx.notify();
+                        });
+                    })
+                })
+        };
 
         let (_, chosen) = dlg.chosen_project();
         let mut panel = prompt_panel()
@@ -797,23 +870,52 @@ impl TimetrackView {
                 "project",
                 format!("→ {chosen}"),
                 "h/l or click to map",
-            ))
-            .child(
+            ));
+        if dlg.kind == SourceKind::Caldav {
+            panel = panel
+                .child(text_row(
+                    "source-field-username",
+                    SourceField::Username,
+                    "user name",
+                    &dlg.username,
+                    "empty takes user@ from the URL",
+                    &dlg.caret,
+                ))
+                .child(secret_row(if dlg.has_credential {
+                    "empty keeps the stored password"
+                } else {
+                    "empty stores no credential"
+                }));
+            if dlg.field_applies(SourceField::RemoveCredential) {
+                panel = panel.child(cycle_row(
+                    "source-field-remove-credential",
+                    SourceField::RemoveCredential,
+                    "credential",
+                    if dlg.remove_credential {
+                        "remove on save".to_string()
+                    } else {
+                        "keep stored".to_string()
+                    },
+                    "h/l or click to change",
+                ));
+            }
+            panel = panel.child(
                 div()
                     .pt_1()
                     .text_sm()
                     .text_color(rgba(theme::HINT_TEXT))
                     .child(
-                        "CalDAV password? run: timetrack source-set-credential <id> — secrets never live in the app",
+                        "the password goes to the OS credential store — never into the app database",
                     ),
-            )
-            .child(
-                div()
-                    .pt_1()
-                    .text_sm()
-                    .text_color(rgba(theme::HINT_TEXT))
-                    .child("type to edit · tab next field · h/l cycle · enter save · esc cancel"),
             );
+        }
+        panel = panel.child(
+            div()
+                .pt_1()
+                .text_sm()
+                .text_color(rgba(theme::HINT_TEXT))
+                .child("type to edit · tab next field · h/l cycle · enter save · esc cancel"),
+        );
         if let Some(err) = &dlg.error {
             panel = panel.child(
                 div()
