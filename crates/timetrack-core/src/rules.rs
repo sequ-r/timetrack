@@ -117,7 +117,7 @@ pub const MAX_NOTE_CHARS: usize = 2_000;
 /// `what` names the field in the user's words; it is what the error says.
 /// Length counts characters, not bytes, so the cap means the same thing in
 /// every language.
-fn check_text(what: &str, text: &str, max_chars: usize) -> RuleResult<()> {
+pub(crate) fn check_text(what: &str, text: &str, max_chars: usize) -> RuleResult<()> {
     if text.chars().any(|c| c.is_control()) {
         return Err(RuleError::TextHasControlCharacters(what.to_string()));
     }

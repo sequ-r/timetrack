@@ -399,6 +399,12 @@ pub enum ImportError {
 /// leading `'` (see [`neutralize_formula`]) is removed so a re-import
 /// recreates the original text. Idempotency is the caller's job (it
 /// owns the snapshot to dedupe against); this only reads the file.
+///
+/// Every row is also checked against the rules a mutation would apply
+/// (interval order and range, the #101 text limits), row-precisely and
+/// before the caller writes anything: a bad file imports nothing.
+/// Text arrives trimmed exactly as the rules would store it, so two
+/// spellings of one project name cannot split at creation time.
 pub fn parse_export_csv(text: &str, tz: &Tz) -> Result<Vec<ImportedEntry>, ImportError> {
     let records = parse_csv_records(text);
     let Some((header, _)) = records.first() else {
@@ -429,13 +435,42 @@ pub fn parse_export_csv(text: &str, tz: &Tz) -> Result<Vec<ImportedEntry>, Impor
             "external" => crate::EntrySource::External,
             other => return Err(row(format!("unknown source '{other}'"))),
         };
+        // The semantic checks the rules would apply at mutation time, in
+        // their order and their words, so no row can pass here and then
+        // refuse halfway through an import (#132).
+        let refuse = |e: crate::RuleError| row(e.to_string());
+        for instant in [started_at, ended_at] {
+            if !crate::instant_in_range(instant) {
+                return Err(refuse(crate::RuleError::InstantOutOfRange(instant)));
+            }
+        }
+        if ended_at < started_at {
+            return Err(refuse(crate::RuleError::NegativeDuration));
+        }
+        let project = unneutralize_formula(&fields[1]);
+        let project = project.trim();
+        if project.is_empty() {
+            return Err(refuse(crate::RuleError::BlankProjectName));
+        }
+        crate::rules::check_text("project name", project, crate::MAX_PROJECT_NAME_CHARS)
+            .map_err(refuse)?;
+        let description = unneutralize_formula(&fields[2]);
+        let description = description.trim();
+        crate::rules::check_text("description", description, crate::MAX_DESCRIPTION_CHARS)
+            .map_err(refuse)?;
+        let note = (!fields[8].is_empty())
+            .then(|| unneutralize_formula(&fields[8]))
+            .map(|n| n.trim().to_string());
+        if let Some(note) = &note {
+            crate::rules::check_text("note", note, crate::MAX_NOTE_CHARS).map_err(refuse)?;
+        }
         out.push(ImportedEntry {
-            project: unneutralize_formula(&fields[1]),
-            description: unneutralize_formula(&fields[2]),
+            project: project.to_string(),
+            description: description.to_string(),
             started_at,
             ended_at,
             source,
-            note: (!fields[8].is_empty()).then(|| unneutralize_formula(&fields[8])),
+            note,
         });
     }
     Ok(out)
@@ -1091,6 +1126,77 @@ mod tests {
         let err = parse_export_csv(&bad_row, &utc()).unwrap_err();
         assert!(err.to_string().contains("row 2"), "{err}");
         assert!(err.to_string().contains("not-a-time"), "{err}");
+    }
+
+    #[test]
+    fn import_refuses_semantically_bad_rows_before_any_mutation() {
+        // #132: a row the rules would refuse at mutation time must
+        // refuse here, row-precisely, even behind a good row -- or the
+        // caller writes the good rows and aborts on the bad one.
+        let good = "e1,Work,x,2026-10-05T10:00:00,2026-10-05T12:00:00,02:00:00,120,manual,";
+        let bad_rows: Vec<(String, &str)> = vec![
+            (
+                "e2,Work,x,2026-10-05T12:00:00,2026-10-05T10:00:00,-02:00:00,-120,manual,"
+                    .to_string(),
+                "must not end before it starts",
+            ),
+            (
+                "e2,,x,2026-10-05T10:00:00,2026-10-05T12:00:00,02:00:00,120,manual,".to_string(),
+                "project name cannot be blank",
+            ),
+            (
+                format!(
+                    "e2,{},x,2026-10-05T10:00:00,2026-10-05T12:00:00,02:00:00,120,manual,",
+                    "p".repeat(crate::MAX_PROJECT_NAME_CHARS + 1)
+                ),
+                "project name is too long",
+            ),
+            (
+                format!(
+                    "e2,Work,{},2026-10-05T10:00:00,2026-10-05T12:00:00,02:00:00,120,manual,",
+                    "d".repeat(crate::MAX_DESCRIPTION_CHARS + 1)
+                ),
+                "description is too long",
+            ),
+            (
+                format!(
+                    "e2,Work,x,2026-10-05T10:00:00,2026-10-05T12:00:00,02:00:00,120,manual,{}",
+                    "n".repeat(crate::MAX_NOTE_CHARS + 1)
+                ),
+                "note is too long",
+            ),
+        ];
+        for (bad, why) in bad_rows {
+            let text = format!("{CSV_HEADER}\n{good}\n{bad}\n");
+            let err = parse_export_csv(&text, &utc()).unwrap_err();
+            assert!(
+                matches!(err, ImportError::Row { line: 3, .. }),
+                "{why}: {err:?}"
+            );
+            assert!(err.to_string().contains(why), "{why}: {err}");
+        }
+        // An instant the zone pushes past the supported range refuses
+        // the same way: 9999-12-31 evening at UTC-12 is year 10000 UTC.
+        let far = format!(
+            "{CSV_HEADER}\n\
+             e1,Work,x,9999-12-31T23:00:00,9999-12-31T23:30:00,00:30:00,30,manual,\n"
+        );
+        let err = parse_export_csv(&far, &Tz::fixed_ms(-12 * 3_600_000)).unwrap_err();
+        assert!(matches!(err, ImportError::Row { line: 2, .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("outside the supported range"),
+            "{err}"
+        );
+        // A zero-length entry is legal (the rules refuse only a
+        // negative one), and padded text arrives as it would be stored.
+        let zero = format!(
+            "{CSV_HEADER}\n\
+             e1, Work , x ,2026-10-05T10:00:00,2026-10-05T10:00:00,00:00:00,0,manual,\n"
+        );
+        let parsed = parse_export_csv(&zero, &utc()).unwrap();
+        assert_eq!(parsed[0].project, "Work");
+        assert_eq!(parsed[0].description, "x");
+        assert_eq!(parsed[0].started_at, parsed[0].ended_at);
     }
 
     #[test]
