@@ -457,6 +457,14 @@ fn explain(err: anyhow::Error) -> anyhow::Error {
     ) {
         return anyhow::anyhow!(no_service_hint());
     }
+    // A refusal arrives three layers deep (`ClientError::Service` →
+    // `ServiceError::Rule` → the rule), every layer displaying the same
+    // wording, so the anyhow chain prints it three times (`Error` plus
+    // `Caused by` 0 and 1). Flatten refusals to the single wording the
+    // service sent.
+    if let Some(client) = err.downcast_ref::<ClientError>() {
+        return anyhow::anyhow!("{}", disp(&client.to_string()));
+    }
     // A refusal can embed stored text (a duplicate project name, say), and
     // `main`'s `Error: …` line would print it raw to the terminal (#101).
     // Clean messages keep their typed error; only a message that actually
@@ -470,12 +478,70 @@ fn explain(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Write one stdout line, exiting quietly when the reader is gone.
+///
+/// `println!` panics on a closed pipe (`timetrack list | head -n 2`
+/// exits 101), so stdout output goes through here instead: a
+/// `BrokenPipe` means the reader left early and is exit 0, anything
+/// else is still a panic.
+fn emit(line: &str) {
+    if let Err(e) = emit_to(&mut std::io::stdout().lock(), line) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        panic!("failed writing to stdout: {e}");
+    }
+}
+
+/// The writable half of [`emit`], split out so the error mapping is
+/// testable without a real pipe.
+fn emit_to(out: &mut dyn std::io::Write, line: &str) -> std::io::Result<()> {
+    writeln!(out, "{line}")
+}
+
+/// [`emit`] without the trailing newline, for payloads (like CSV) where
+/// the bytes must reach the reader verbatim.
+fn emit_raw(text: &str) {
+    if let Err(e) = emit_raw_to(&mut std::io::stdout().lock(), text) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        panic!("failed writing to stdout: {e}");
+    }
+}
+
+/// The writable half of [`emit_raw`], split out for the same reason as
+/// [`emit_to`].
+fn emit_raw_to(out: &mut dyn std::io::Write, text: &str) -> std::io::Result<()> {
+    write!(out, "{text}")
+}
+
 /// A display copy of stored text for the terminal (#101): control
 /// characters from a legacy or hand-edited store become spaces, so a stored
 /// name can neither break the columns nor drive the terminal. Every line
 /// that prints stored text goes through here.
 fn disp(text: &str) -> String {
     timetrack_core::sanitize_display(text)
+}
+
+/// Refuse a `shorten` that moves nothing: with neither endpoint the
+/// command used to exit 0 having changed nothing. Split out so the
+/// refusal is testable without a service.
+fn check_shorten_args(start: &Option<String>, end: &Option<String>) -> Result<()> {
+    if start.is_none() && end.is_none() {
+        anyhow::bail!("shorten needs a new start (--start/-S) or end (--end/-E)");
+    }
+    Ok(())
+}
+
+/// Refuse a `merge` that cannot merge: the service's arity refusal names
+/// a `<need two entries>` sentinel id, so check up front in the CLI's own
+/// words. Split out so the refusal is testable without a service.
+fn check_merge_ids(ids: &[String]) -> Result<()> {
+    if ids.len() < 2 {
+        anyhow::bail!("merge needs at least two entries (got {})", ids.len());
+    }
+    Ok(())
 }
 
 /// Refuse names the service would reject, preserving the core rule for both
@@ -586,11 +652,11 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let start_ms = parse_when(&start, "start", &tz)?;
             let end_ms = parse_when(&end, "end", &tz)?;
             let e = client.add(&project, &description, start_ms, end_ms).await?;
-            println!(
+            emit(&format!(
                 "added {} ({})",
                 timetrack_core::format_duration(e.duration_ms()),
                 e.id
-            );
+            ));
         }
 
         Command::Duration {
@@ -602,11 +668,11 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let project = pick_project(&snap, project.as_deref())?;
             let ms = parse_duration(&for_)?;
             let e = client.add_duration(&project, &description, ms).await?;
-            println!(
+            emit(&format!(
                 "added {} ending now ({})",
                 timetrack_core::format_duration(e.duration_ms()),
                 e.id
-            );
+            ));
         }
 
         Command::Past {
@@ -623,14 +689,14 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let e = client
                 .add_duration_ending(&project, &description, ms, end_ms)
                 .await?;
-            println!(
+            emit(&format!(
                 "added {} ending {}ms before now ({})",
                 timetrack_core::format_duration(e.duration_ms()),
                 // Display only; saturating so an extreme typed end cannot
                 // panic the confirmation line (#98).
                 now_ms().saturating_sub(end_ms),
                 e.id
-            );
+            ));
         }
 
         Command::Quick {
@@ -650,12 +716,12 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 )
             })?;
             let e = client.quick_add(&project, ms).await?;
-            println!(
+            emit(&format!(
                 "added {} ({}) -- undo with: timetrack undo {}",
                 timetrack_core::format_duration(e.duration_ms()),
                 e.id,
                 e.id
-            );
+            ));
             if notify {
                 // Best effort (#105): the time is recorded either way, so
                 // a missing notification daemon is a note on stderr, not
@@ -676,6 +742,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         Command::Shorten { id, start, end } => {
             // Unspecified endpoints are left alone, so `shorten e2 -E 30m`
             // moves only the end and the entry is kept.
+            check_shorten_args(&start, &end)?;
             let snap = client.snapshot().await?;
             let existing = find_entry(&snap, &id)?;
             let tz = snapshot_tz(&snap)?;
@@ -688,32 +755,36 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 None => existing.ended_at,
             };
             let e = client.set_times(&existing.id, start_ms, end_ms).await?;
-            println!(
+            emit(&format!(
                 "shortened to {} (the entry is still there: {})",
                 timetrack_core::format_duration(e.duration_ms()),
                 e.id
-            );
+            ));
         }
 
         Command::Undo { id } => {
             let snap = client.snapshot().await?;
             let existing = find_entry(&snap, &id)?;
             client.undo_quick_add(&existing.id).await?;
-            println!("undid quick add: {}", existing.id);
+            emit(&format!("undid quick add: {}", existing.id));
         }
 
         Command::Delete { id } => {
             let snap = client.snapshot().await?;
             let existing = find_entry(&snap, &id)?;
             client.delete_entry(&existing.id).await?;
-            println!("deleted: {}", existing.id);
+            emit(&format!("deleted: {}", existing.id));
         }
 
         Command::SetText { id, text } => {
             let snap = client.snapshot().await?;
             let existing = find_entry(&snap, &id)?;
             let e = client.set_text(&existing.id, &text).await?;
-            println!("set text on {} to \"{}\"", e.id, disp(&e.description));
+            emit(&format!(
+                "set text on {} to \"{}\"",
+                e.id,
+                disp(&e.description)
+            ));
         }
 
         Command::SetProject { id, project } => {
@@ -721,7 +792,12 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let existing = find_entry(&snap, &id)?;
             let target = find_project(&snap, &project)?;
             let e = client.set_project(&existing.id, &target.id).await?;
-            println!("moved {} to {} ({})", e.id, disp(&target.name), target.id);
+            emit(&format!(
+                "moved {} to {} ({})",
+                e.id,
+                disp(&target.name),
+                target.id
+            ));
         }
 
         Command::Split { id, at } => {
@@ -733,16 +809,17 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 anyhow::bail!("split point is outside entry '{id}'");
             }
             let (a, b) = client.split(&existing.id, at_ms).await?;
-            println!(
+            emit(&format!(
                 "split into ({}) {} and ({}) {}",
                 a.id,
                 timetrack_core::format_duration(a.duration_ms()),
                 b.id,
                 timetrack_core::format_duration(b.duration_ms()),
-            );
+            ));
         }
 
         Command::Merge { ids, yes } => {
+            check_merge_ids(&ids)?;
             let snap = client.snapshot().await?;
             let mut found = Vec::with_capacity(ids.len());
             for id in &ids {
@@ -771,27 +848,27 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                     let mut line = String::new();
                     stdin.lock().read_line(&mut line)?;
                     if !confirmed(&line) {
-                        println!("merge cancelled");
+                        emit("merge cancelled");
                         return Ok(());
                     }
-                } else {
+                } else if !read_piped_confirmation(&mut std::io::stdin().lock())? {
                     anyhow::bail!("merge needs confirmation ({delta}); re-run with --yes");
                 }
             }
             let resolved: Vec<String> = found.iter().map(|e| e.id.clone()).collect();
             let merged = client.merge(&resolved).await?;
-            println!(
+            emit(&format!(
                 "merged {} entries into ({}) {} ({delta})",
                 ids.len(),
                 merged.id,
                 timetrack_core::format_duration(merged.duration_ms()),
-            );
+            ));
         }
 
         Command::Project { name } => {
             validate_project_name(&name)?;
             let p = client.add_project(&name).await?;
-            println!("created project {} ({})", disp(&p.name), p.id);
+            emit(&format!("created project {} ({})", disp(&p.name), p.id));
         }
 
         Command::Rename { id, name } => {
@@ -802,7 +879,12 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let existing = find_project(&snap, &id)?;
             let old = existing.name.clone();
             let p = client.update_project(&existing.id, &name, -1).await?;
-            println!("renamed {} to {} ({})", disp(&old), disp(&p.name), p.id);
+            emit(&format!(
+                "renamed {} to {} ({})",
+                disp(&old),
+                disp(&p.name),
+                p.id
+            ));
         }
 
         Command::Recolour { id, colour } => {
@@ -812,25 +894,29 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let p = client
                 .update_project(&existing.id, "", value as i64)
                 .await?;
-            println!("recoloured {} ({}) to #{value:06x}", disp(&p.name), p.id);
+            emit(&format!(
+                "recoloured {} ({}) to #{value:06x}",
+                disp(&p.name),
+                p.id
+            ));
         }
 
         Command::Archive { id } => {
             let snap = client.snapshot().await?;
             let existing = find_project(&snap, &id)?;
             let p = client.set_archived(&existing.id, true).await?;
-            println!(
+            emit(&format!(
                 "archived {} ({}) -- its entries stay in historical totals",
                 disp(&p.name),
                 p.id
-            );
+            ));
         }
 
         Command::Unarchive { id } => {
             let snap = client.snapshot().await?;
             let existing = find_project(&snap, &id)?;
             let p = client.set_archived(&existing.id, false).await?;
-            println!("unarchived {} ({})", disp(&p.name), p.id);
+            emit(&format!("unarchived {} ({})", disp(&p.name), p.id));
         }
 
         Command::DeleteProject { id } => {
@@ -843,21 +929,22 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             // cannot be deleted, and neither can the last project. Its
             // refusals reach the CLI in the core's own words.
             client.delete_project(&existing.id).await?;
-            println!("deleted project {} ({})", disp(&existing.name), existing.id);
+            emit(&format!(
+                "deleted project {} ({})",
+                disp(&existing.name),
+                existing.id
+            ));
         }
 
         Command::Snapshot => {
             let snap = client.snapshot().await?;
-            println!(
-                "{}",
-                serde_json::to_string(&snap).expect("snapshots are always serializable")
-            );
+            emit(&serde_json::to_string(&snap).expect("snapshots are always serializable"));
         }
 
         Command::Status { json } => {
             let snap = client.snapshot().await?;
             if json {
-                println!("{}", status_json(&snap));
+                emit(&status_json(&snap));
             } else {
                 print_status(&snap);
             }
@@ -870,7 +957,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         } => {
             let snap = client.snapshot().await?;
             if json {
-                println!("{}", list_json(&snap, limit, search.as_deref()));
+                emit(&list_json(&snap, limit, search.as_deref()));
             } else {
                 print_list(&snap, limit, search.as_deref());
             }
@@ -885,12 +972,12 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let plan = plan_import(&snap, &rows);
             let mut notes_dropped = 0usize;
             if dry_run {
-                println!(
+                emit(&format!(
                     "would import {} entries ({} skipped as already present, {} new project(s))",
                     plan.to_add.len(),
                     plan.skipped,
                     plan.new_projects.len()
-                );
+                ));
             } else {
                 // Project name (lowercased) -> id, seeded from the
                 // snapshot and extended as missing projects are created.
@@ -914,16 +1001,16 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                         notes_dropped += 1;
                     }
                 }
-                println!(
+                emit(&format!(
                     "imported {} entries ({} skipped as already present, {} project(s) created)",
                     plan.to_add.len(),
                     plan.skipped,
                     plan.new_projects.len()
-                );
+                ));
             }
             if notes_dropped > 0 {
-                println!(
-                    "note: {notes_dropped} note(s) could not be restored (notes need a socket-speaking service)"
+                emit(
+                    "note: {notes_dropped} note(s) could not be restored (notes need a socket-speaking service)",
                 );
             }
         }
@@ -950,12 +1037,12 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let src = client
                 .add_source(kind, &locator, project_id.as_deref(), &label)
                 .await?;
-            println!(
+            emit(&format!(
                 "added source {} ({}) {}",
                 disp(&src.label),
                 src.kind,
                 src.id
-            );
+            ));
         }
 
         Command::SourceUpdate {
@@ -993,18 +1080,18 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                     label.as_deref().unwrap_or(&current.label),
                 )
                 .await?;
-            println!(
+            emit(&format!(
                 "updated source {} ({}) {}",
                 disp(&updated.label),
                 updated.kind,
                 updated.id
-            );
+            ));
         }
 
         Command::Sources => {
             let sources = client.sources().await?;
             if sources.is_empty() {
-                println!("no external sources yet (add one with: timetrack source-add <file.ics>)");
+                emit("no external sources yet (add one with: timetrack source-add <file.ics>)");
             }
             for s in sources {
                 // The credential state, never the secret: who the stored
@@ -1014,14 +1101,14 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                     (true, None) => "  [credential]".to_string(),
                     (false, _) => String::new(),
                 };
-                println!(
+                emit(&format!(
                     "{}  {:<8}  {}  {}{}",
                     s.id,
                     s.kind,
                     disp(&s.label),
                     disp(&s.locator),
                     credential
-                );
+                ));
             }
         }
 
@@ -1032,23 +1119,22 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
         } => {
             let found = client.discover_caldav(&endpoint, source.as_deref()).await?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&found)
-                        .expect("collection views are always serializable")
+                emit(
+                    &serde_json::to_string(&found)
+                        .expect("collection views are always serializable"),
                 );
             } else if found.is_empty() {
-                println!("no calendar collections found at {endpoint}");
+                emit(&format!("no calendar collections found at {endpoint}"));
             } else {
                 for c in &found {
-                    println!(
+                    emit(&format!(
                         "{}  [{}]  {}",
                         disp(&c.display_name),
                         c.components.join(", "),
                         disp(&c.url)
-                    );
+                    ));
                 }
-                println!("register one with: timetrack source-add --kind caldav <url>");
+                emit("register one with: timetrack source-add --kind caldav <url>");
             }
         }
 
@@ -1063,33 +1149,32 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             if tally.withdrawn > 0 {
                 extra.push_str(&format!(", {} withdrawn", tally.withdrawn));
             }
-            println!(
+            emit(&format!(
                 "fetched {} item(s): {} new suggestion(s), {} skipped{}",
                 tally.fetched, tally.inserted, tally.skipped, extra
-            );
+            ));
         }
 
         Command::Suggestions { json } => {
             let suggestions = client.suggestions().await?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&suggestions)
-                        .expect("suggestion views are always serializable")
+                emit(
+                    &serde_json::to_string(&suggestions)
+                        .expect("suggestion views are always serializable"),
                 );
             } else if suggestions.is_empty() {
-                println!("no pending suggestions (try: timetrack refresh)");
+                emit("no pending suggestions (try: timetrack refresh)");
             } else {
                 let snap = client.snapshot().await?;
                 let tz = snapshot_tz(&snap)?;
                 for s in suggestions {
-                    println!(
+                    emit(&format!(
                         "{}  {}  {:>10}  {}",
                         s.id,
                         timetrack_core::format_local_iso8601(s.started_at, &tz),
                         timetrack_core::format_duration(s.ended_at - s.started_at),
                         disp(&s.title)
-                    );
+                    ));
                 }
             }
         }
@@ -1105,16 +1190,16 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let e = client
                 .confirm_suggestion(&id, project_id.as_deref())
                 .await?;
-            println!(
+            emit(&format!(
                 "confirmed {} ({})",
                 timetrack_core::format_duration(e.duration_ms()),
                 e.id
-            );
+            ));
         }
 
         Command::Dismiss { id } => {
             client.dismiss_suggestion(&id).await?;
-            println!("dismissed {id}");
+            emit(&format!("dismissed {id}"));
         }
 
         Command::SourceSetCredential { id, username } => {
@@ -1133,21 +1218,21 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             let updated = client
                 .set_source_credential(&id, &username, &secret)
                 .await?;
-            println!(
+            emit(&format!(
                 "stored a credential for {} on source {} ({})",
                 disp(updated.username.as_deref().unwrap_or_default()),
                 disp(&updated.label),
                 updated.id
-            );
+            ));
         }
 
         Command::SourceRemoveCredential { id } => {
             let updated = client.remove_source_credential(&id).await?;
-            println!(
+            emit(&format!(
                 "removed the credential from source {} ({})",
                 disp(&updated.label),
                 updated.id
-            );
+            ));
         }
 
         Command::SourceRemove { id } => {
@@ -1158,7 +1243,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 .map(|s| disp(&s.label))
                 .unwrap_or_else(|| id.clone());
             client.remove_source(&id).await?;
-            println!("removed source {label} ({id})");
+            emit(&format!("removed source {label} ({id})"));
         }
 
         Command::Export {
@@ -1192,13 +1277,13 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string());
-                    println!(
+                    emit(&format!(
                         "exported {count} entries ({}..{}) to {basename}",
                         timetrack_core::anchor_day_string(from_ms, &tz),
                         timetrack_core::anchor_day_string(to_ms, &tz)
-                    );
+                    ));
                 }
-                None => print!("{csv}"),
+                None => emit_raw(&csv),
             }
         }
 
@@ -1243,9 +1328,9 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             match out {
                 Some(path) => {
                     std::fs::write(&path, &csv)?;
-                    println!("{}", export_file_status(&csv, parsed, &period_id, &path));
+                    emit(&export_file_status(&csv, parsed, &period_id, &path));
                 }
-                None => print!("{csv}"),
+                None => emit_raw(&csv),
             }
         }
     }
@@ -1253,26 +1338,26 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
 }
 
 fn print_status(s: &Snapshot) {
-    println!(
+    emit(&format!(
         "this week:  {}  ({} entries)",
         timetrack_core::format_duration(s.week.total_ms),
         s.week.entry_count
-    );
-    println!(
+    ));
+    emit(&format!(
         "this month: {}",
         timetrack_core::format_duration(s.month.total_ms)
-    );
-    println!(
+    ));
+    emit(&format!(
         "all time:   {}",
         timetrack_core::format_duration(s.total_ms)
-    );
+    ));
     if !s.over_24h_days.is_empty() {
         // Legal, but worth surfacing: it usually means a mistyped interval
         // rather than a genuinely enormous day (REQUIREMENTS §4).
-        println!(
+        emit(&format!(
             "warning:    {} day(s) total more than 24h",
             s.over_24h_days.len()
-        );
+        ));
     }
 }
 
@@ -1307,14 +1392,11 @@ fn filtered_entries<'a>(
 fn print_list(s: &Snapshot, limit: usize, search: Option<&str>) {
     let entries = filtered_entries(s, search);
     if entries.is_empty() {
-        println!(
-            "{}",
-            if search.is_some() {
-                "no entries match"
-            } else {
-                "no entries yet"
-            }
-        );
+        emit(if search.is_some() {
+            "no entries match"
+        } else {
+            "no entries yet"
+        });
         return;
     }
     for e in entries.into_iter().take(limit) {
@@ -1323,12 +1405,12 @@ fn print_list(s: &Snapshot, limit: usize, search: Option<&str>) {
         } else {
             " "
         };
-        println!(
+        emit(&format!(
             "{marker} {:>10}  {:<6}  {}",
             timetrack_core::format_duration(e.duration_ms()),
             e.id,
             disp(e.label())
-        );
+        ));
     }
 }
 
@@ -1625,6 +1707,17 @@ fn snapshot_tz(snap: &Snapshot) -> Result<timetrack_core::Tz> {
 /// case confirms, everything else (including empty) cancels.
 fn confirmed(line: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The non-terminal half of the merge confirmation: the first stdin line
+/// when piped (`echo y | timetrack merge …`), so scripts can confirm
+/// without `--yes`. An empty pipe (EOF) refuses like any other non-yes.
+fn read_piped_confirmation(reader: &mut dyn std::io::BufRead) -> Result<bool> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| anyhow::anyhow!("could not read confirmation: {e}"))?;
+    Ok(confirmed(&line))
 }
 
 /// Parse a duration like `90m`, `1h30m` or `45s`, in milliseconds.
@@ -2517,5 +2610,93 @@ mod tests {
             pick_project(&snap, None).unwrap(),
             "aaaaaaaa-0000-4000-8000-000000000001"
         );
+    }
+
+    #[test]
+    fn service_refusals_print_once_not_three_times() {
+        // A refusal nests three deep (`ClientError::Service` →
+        // `ServiceError::Rule` → the rule) with the same wording at every
+        // layer, so `timetrack undo <manual-entry-id>` rendered `Error`
+        // plus `Caused by` 0 and 1 identically. `explain` flattens that.
+        let err = anyhow::Error::new(ClientError::Service(timetrack_proto::ServiceError::Rule(
+            timetrack_core::RuleError::NotQuickAdd("e1".into()),
+        )));
+        let explained = explain(err);
+        assert_eq!(
+            explained.to_string(),
+            "entry 'e1' was not created by a quick add, so it cannot be undone"
+        );
+        let debug = format!("{explained:?}");
+        assert!(
+            !debug.contains("Caused by"),
+            "a refusal must print once, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn shorten_with_no_endpoint_refuses() {
+        let err = check_shorten_args(&None, &None).unwrap_err().to_string();
+        assert!(
+            err.contains("--start") && err.contains("--end"),
+            "the refusal must name the flags: {err}"
+        );
+        assert!(check_shorten_args(&Some("09:00".into()), &None).is_ok());
+        assert!(check_shorten_args(&None, &Some("10:00".into())).is_ok());
+    }
+
+    #[test]
+    fn merge_with_fewer_than_two_entries_refuses_up_front() {
+        // The service's arity refusal names a `<need two entries>`
+        // sentinel id; the CLI refuses first, naming the count.
+        let err = check_merge_ids(&["e1".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at least two") && err.contains('1'),
+            "got: {err}"
+        );
+        assert!(check_merge_ids(&["e1".into(), "e2".into()]).is_ok());
+    }
+
+    #[test]
+    fn piped_merge_confirmations_follow_the_same_yes_rule() {
+        use std::io::BufReader;
+        for yes in ["y\n", "YES\n", "  yes  \n"] {
+            assert!(
+                read_piped_confirmation(&mut BufReader::new(yes.as_bytes())).unwrap(),
+                "{yes:?} should confirm"
+            );
+        }
+        for no in ["n\n", "no\n", "yess\n"] {
+            assert!(
+                !read_piped_confirmation(&mut BufReader::new(no.as_bytes())).unwrap(),
+                "{no:?} should cancel"
+            );
+        }
+        // EOF (an empty pipe) refuses instead of hanging or merging.
+        assert!(!read_piped_confirmation(&mut BufReader::new("".as_bytes())).unwrap());
+    }
+
+    #[test]
+    fn emit_to_writes_lines_and_reports_broken_pipe() {
+        struct FailPipe(std::io::ErrorKind);
+        impl std::io::Write for FailPipe {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "gone"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // The writer `emit` relies on: lines end with a newline …
+        let mut ok = Vec::new();
+        emit_to(&mut ok, "hi").unwrap();
+        assert_eq!(ok, b"hi\n");
+        // … and a closed pipe surfaces as `BrokenPipe` (mapped to exit 0
+        // by `emit`), while other failures stay distinct (still a panic).
+        let err = emit_to(&mut FailPipe(std::io::ErrorKind::BrokenPipe), "hi").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        let err = emit_to(&mut FailPipe(std::io::ErrorKind::PermissionDenied), "hi").unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }
