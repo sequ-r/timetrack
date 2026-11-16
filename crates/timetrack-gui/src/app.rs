@@ -33,6 +33,8 @@ use self::dialogs::entry::{EntryDialog, SaveOutcome, resolve_save};
 use self::dialogs::merge::{MergeConfirm, merge_offer};
 use self::dialogs::project::{ProjectPrompt, ProjectSave, resolve_project_prompt};
 use self::dialogs::recolour::{RecolourPrompt, RecolourSave, resolve_recolour};
+#[cfg(test)]
+use self::dialogs::source::CredentialSave;
 use self::dialogs::source::{
     SourceDialog, SourceField, SourceKind, SourceRemoveConfirm, SourceSave, resolve_source_dialog,
     source_remove_offer,
@@ -1535,6 +1537,8 @@ impl TimetrackView {
                         src.locator,
                         src.label,
                         src.project_id,
+                        src.username,
+                        src.has_credential,
                         choices,
                     ));
                 }
@@ -1562,6 +1566,9 @@ impl TimetrackView {
         }
         match ev.keystroke.key.as_str() {
             "escape" => {
+                if let Some(dlg) = self.source_dialog.as_mut() {
+                    dlg.clear_secret();
+                }
                 self.source_dialog = None;
             }
             "enter" => self.source_save(),
@@ -1599,6 +1606,10 @@ impl TimetrackView {
                             "l" => dlg.cycle_project(1),
                             _ => {}
                         },
+                        SourceField::RemoveCredential => match ch {
+                            "h" | "l" => dlg.toggle_remove_credential(),
+                            _ => {}
+                        },
                         // While the input handler is live the platform
                         // delivers the key through it (#126) — inserting
                         // here too would double every character.
@@ -1633,14 +1644,16 @@ impl TimetrackView {
                 locator,
                 project_id,
                 label,
+                credential,
             }) => {
                 self.send(Action::AddSource {
                     kind,
                     locator,
                     project_id,
                     label,
+                    credential,
                 });
-                self.source_dialog = None;
+                self.close_source_dialog();
             }
             Ok(SourceSave::Update {
                 id,
@@ -1648,6 +1661,7 @@ impl TimetrackView {
                 locator,
                 project_id,
                 label,
+                credential,
             }) => {
                 self.send(Action::UpdateSource {
                     id,
@@ -1655,9 +1669,28 @@ impl TimetrackView {
                     locator,
                     project_id,
                     label,
+                    credential,
                 });
-                self.source_dialog = None;
+                self.close_source_dialog();
             }
+        }
+    }
+
+    /// Close the source dialog after a save is sent: the typed secret
+    /// is wiped first, so it never lingers in dialog state past the
+    /// action that carries it (redacted) to the service thread.
+    fn close_source_dialog(&mut self) {
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            dlg.clear_secret();
+        }
+        self.source_dialog = None;
+    }
+
+    /// Toggle forgetting the stored credential, from the dialog's
+    /// remove row click: the keyboard path is `h`/`l` in the field.
+    pub(crate) fn toggle_source_remove_credential(&mut self) {
+        if let Some(dlg) = self.source_dialog.as_mut() {
+            dlg.toggle_remove_credential();
         }
     }
 
@@ -2483,6 +2516,7 @@ mod tests {
                     locator: "/tmp/cal.ics".into(),
                     project_id: None,
                     label: "Cal".into(),
+                    credential: CredentialSave::Keep,
                 },
                 &snap,
                 &sources
@@ -2496,6 +2530,7 @@ mod tests {
                     locator: "/tmp/other.ics".into(),
                     project_id: None,
                     label: String::new(),
+                    credential: CredentialSave::Keep,
                 },
                 &snap,
                 &sources
@@ -2511,6 +2546,7 @@ mod tests {
                     locator: "/tmp/cal.ics".into(),
                     project_id: None,
                     label: "Cal".into(),
+                    credential: CredentialSave::Keep,
                 },
                 &snap,
                 &sources
