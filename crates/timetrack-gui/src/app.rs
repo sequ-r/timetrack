@@ -2295,6 +2295,44 @@ mod tests {
         assert_eq!(newest_quick_add(&snap), None);
     }
 
+    #[test]
+    fn undo_still_targets_the_newest_quick_add_under_an_active_filter() {
+        // #131 acceptance: an active filter narrows only the entries
+        // list. The `u` handler calls `newest_quick_add(&self.snapshot)`
+        // on the unfiltered snapshot, so hiding the newest quick-add
+        // behind a query must not move the undo target to a visible
+        // entry, an older quick-add, or nothing.
+        use super::render::home::filtered_entry_indices;
+        let mut hidden_quick = entry("e3", EntrySource::QuickAdd, 2_000);
+        hidden_quick.description = "groceries".into();
+        let mut shown = entry("e2", EntrySource::Manual, 1_000);
+        shown.description = "Review PR".into();
+        let mut older_quick = entry("e1", EntrySource::QuickAdd, 0);
+        older_quick.description = "groceries".into();
+        let snap = Snapshot {
+            // Newest first, as the service sends them.
+            entries: vec![hidden_quick, shown, older_quick],
+            projects: vec![project("p1", "Work")],
+            ..Default::default()
+        };
+        let filter = EntryFilter {
+            query: "review".into(),
+            editing: false,
+        };
+        assert!(filter.is_active());
+        // Precondition: the filter really does hide the newest
+        // quick-add (index 0) and keep only the manual entry.
+        assert_eq!(filtered_entry_indices(&snap, &filter.query), vec![1]);
+        assert_eq!(
+            newest_quick_add(&snap).as_deref(),
+            Some("e3"),
+            "undo reads the unfiltered snapshot, never the visible rows"
+        );
+        // Edge: a query matching nothing at all leaves the target alone.
+        assert!(filtered_entry_indices(&snap, "absent").is_empty());
+        assert_eq!(newest_quick_add(&snap).as_deref(), Some("e3"));
+    }
+
     // --- typed status kinds (no string parsing) ---
 
     #[test]
@@ -2669,6 +2707,62 @@ mod tests {
             pending_outcome(&Action::ExportCsv(ExportCall::Range(request)), &snap, &[]),
             None
         );
+    }
+
+    #[test]
+    fn an_export_issued_under_an_active_filter_holds_the_full_scoped_rows() {
+        // #131 acceptance: search is a view, not a scope. The Export
+        // click builds its request from scope plus anchor only
+        // (`export_request` takes no query), and the preview rows --
+        // documented as exactly what the CSV will hold, via the shared
+        // core scope predicate over the unfiltered snapshot -- must
+        // keep every in-scope row even while a Home filter hides some.
+        use super::render::home::filtered_entry_indices;
+        let mut snap = preview_snapshot();
+        snap.projects = vec![project("p1", "Work")];
+        // Newest first: e3 (2026-10-07), e2 (2026-10-06), e1 (2026-09-30).
+        snap.entries[0].description = "groceries".into();
+        snap.entries[1].description = "Review PR".into();
+        snap.entries[2].description = "groceries".into();
+        let filter = EntryFilter {
+            query: "review".into(),
+            editing: false,
+        };
+        assert!(filter.is_active());
+        // Precondition: the filter keeps only e2 (snapshot index 1).
+        assert_eq!(filtered_entry_indices(&snap, &filter.query), vec![1]);
+
+        let anchor = day_anchor("2026-10-08");
+        // The week export still holds both W41 rows, oldest first --
+        // including the hidden e3 -- while the scope itself still
+        // excludes the W40 row e1: scope narrows, the filter does not.
+        assert_eq!(
+            preview_ids(&snap, timetrack_core::ExportScope::Week, anchor),
+            vec!["e2".to_string(), "e3".to_string()]
+        );
+        assert_eq!(
+            preview_ids(&snap, timetrack_core::ExportScope::All, anchor),
+            vec!["e1".to_string(), "e2".to_string(), "e3".to_string()]
+        );
+        assert_eq!(
+            preview_range_ids(&snap, day_anchor("2026-10-01"), day_anchor("2026-10-15")),
+            vec!["e2".to_string(), "e3".to_string()],
+            "the range export preview is unfiltered too"
+        );
+        // Edge: a query matching nothing empties the list, not the export.
+        assert!(filtered_entry_indices(&snap, "absent").is_empty());
+        assert_eq!(
+            preview_ids(&snap, timetrack_core::ExportScope::Week, anchor),
+            vec!["e2".to_string(), "e3".to_string()]
+        );
+
+        // The request the click sends names the same period it would
+        // with no filter active: scope plus anchor, nothing else.
+        let now = day_anchor("2026-11-05");
+        let request = export_request(timetrack_core::ExportScope::Week, anchor, now, &utc_tz());
+        assert_eq!(request.scope, timetrack_core::ExportScope::Week);
+        assert_eq!(request.anchor_ms, Some(anchor));
+        assert_eq!(request.period_id, "2026-W41");
     }
 }
 
