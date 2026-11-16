@@ -539,7 +539,7 @@ fn check_shorten_args(start: &Option<String>, end: &Option<String>) -> Result<()
 /// words. Split out so the refusal is testable without a service.
 fn check_merge_ids(ids: &[String]) -> Result<()> {
     if ids.len() < 2 {
-        anyhow::bail!("merge needs at least two entries (got {})", ids.len());
+        anyhow::bail!("merge: need two entries at least (got {})", ids.len());
     }
     Ok(())
 }
@@ -2652,7 +2652,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("at least two") && err.contains('1'),
+            err.contains("need two") && err.contains('1'),
             "got: {err}"
         );
         assert!(check_merge_ids(&["e1".into(), "e2".into()]).is_ok());
