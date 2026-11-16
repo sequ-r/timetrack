@@ -2651,10 +2651,7 @@ mod tests {
         let err = check_merge_ids(&["e1".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("need two") && err.contains('1'),
-            "got: {err}"
-        );
+        assert!(err.contains("need two") && err.contains('1'), "got: {err}");
         assert!(check_merge_ids(&["e1".into(), "e2".into()]).is_ok());
     }
 
