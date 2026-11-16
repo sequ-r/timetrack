@@ -59,25 +59,20 @@ pub fn gui_argv(desktop: &str) -> Vec<String> {
 /// (app bundle, Start-menu entry) while keeping this signature.
 #[cfg(not(target_os = "linux"))]
 fn sibling_gui_command() -> Vec<String> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let name = if cfg!(windows) {
-            "timetrack-gui.exe"
-        } else {
-            "timetrack-gui"
-        };
-        return vec![dir.join(name).to_string_lossy().into_owned()];
-    }
-    vec!["timetrack-gui".to_string()]
+    let exe = std::env::current_exe();
+    sibling_gui_command_from(exe.as_deref().ok(), cfg!(windows))
 }
 
 /// The sibling GUI command, pure over explicit inputs so the rule is
-/// testable on any host (mirrors `service/src/platform.rs`).
-#[cfg(all(test, not(target_os = "linux")))]
-fn sibling_gui_command_from(current_exe: Option<&std::path::Path>) -> Vec<String> {
+/// testable on any host (mirrors `service/src/platform.rs`): the
+/// Windows `.exe` suffix is an input, not read from `cfg!` here, so a
+/// Linux test run pins the Windows argv too. Comparing the result as a
+/// path (not by string suffix) is what keeps that honest -- on Windows
+/// `Path::join` spells the separator `\` whatever the parent used.
+#[cfg(any(test, not(target_os = "linux")))]
+fn sibling_gui_command_from(current_exe: Option<&std::path::Path>, windows: bool) -> Vec<String> {
     if let Some(dir) = current_exe.and_then(|exe| exe.parent()) {
-        let name = if cfg!(windows) {
+        let name = if windows {
             "timetrack-gui.exe"
         } else {
             "timetrack-gui"
@@ -87,23 +82,49 @@ fn sibling_gui_command_from(current_exe: Option<&std::path::Path>) -> Vec<String
     vec!["timetrack-gui".to_string()]
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn sibling_command_is_never_empty() {
         // The dispatcher's empty branch must never fire off Linux: its
         // wording names the desktop entry.
         assert!(!open_gui_command().is_empty());
-        assert!(!sibling_gui_command_from(None).is_empty());
+        assert!(!sibling_gui_command_from(None, cfg!(windows)).is_empty());
     }
 
     #[test]
     fn sibling_command_names_the_gui_beside_the_tray() {
-        let exe = std::path::Path::new("/opt/timetrack/timetrack-tray");
-        let argv = sibling_gui_command_from(Some(exe));
-        assert_eq!(argv.len(), 1);
-        assert!(argv[0].ends_with("timetrack-gui"), "argv: {argv:?}");
+        // Both name rules run on every host: the Windows one is the
+        // case that reddened `cross (windows-latest)` (#157), where
+        // argv was `.../timetrack-gui.exe` and a string-suffix check
+        // for `timetrack-gui` could never pass.
+        for (windows, file_name) in [(true, "timetrack-gui.exe"), (false, "timetrack-gui")] {
+            let exe = Path::new("/opt/timetrack/timetrack-tray");
+            let argv = sibling_gui_command_from(Some(exe), windows);
+            assert_eq!(argv.len(), 1, "argv: {argv:?}");
+            let gui = Path::new(&argv[0]);
+            assert_eq!(
+                gui.file_name().and_then(|n| n.to_str()),
+                Some(file_name),
+                "argv: {argv:?}"
+            );
+            assert_eq!(gui.parent(), exe.parent(), "argv: {argv:?}");
+        }
+    }
+
+    #[test]
+    fn sibling_command_falls_back_to_the_bare_name() {
+        assert_eq!(
+            sibling_gui_command_from(None, true),
+            vec!["timetrack-gui".to_string()]
+        );
+        assert_eq!(
+            sibling_gui_command_from(None, false),
+            vec!["timetrack-gui".to_string()]
+        );
     }
 }
