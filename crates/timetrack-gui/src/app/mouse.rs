@@ -31,14 +31,16 @@ use gpui::{
 use super::TimetrackView;
 use super::dialogs::entry::DialogField;
 use super::dialogs::source::SourceField;
+use super::dialogs::sync::SyncField;
 use super::export::picker::RangeEnd;
 use super::textline::{self, Caret};
 
 /// A text field the mouse can place the caret in (#127): the entry
 /// dialog's three text rows, the two single-field prompts, the source
-/// dialog's locator/label/user-name rows (#153), the export anchor day
-/// and the two range days. The entry project row, the source
-/// kind/project rows, the entries filter query (#131) and the
+/// dialog's locator/label/user-name rows (#153), the sync dialog's
+/// folder/pairing-code rows (#176), the export anchor day and the two
+/// range days. The entry project row, the source kind/project rows,
+/// the sync mode row, the entries filter query (#131) and the
 /// recolour hex prompt have no caret, so they are not fields here;
 /// the source password row is masked, so it only takes focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,6 +49,7 @@ pub(crate) enum MouseField {
     Project,
     Split,
     Source(SourceField),
+    Sync(SyncField),
     Anchor,
     Range(RangeEnd),
 }
@@ -188,9 +191,11 @@ pub(crate) fn x_for_displayed_offset(
 pub(crate) fn field_prefix(field: MouseField) -> &'static str {
     match field {
         MouseField::Anchor | MouseField::Range(_) => "day ",
-        MouseField::Entry(_) | MouseField::Project | MouseField::Split | MouseField::Source(_) => {
-            ""
-        }
+        MouseField::Entry(_)
+        | MouseField::Project
+        | MouseField::Split
+        | MouseField::Source(_)
+        | MouseField::Sync(_) => "",
     }
 }
 
@@ -215,6 +220,10 @@ impl TimetrackView {
             MouseField::Split => self.split_prompt.is_some(),
             MouseField::Source(want) => self
                 .source_dialog
+                .as_ref()
+                .is_some_and(|dlg| dlg.field == want),
+            MouseField::Sync(want) => self
+                .sync_dialog
                 .as_ref()
                 .is_some_and(|dlg| dlg.field == want),
             MouseField::Anchor => self.export_picker.editing,
@@ -292,6 +301,17 @@ impl TimetrackView {
                     SourceField::Username => Some((&dlg.username, &dlg.caret)),
                 }
             }
+            MouseField::Sync(want) => {
+                let dlg = self.sync_dialog.as_ref()?;
+                if !dlg.field_applies(want) {
+                    return None;
+                }
+                match want {
+                    SyncField::Mode => None,
+                    SyncField::Folder => Some((&dlg.folder, &dlg.caret)),
+                    SyncField::PairingCode => Some((&dlg.pairing_code, &dlg.caret)),
+                }
+            }
             MouseField::Project => {
                 let prompt = self.project_prompt.as_ref()?;
                 Some((&prompt.name, &prompt.caret))
@@ -355,6 +375,9 @@ impl TimetrackView {
                 .map(MouseField::Source),
             );
         }
+        if self.sync_dialog.is_some() {
+            fields.extend([SyncField::Folder, SyncField::PairingCode].map(MouseField::Sync));
+        }
         if self.export_picker.is_active() && !self.export_picker.is_range() {
             fields.push(MouseField::Anchor);
         }
@@ -396,6 +419,12 @@ impl TimetrackView {
                 field => Some(MouseField::Source(field)),
             };
         }
+        if let Some(dlg) = self.sync_dialog.as_ref() {
+            return match dlg.field {
+                SyncField::Mode => None,
+                field => Some(MouseField::Sync(field)),
+            };
+        }
         if self.export_picker.editing {
             return Some(MouseField::Anchor);
         }
@@ -428,6 +457,12 @@ impl TimetrackView {
             }
             MouseField::Source(want) => {
                 let Some(dlg) = self.source_dialog.as_mut() else {
+                    return;
+                };
+                dlg.mouse_down(want, at, shift);
+            }
+            MouseField::Sync(want) => {
+                let Some(dlg) = self.sync_dialog.as_mut() else {
                     return;
                 };
                 dlg.mouse_down(want, at, shift);
@@ -470,6 +505,11 @@ impl TimetrackView {
             }
             MouseField::Source(_) => {
                 if let Some(dlg) = self.source_dialog.as_mut() {
+                    dlg.mouse_drag(at);
+                }
+            }
+            MouseField::Sync(_) => {
+                if let Some(dlg) = self.sync_dialog.as_mut() {
                     dlg.mouse_drag(at);
                 }
             }

@@ -11,11 +11,41 @@
 use std::time::Duration;
 
 use super::super::TimetrackView;
+use super::super::dialogs::sync::SyncMode;
 use super::super::{display_tz, service::Action, theme};
 use gpui::prelude::*;
 use gpui::{Animation, AnimationExt as _, ElementId, IntoElement, div, ease_out_quint, px, rgba};
 use timetrack_core::QUICK_ADD_MS;
 use timetrack_proto::Snapshot;
+
+/// Short 8-character prefix for displaying a sync device id (#176).
+pub(crate) fn short_device_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Fixed local timestamp string (`YYYY-MM-DD HH:MM`) for sync status/conflicts.
+/// Never uses relative "X ago" text so renders stay deterministic.
+pub(crate) fn format_sync_time(ms: i64, tz: &timetrack_core::Tz) -> String {
+    if ms <= 0 {
+        return "none".to_string();
+    }
+    let iso = timetrack_core::format_local_iso8601(ms, tz);
+    match iso.split_once('T') {
+        Some((date, time)) => format!("{date} {}", &time[..time.len().min(5)]),
+        None => iso,
+    }
+}
+
+/// Status badge for a sync peer when stale or quarantined (#175, #176).
+pub(crate) fn peer_status_badge(peer: &timetrack_proto::SyncPeerView) -> Option<&'static str> {
+    if peer.quarantined {
+        Some("quarantined (>90d / behind compaction)")
+    } else if peer.stale {
+        Some("stale (>7d)")
+    } else {
+        None
+    }
+}
 
 /// Width of the per-project bar track on Home.
 const PROJECT_BAR_TRACK_PX: f32 = 120.0;
@@ -164,6 +194,7 @@ impl TimetrackView {
             .child(self.render_quick_add())
             .child(self.render_suggestions())
             .child(self.render_sources())
+            .child(self.render_sync())
             .child(self.render_week_by_project())
             .child(self.render_filter())
             .child(self.render_entries())
@@ -546,6 +577,362 @@ impl TimetrackView {
             .into_any_element()
     }
 
+    /// Folder sync (#176): compact enable/join links when off, and when on,
+    /// per-device peer state, last-merge/repair honesty, and unresolved conflict
+    /// review + restore. Never uses `theme::ACTION` (`#2ea043`) or `PANEL_BG`
+    /// (`#1a1a26`) so the smoke check baselines on Home and Export stay clean.
+    fn render_sync(&self) -> impl IntoElement {
+        let Some(status) = self.sync_status.as_ref().filter(|s| s.enabled) else {
+            let entity_enable = self.entity.clone();
+            let entity_join = self.entity.clone();
+            return div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_6()
+                .pt_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(theme::MUTED_TEXT))
+                        .child("SYNC"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(theme::HINT_TEXT))
+                        .child("off"),
+                )
+                .child(
+                    div()
+                        .id("sync-enable")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(rgba(theme::ACCENT))
+                        .cursor_pointer()
+                        .child("enable sync")
+                        .on_click(move |_ev, _window, cx| {
+                            if let Some(entity) = entity_enable.clone() {
+                                entity.update(cx, |view, cx| {
+                                    view.open_sync_dialog(SyncMode::Create);
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    div()
+                        .id("sync-join")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(rgba(theme::ACCENT))
+                        .cursor_pointer()
+                        .child("join folder")
+                        .on_click(move |_ev, _window, cx| {
+                            if let Some(entity) = entity_join.clone() {
+                                entity.update(cx, |view, cx| {
+                                    view.open_sync_dialog(SyncMode::Join);
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                )
+                .into_any_element();
+        };
+
+        let tz = display_tz(&self.snapshot);
+        let entity_now = self.entity.clone();
+        let entity_code = self.entity.clone();
+        let entity_repair = self.entity.clone();
+        let entity_unpair = self.entity.clone();
+        let show_repair = status.needs_repair || status.peers.iter().any(|p| p.quarantined);
+
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_6()
+            .pt_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgba(theme::MUTED_TEXT))
+                    .child("SYNC"),
+            )
+            .child(
+                div()
+                    .id("sync-now")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                    .text_color(rgba(theme::BODY_TEXT))
+                    .cursor_pointer()
+                    .child("sync now")
+                    .on_click(move |_ev, _window, cx| {
+                        if let Some(entity) = entity_now.clone() {
+                            entity.update(cx, |view, cx| {
+                                view.sync_now();
+                                cx.notify();
+                            });
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .id("sync-show-code")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                    .text_color(rgba(theme::BODY_TEXT))
+                    .cursor_pointer()
+                    .child("show code")
+                    .on_click(move |_ev, _window, cx| {
+                        if let Some(entity) = entity_code.clone() {
+                            entity.update(cx, |view, cx| {
+                                view.sync_show_code();
+                                cx.notify();
+                            });
+                        }
+                    }),
+            );
+
+        if show_repair {
+            header = header.child(
+                div()
+                    .id("sync-repair")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                    .text_color(rgba(theme::WARNING))
+                    .cursor_pointer()
+                    .child("repair")
+                    .on_click(move |_ev, _window, cx| {
+                        if let Some(entity) = entity_repair.clone() {
+                            entity.update(cx, |view, cx| {
+                                view.sync_repair();
+                                cx.notify();
+                            });
+                        }
+                    }),
+            );
+        }
+
+        header = header.child(
+            div()
+                .id("sync-unpair")
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                .text_color(rgba(theme::DANGER))
+                .cursor_pointer()
+                .child("unpair")
+                .on_click(move |_ev, _window, cx| {
+                    if let Some(entity) = entity_unpair.clone() {
+                        entity.update(cx, |view, cx| {
+                            view.open_sync_unpair_confirm();
+                            cx.notify();
+                        });
+                    }
+                }),
+        );
+
+        let folder_label = status
+            .folder
+            .as_deref()
+            .map(timetrack_core::sanitize_display)
+            .unwrap_or_else(|| "(no folder)".to_string());
+        let last_sync_label = match status.last_sync_at {
+            Some(ts) => format_sync_time(ts, &tz),
+            None => "never synced".to_string(),
+        };
+        let mut summary_text = format!(
+            "{folder_label} · dev {} · last sync {last_sync_label}",
+            short_device_id(&status.device_id)
+        );
+        if status.merged_through > 0 {
+            summary_text.push_str(&format!(
+                " · merged {}",
+                format_sync_time(status.merged_through, &tz)
+            ));
+        }
+        if status.compacted_through > 0 {
+            summary_text.push_str(&format!(
+                " · compacted {}",
+                format_sync_time(status.compacted_through, &tz)
+            ));
+        }
+
+        let mut body = div().flex().flex_col().px_6().child(
+            div()
+                .py_1()
+                .text_sm()
+                .text_color(rgba(theme::ROW_TEXT))
+                .child(summary_text),
+        );
+
+        if !status.has_key {
+            body = body.child(
+                div()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgba(theme::WARNING))
+                    .child("⚠ sync key missing in OS credential store — re-pair or rotate key"),
+            );
+        }
+        if status.needs_repair {
+            body = body.child(
+                div()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgba(theme::WARNING))
+                    .child("⚠ device fell behind (>90d or behind compaction) — click repair to pull-merge before publishing"),
+            );
+        }
+        if let Some(err) = &status.last_error {
+            body = body.child(
+                div()
+                    .py_1()
+                    .text_sm()
+                    .text_color(rgba(theme::DANGER))
+                    .child(format!(
+                        "sync error: {}",
+                        timetrack_core::sanitize_display(err)
+                    )),
+            );
+        }
+
+        for peer in &status.peers {
+            let short = short_device_id(&peer.device_id);
+            let pub_str = format_sync_time(peer.last_published_at, &tz);
+            let merged_str = format_sync_time(peer.last_merged_through, &tz);
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .py_1()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(rgba(theme::STRONG_TEXT))
+                        .child(format!("peer {short}")),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgba(theme::MUTED_TEXT))
+                        .child(format!("published {pub_str} · merged {merged_str}")),
+                );
+            if let Some(badge) = peer_status_badge(peer) {
+                row = row.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(rgba(if peer.quarantined {
+                            theme::DANGER
+                        } else {
+                            theme::WARNING
+                        }))
+                        .child(badge),
+                );
+            }
+            body = body.child(row);
+            if let Some(warn) = &peer.last_warning {
+                body = body.child(
+                    div()
+                        .pl_4()
+                        .pb_1()
+                        .text_sm()
+                        .text_color(rgba(theme::WARNING))
+                        .child(format!("⚠ {}", timetrack_core::sanitize_display(warn))),
+                );
+            }
+        }
+
+        if !self.sync_conflicts.is_empty() {
+            body = body.child(
+                div()
+                    .pt_2()
+                    .text_sm()
+                    .text_color(rgba(theme::WARNING))
+                    .child(format!("CONFLICTS ({})", self.sync_conflicts.len())),
+            );
+            for conflict in &self.sync_conflicts {
+                let conflict_id = conflict.id.clone();
+                let entity_restore = self.entity.clone();
+                let meta = format!(
+                    "lost @{} ({}) to @{} ({})",
+                    format_sync_time(conflict.loser_updated_at, &tz),
+                    short_device_id(&conflict.loser_device_id),
+                    format_sync_time(conflict.winner_updated_at, &tz),
+                    short_device_id(&conflict.winner_device_id),
+                );
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .py_1()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_sm()
+                                .text_color(rgba(theme::MUTED_TEXT))
+                                .child(conflict.kind.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .text_sm()
+                                .text_color(rgba(theme::BODY_TEXT))
+                                .child(format!(
+                                    "{} · {meta}",
+                                    timetrack_core::sanitize_display(&conflict.summary)
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id(Self::source_button_id("restore-conflict", &conflict.id))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_sm()
+                                .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                                .text_color(rgba(theme::ACCENT))
+                                .cursor_pointer()
+                                .child("restore")
+                                .on_click(move |_ev, _window, cx| {
+                                    if let Some(entity) = entity_restore.clone() {
+                                        let id = conflict_id.clone();
+                                        entity.update(cx, |view, cx| {
+                                            view.restore_sync_conflict(&id);
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        ),
+                );
+            }
+        }
+
+        div().child(header).child(body).into_any_element()
+    }
+
     /// This week's time per project, longest first.
     fn render_week_by_project(&self) -> impl IntoElement {
         let mut rows: Vec<(String, i64)> = self
@@ -832,5 +1219,41 @@ mod tests {
         assert_eq!(snap.week, before);
         assert_eq!(snap.week.total_ms, 180_000);
         assert_eq!(snap.week.entry_count, 3);
+    }
+
+    #[test]
+    fn sync_display_helpers_format_ids_times_and_peer_badges() {
+        assert_eq!(short_device_id("abcdef0123456789"), "abcdef01");
+        assert_eq!(short_device_id("abc"), "abc");
+
+        let utc = timetrack_core::Tz::utc();
+        assert_eq!(format_sync_time(0, &utc), "none");
+        // 2026-10-08T14:30:00Z
+        let ms = 1_791_469_800_000;
+        let formatted = format_sync_time(ms, &utc);
+        assert!(formatted.contains(' '), "{formatted}");
+        assert!(!formatted.contains('T'), "{formatted}");
+
+        let base = timetrack_proto::SyncPeerView {
+            device_id: "0123456789abcdef".into(),
+            last_published_at: ms,
+            last_merged_through: ms,
+            last_seen_at: ms,
+            quarantined: false,
+            stale: false,
+            last_warning: None,
+        };
+        assert_eq!(peer_status_badge(&base), None);
+
+        let mut stale = base.clone();
+        stale.stale = true;
+        assert_eq!(peer_status_badge(&stale), Some("stale (>7d)"));
+
+        let mut quar = stale;
+        quar.quarantined = true;
+        assert_eq!(
+            peer_status_badge(&quar),
+            Some("quarantined (>90d / behind compaction)")
+        );
     }
 }

@@ -40,6 +40,10 @@ use self::dialogs::source::{
     source_remove_offer,
 };
 use self::dialogs::split::{SplitPrompt, resolve_split};
+use self::dialogs::sync::{
+    SyncCodeDialog, SyncDialog, SyncField, SyncMode, SyncSave, SyncUnpairConfirm,
+    resolve_sync_dialog,
+};
 use self::export::picker::{ExportPicker, RangeEnd};
 use self::keys::printable_char;
 use self::mouse::MouseField;
@@ -110,11 +114,14 @@ enum OpenPrompt {
     Project,
     Split,
     Source,
+    Sync,
     Merge,
     Delete,
     Recolour,
     DeleteProject,
     SourceRemove,
+    SyncCode,
+    SyncUnpair,
 }
 
 /// Which prompt is open, if one is.
@@ -131,21 +138,25 @@ enum OpenPrompt {
 /// At most one prompt is open at a time (each one swallows the keys that
 /// would open another), so the order below is the priority the key handler
 /// already used: the entry dialog first, then the project prompt, the split
-/// prompt, the source dialog (#153), the merge confirmation, the delete
-/// confirmation, and the three housekeeping prompts (#104, #153) last.
-// Nine flags, one per prompt: a struct would only rename the call sites'
+/// prompt, the source dialog (#153), the sync dialog (#176), the merge
+/// confirmation, the delete confirmation, the three housekeeping prompts
+/// (#104, #153), and the sync code/unpair modals last.
+// Twelve flags, one per prompt: a struct would only rename the call sites'
 // positional bools without making them clearer.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn which_prompt(
     entry: bool,
     project: bool,
     split: bool,
     source: bool,
+    sync: bool,
     merge: bool,
     delete: bool,
     recolour: bool,
     delete_project: bool,
     source_remove: bool,
+    sync_code: bool,
+    sync_unpair: bool,
 ) -> Option<OpenPrompt> {
     if entry {
         Some(OpenPrompt::Entry)
@@ -155,6 +166,8 @@ fn which_prompt(
         Some(OpenPrompt::Split)
     } else if source {
         Some(OpenPrompt::Source)
+    } else if sync {
+        Some(OpenPrompt::Sync)
     } else if merge {
         Some(OpenPrompt::Merge)
     } else if delete {
@@ -165,6 +178,10 @@ fn which_prompt(
         Some(OpenPrompt::DeleteProject)
     } else if source_remove {
         Some(OpenPrompt::SourceRemove)
+    } else if sync_code {
+        Some(OpenPrompt::SyncCode)
+    } else if sync_unpair {
+        Some(OpenPrompt::SyncUnpair)
     } else {
         None
     }
@@ -253,8 +270,11 @@ fn pending_outcome(
     sources: &[timetrack_proto::SourceView],
 ) -> Option<Option<String>> {
     let label = match action {
-        Action::Refresh | Action::ExportCsv(_) | Action::InstallUpdate { .. } => return None,
-        Action::StartService => None,
+        Action::Refresh
+        | Action::ExportCsv(_)
+        | Action::InstallUpdate { .. }
+        | Action::PickSyncFolder => return None,
+        Action::StartService | Action::SyncShowCode => None,
         Action::QuickAdd { project, ms } => Some(format!(
             "added {} to {}",
             timetrack_core::format_compact(*ms),
@@ -316,6 +336,19 @@ fn pending_outcome(
             Some(format!("updated source {}", source_display(sources, id)))
         }
         Action::RemoveSource(id) => Some(format!("removed source {}", source_display(sources, id))),
+        Action::SyncEnable { folder, .. } => Some(format!(
+            "folder sync enabled for {}",
+            timetrack_core::sanitize_display(folder)
+        )),
+        Action::SyncNow => Some("sync completed".to_string()),
+        Action::SyncRepair => Some("sync repaired".to_string()),
+        Action::SyncUnpair { delete_file } => Some(if *delete_file {
+            "sync unpaired and device file deleted".to_string()
+        } else {
+            "sync unpaired".to_string()
+        }),
+        Action::SyncRotateKey => Some("sync key rotated — re-pair other devices".to_string()),
+        Action::SyncRestoreConflict(_) => Some("conflict restored — sync to propagate".to_string()),
     };
     Some(label)
 }
@@ -357,6 +390,10 @@ pub struct TimetrackView {
     /// Registered external sources (#153), forwarded by the service
     /// thread when they change. Empty against a bus-only service.
     sources: Vec<timetrack_proto::SourceView>,
+    /// Folder-sync state (#176), forwarded by the service thread when it changes.
+    sync_status: Option<timetrack_proto::SyncStatusView>,
+    /// Unresolved folder-sync conflicts (#176), forwarded when they change.
+    sync_conflicts: Vec<timetrack_proto::SyncConflictView>,
     /// Whether any snapshot has arrived yet. Until it has, `snapshot`
     /// is the empty default and the tabs say "Connecting" rather than
     /// drawing it as an empty store (see `show_connecting`).
@@ -419,6 +456,12 @@ pub struct TimetrackView {
     /// from a row button only, so the keyboard only cancels it (escape)
     /// or quits (`q`); the Confirm button executes.
     source_remove_confirm: Option<SourceRemoveConfirm>,
+    /// The folder-sync setup dialog (#176), when open.
+    sync_dialog: Option<SyncDialog>,
+    /// The pairing-code modal dialog (#176), when open.
+    sync_code_dialog: Option<SyncCodeDialog>,
+    /// Pending folder-sync unpair confirmation (#176), when open.
+    sync_unpair_confirm: Option<SyncUnpairConfirm>,
     /// The Export tab's scope-plus-anchor picker (spec #19). The anchor
     /// defaults to now at view creation; all time ignores it.
     export_picker: ExportPicker,
@@ -457,6 +500,8 @@ impl TimetrackView {
             snapshot: Snapshot::default(),
             suggestions: Vec::new(),
             sources: Vec::new(),
+            sync_status: None,
+            sync_conflicts: Vec::new(),
             snapshot_received: false,
             status: None,
             pending_outcomes: VecDeque::new(),
@@ -475,6 +520,9 @@ impl TimetrackView {
             delete_project_confirm: None,
             source_dialog: None,
             source_remove_confirm: None,
+            sync_dialog: None,
+            sync_code_dialog: None,
+            sync_unpair_confirm: None,
             export_picker: ExportPicker::new(now_ms()),
             export_last_dest: None,
             export_last_via_portal: false,
@@ -693,6 +741,32 @@ impl TimetrackView {
                     self.sources = fresh;
                     changed = true;
                 }
+                Ok(Msg::SyncStatus(fresh)) => {
+                    if self.sync_status.as_ref() != Some(&fresh) {
+                        self.sync_status = Some(fresh);
+                        changed = true;
+                    }
+                }
+                Ok(Msg::SyncConflicts(fresh)) => {
+                    if self.sync_conflicts != fresh {
+                        self.sync_conflicts = fresh;
+                        changed = true;
+                    }
+                }
+                Ok(Msg::SyncCode { code, rotated }) => {
+                    self.sync_code_dialog = Some(SyncCodeDialog {
+                        code,
+                        rotated,
+                        copied: false,
+                    });
+                    changed = true;
+                }
+                Ok(Msg::SyncFolderPicked(path)) => {
+                    if let Some(dlg) = self.sync_dialog.as_mut() {
+                        dlg.set_folder(path);
+                        changed = true;
+                    }
+                }
                 Ok(Msg::UpdateCurrent) => {
                     self.update.checked = true;
                 }
@@ -806,11 +880,14 @@ impl TimetrackView {
             self.project_prompt.is_some(),
             self.split_prompt.is_some(),
             self.source_dialog.is_some(),
+            self.sync_dialog.is_some(),
             self.merge_confirm.is_some(),
             self.delete_confirm.is_some(),
             self.recolour_prompt.is_some(),
             self.delete_project_confirm.is_some(),
             self.source_remove_confirm.is_some(),
+            self.sync_code_dialog.is_some(),
+            self.sync_unpair_confirm.is_some(),
         )
     }
 
@@ -830,6 +907,9 @@ impl TimetrackView {
             return Some((&mut prompt.at, &mut prompt.caret));
         }
         if let Some(dlg) = self.source_dialog.as_mut() {
+            return dlg.focused_text_mut();
+        }
+        if let Some(dlg) = self.sync_dialog.as_mut() {
             return dlg.focused_text_mut();
         }
         if self.export_picker.editing {
@@ -906,6 +986,7 @@ impl TimetrackView {
             Some(OpenPrompt::Project) => return self.on_project_key(ev),
             Some(OpenPrompt::Split) => return self.on_split_key(ev),
             Some(OpenPrompt::Source) => return self.on_source_key(ev),
+            Some(OpenPrompt::Sync) => return self.on_sync_key(ev),
             Some(OpenPrompt::Recolour) => return self.on_recolour_key(ev),
             // A merge or a delete waits its turn: the anchor field is typed
             // into first, and each is answered by its own key handler below.
@@ -933,6 +1014,8 @@ impl TimetrackView {
             Some(OpenPrompt::Delete) => return self.on_delete_key(ev),
             Some(OpenPrompt::DeleteProject) => return self.on_delete_project_key(ev),
             Some(OpenPrompt::SourceRemove) => return self.on_source_remove_key(ev),
+            Some(OpenPrompt::SyncCode) => return self.on_sync_code_key(ev),
+            Some(OpenPrompt::SyncUnpair) => return self.on_sync_unpair_key(ev),
             _ => {}
         }
         // Tab cycles the three tabs (§11); shift goes backward. The Tab key
@@ -1761,6 +1844,175 @@ impl TimetrackView {
         !matches!(ev.keystroke.key_char.as_deref(), Some("q"))
     }
 
+    /// Open the folder-sync setup dialog in Create or Join mode (#176).
+    pub(crate) fn open_sync_dialog(&mut self, mode: SyncMode) {
+        self.status = None;
+        self.sync_dialog = Some(SyncDialog::new(mode));
+    }
+
+    pub(crate) fn close_sync_dialog(&mut self) {
+        if let Some(dlg) = self.sync_dialog.as_mut() {
+            dlg.clear_code();
+        }
+        self.sync_dialog = None;
+    }
+
+    pub(crate) fn cycle_sync_mode(&mut self, delta: i32) {
+        if let Some(dlg) = self.sync_dialog.as_mut() {
+            dlg.cycle_mode(delta);
+        }
+    }
+
+    pub(crate) fn focus_sync_field(&mut self, field: SyncField) {
+        if let Some(dlg) = self.sync_dialog.as_mut() {
+            dlg.focus_field(field);
+        }
+    }
+
+    pub(crate) fn pick_sync_folder(&mut self) {
+        self.send(Action::PickSyncFolder);
+    }
+
+    pub(crate) fn sync_save(&mut self) {
+        let Some(dlg) = self.sync_dialog.as_ref() else {
+            return;
+        };
+        match resolve_sync_dialog(dlg) {
+            Err(msg) => {
+                if let Some(open) = self.sync_dialog.as_mut() {
+                    open.error = Some(msg);
+                }
+            }
+            Ok(SyncSave::Enable {
+                folder,
+                pairing_code,
+            }) => {
+                self.send(Action::SyncEnable {
+                    folder,
+                    pairing_code,
+                });
+                self.close_sync_dialog();
+            }
+        }
+    }
+
+    fn on_sync_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if let Some(dlg) = self.sync_dialog.as_mut() {
+            let m = &ev.keystroke.modifiers;
+            if dlg.edit_key(&ev.keystroke.key, m.shift, m.control) {
+                return true;
+            }
+        }
+        match ev.keystroke.key.as_str() {
+            "escape" => self.close_sync_dialog(),
+            "enter" => self.sync_save(),
+            "tab" => {
+                if let Some(dlg) = self.sync_dialog.as_mut() {
+                    if ev.keystroke.modifiers.shift {
+                        dlg.prev_field();
+                    } else {
+                        dlg.next_field();
+                    }
+                }
+            }
+            "backspace" => {
+                if let Some(dlg) = self.sync_dialog.as_mut() {
+                    dlg.backspace();
+                }
+            }
+            _ => {
+                if let Some(ch) = printable_char(ev)
+                    && let Some(dlg) = self.sync_dialog.as_mut()
+                {
+                    if dlg.field == SyncField::Mode {
+                        match ch {
+                            "h" => dlg.cycle_mode(-1),
+                            "l" => dlg.cycle_mode(1),
+                            _ => {}
+                        }
+                    } else if !self.ime_live {
+                        dlg.type_text(ch);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn copy_sync_code(&mut self, cx: &mut Context<Self>) {
+        if let Some(dlg) = self.sync_code_dialog.as_mut() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(dlg.code.clone()));
+            dlg.copied = true;
+        }
+    }
+
+    pub(crate) fn close_sync_code_dialog(&mut self) {
+        self.sync_code_dialog = None;
+    }
+
+    pub(crate) fn rotate_sync_key(&mut self) {
+        self.send(Action::SyncRotateKey);
+    }
+
+    fn on_sync_code_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        match ev.keystroke.key.as_str() {
+            "escape" | "enter" => {
+                self.close_sync_code_dialog();
+                true
+            }
+            _ => !matches!(ev.keystroke.key_char.as_deref(), Some("q")),
+        }
+    }
+
+    pub(crate) fn open_sync_unpair_confirm(&mut self) {
+        let folder = self
+            .sync_status
+            .as_ref()
+            .and_then(|s| s.folder.as_deref())
+            .map(timetrack_core::sanitize_display)
+            .unwrap_or_else(|| "sync folder".to_string());
+        self.status = None;
+        self.sync_unpair_confirm = Some(SyncUnpairConfirm {
+            summary: format!(
+                "Unpair from {folder}? Local tracked time stays intact; choose whether to remove this device's sync file from the folder."
+            ),
+        });
+    }
+
+    pub(crate) fn confirm_sync_unpair(&mut self, delete_file: bool) {
+        if self.sync_unpair_confirm.take().is_some() {
+            self.send(Action::SyncUnpair { delete_file });
+        }
+    }
+
+    pub(crate) fn cancel_sync_unpair(&mut self) {
+        self.sync_unpair_confirm = None;
+    }
+
+    fn on_sync_unpair_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if ev.keystroke.key.as_str() == "escape" {
+            self.cancel_sync_unpair();
+            return true;
+        }
+        !matches!(ev.keystroke.key_char.as_deref(), Some("q"))
+    }
+
+    pub(crate) fn sync_now(&mut self) {
+        self.send(Action::SyncNow);
+    }
+
+    pub(crate) fn sync_repair(&mut self) {
+        self.send(Action::SyncRepair);
+    }
+
+    pub(crate) fn sync_show_code(&mut self) {
+        self.send(Action::SyncShowCode);
+    }
+
+    pub(crate) fn restore_sync_conflict(&mut self, id: &str) {
+        self.send(Action::SyncRestoreConflict(id.to_string()));
+    }
+
     /// Offer the merge confirmation for the selection, if the selected entry
     /// overlaps or touches anything on its project.
     fn open_merge_confirm(&mut self) {
@@ -2103,6 +2355,13 @@ impl TimetrackView {
                     .to_string()
             } else if self.source_remove_confirm.is_some() {
                 "Confirm to remove the source · esc to cancel".to_string()
+            } else if self.sync_dialog.is_some() {
+                "type to edit · tab next field · h/l switch mode · enter enable sync · esc cancel"
+                    .to_string()
+            } else if self.sync_code_dialog.is_some() {
+                "copy or note this pairing code · esc close".to_string()
+            } else if self.sync_unpair_confirm.is_some() {
+                "choose whether to delete this device's sync file · esc to cancel".to_string()
             } else if self.export_picker.is_typing() {
                 "type a day YYYY-MM-DD · enter set · esc cancel".to_string()
             } else {
@@ -2352,7 +2611,7 @@ mod tests {
     fn no_open_prompt_means_no_prompt() {
         assert_eq!(
             which_prompt(
-                false, false, false, false, false, false, false, false, false
+                false, false, false, false, false, false, false, false, false, false, false, false
             ),
             None
         );
@@ -2361,40 +2620,76 @@ mod tests {
     #[test]
     fn each_open_prompt_is_the_one_that_owns_the_keyboard() {
         assert_eq!(
-            which_prompt(true, false, false, false, false, false, false, false, false),
+            which_prompt(
+                true, false, false, false, false, false, false, false, false, false, false, false
+            ),
             Some(OpenPrompt::Entry)
         );
         assert_eq!(
-            which_prompt(false, true, false, false, false, false, false, false, false),
+            which_prompt(
+                false, true, false, false, false, false, false, false, false, false, false, false
+            ),
             Some(OpenPrompt::Project)
         );
         assert_eq!(
-            which_prompt(false, false, true, false, false, false, false, false, false),
+            which_prompt(
+                false, false, true, false, false, false, false, false, false, false, false, false
+            ),
             Some(OpenPrompt::Split)
         );
         assert_eq!(
-            which_prompt(false, false, false, true, false, false, false, false, false),
+            which_prompt(
+                false, false, false, true, false, false, false, false, false, false, false, false
+            ),
             Some(OpenPrompt::Source)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, true, false, false, false, false),
+            which_prompt(
+                false, false, false, false, true, false, false, false, false, false, false, false
+            ),
+            Some(OpenPrompt::Sync)
+        );
+        assert_eq!(
+            which_prompt(
+                false, false, false, false, false, true, false, false, false, false, false, false
+            ),
             Some(OpenPrompt::Merge)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, false, true, false, false, false),
+            which_prompt(
+                false, false, false, false, false, false, true, false, false, false, false, false
+            ),
             Some(OpenPrompt::Delete)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, false, false, true, false, false),
+            which_prompt(
+                false, false, false, false, false, false, false, true, false, false, false, false
+            ),
             Some(OpenPrompt::Recolour)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, false, false, false, true, false),
+            which_prompt(
+                false, false, false, false, false, false, false, false, true, false, false, false
+            ),
             Some(OpenPrompt::DeleteProject)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, false, false, false, false, true),
+            which_prompt(
+                false, false, false, false, false, false, false, false, false, true, false, false
+            ),
             Some(OpenPrompt::SourceRemove)
+        );
+        assert_eq!(
+            which_prompt(
+                false, false, false, false, false, false, false, false, false, false, true, false
+            ),
+            Some(OpenPrompt::SyncCode)
+        );
+        assert_eq!(
+            which_prompt(
+                false, false, false, false, false, false, false, false, false, false, false, true
+            ),
+            Some(OpenPrompt::SyncUnpair)
         );
     }
 
@@ -2403,23 +2698,39 @@ mod tests {
         // The key handler used to check the prompts one by one, in this
         // order; the shared question has to keep it.
         assert_eq!(
-            which_prompt(true, true, true, true, true, true, true, true, true),
+            which_prompt(
+                true, true, true, true, true, true, true, true, true, true, true, true
+            ),
             Some(OpenPrompt::Entry)
         );
         assert_eq!(
-            which_prompt(false, true, true, true, true, true, true, true, true),
+            which_prompt(
+                false, true, true, true, true, true, true, true, true, true, true, true
+            ),
             Some(OpenPrompt::Project)
         );
         assert_eq!(
-            which_prompt(false, false, true, true, true, true, true, true, true),
+            which_prompt(
+                false, false, true, true, true, true, true, true, true, true, true, true
+            ),
             Some(OpenPrompt::Split)
         );
         assert_eq!(
-            which_prompt(false, false, false, true, true, true, true, true, true),
+            which_prompt(
+                false, false, false, true, true, true, true, true, true, true, true, true
+            ),
             Some(OpenPrompt::Source)
         );
         assert_eq!(
-            which_prompt(false, false, false, false, true, true, true, true, true),
+            which_prompt(
+                false, false, false, false, true, true, true, true, true, true, true, true
+            ),
+            Some(OpenPrompt::Sync)
+        );
+        assert_eq!(
+            which_prompt(
+                false, false, false, false, false, true, true, true, true, true, true, true
+            ),
             Some(OpenPrompt::Merge)
         );
     }
@@ -2623,6 +2934,49 @@ mod tests {
             Action::RemoveSource(id) => assert_eq!(id, "src-1"),
             other => panic!("expected RemoveSource, got {other:?}"),
         }
+        assert_eq!(
+            pending_outcome(&Action::PickSyncFolder, &snap, &sources),
+            None
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncShowCode, &snap, &sources),
+            Some(None)
+        );
+        assert_eq!(
+            pending_outcome(
+                &Action::SyncEnable {
+                    folder: "/tmp/sync".into(),
+                    pairing_code: None,
+                },
+                &snap,
+                &sources
+            ),
+            Some(Some("folder sync enabled for /tmp/sync".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncNow, &snap, &sources),
+            Some(Some("sync completed".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncRepair, &snap, &sources),
+            Some(Some("sync repaired".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncUnpair { delete_file: false }, &snap, &sources),
+            Some(Some("sync unpaired".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncUnpair { delete_file: true }, &snap, &sources),
+            Some(Some("sync unpaired and device file deleted".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncRotateKey, &snap, &sources),
+            Some(Some("sync key rotated — re-pair other devices".to_string()))
+        );
+        assert_eq!(
+            pending_outcome(&Action::SyncRestoreConflict("c1".into()), &snap, &sources),
+            Some(Some("conflict restored — sync to propagate".to_string()))
+        );
     }
 
     // --- tabs and bars (§11) ---

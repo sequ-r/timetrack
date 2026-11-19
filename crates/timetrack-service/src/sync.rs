@@ -1788,4 +1788,254 @@ END:VCALENDAR
         let _ = (a.svc, b.svc, svc_r, a.creds, b.creds, creds_restored);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn gui_client_pairs_reviews_and_restores_cli_conflict_and_vice_versa() {
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("cli-gui-sync");
+        let sync_dir = dir.join("shared");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        let folder = sync_dir.to_string_lossy().into_owned();
+        let t0 = 1_760_000_000_000i64;
+
+        let cli = spawn_test_node(&dir, "cli", t0);
+        let gui = spawn_test_node(&dir, "gui", t0);
+
+        let proj = cli
+            .client
+            .call(Request::AddProject {
+                name: "SyncDemo".into(),
+            })
+            .unwrap()
+            .project()
+            .unwrap();
+        cli.clock.store(t0 + 500, Ordering::Relaxed);
+        let entry = cli
+            .client
+            .call(Request::Add {
+                project_id: proj.id,
+                description: "cli-initial".into(),
+                started_at: t0 - 3_600_000,
+                ended_at: t0,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        // First device (CLI flow) enables sync and mints a pairing code.
+        cli.clock.store(t0 + 1_000, Ordering::Relaxed);
+        let enabled_cli = cli
+            .client
+            .call(Request::SyncEnable {
+                folder: folder.clone(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        let pairing_code = enabled_cli
+            .pairing_code
+            .clone()
+            .expect("first device emits pairing code");
+        assert_eq!(
+            cli.client
+                .call(Request::SyncShowCode)
+                .unwrap()
+                .sync_code()
+                .unwrap(),
+            pairing_code
+        );
+
+        // Second device (GUI flow) joins with folder + pairing_code, pulls & publishes.
+        gui.clock.store(t0 + 1_500, Ordering::Relaxed);
+        let enabled_gui = gui
+            .client
+            .call(Request::SyncEnable {
+                folder,
+                pairing_code: Some(pairing_code),
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        assert!(enabled_gui.pairing_code.is_none());
+        assert!(enabled_gui.status.enabled);
+        assert!(enabled_gui.status.has_key);
+        assert_eq!(enabled_gui.status.peers.len(), 1);
+        assert_eq!(
+            enabled_gui.status.peers[0].device_id,
+            enabled_cli.status.device_id
+        );
+        let gui_snap = gui
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(gui_snap.entries.len(), 1);
+        assert_eq!(gui_snap.entries[0].description, "cli-initial");
+
+        // Concurrent edits: GUI loses (earlier ts) to CLI (later ts), then GUI lists & restores.
+        gui.clock.store(t0 + 2_000, Ordering::Relaxed);
+        gui.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "gui-loser".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        cli.clock.store(t0 + 3_000, Ordering::Relaxed);
+        cli.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "cli-winner".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        cli.clock.store(t0 + 4_000, Ordering::Relaxed);
+        cli.client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        gui.clock.store(t0 + 5_000, Ordering::Relaxed);
+        let gui_sync = gui
+            .client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        assert_eq!(gui_sync.new_conflicts, 1);
+        assert_eq!(gui_sync.status.unresolved_conflicts, 1);
+
+        let gui_conflicts = gui
+            .client
+            .call(Request::SyncConflicts {
+                include_restored: false,
+            })
+            .unwrap()
+            .sync_conflicts()
+            .unwrap();
+        assert_eq!(gui_conflicts.len(), 1);
+        assert!(gui_conflicts[0].summary.contains("gui-loser"));
+
+        gui.clock.store(t0 + 6_000, Ordering::Relaxed);
+        gui.client
+            .call(Request::SyncRestoreConflict {
+                id: gui_conflicts[0].id.clone(),
+            })
+            .unwrap()
+            .unit()
+            .unwrap();
+        gui.client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        assert!(
+            gui.client
+                .call(Request::SyncConflicts {
+                    include_restored: false,
+                })
+                .unwrap()
+                .sync_conflicts()
+                .unwrap()
+                .is_empty()
+        );
+
+        cli.clock.store(t0 + 7_000, Ordering::Relaxed);
+        cli.client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        let cli_after_restore = cli
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(cli_after_restore.entries[0].description, "gui-loser");
+
+        // Reverse direction: CLI loses to GUI, CLI lists & restores, GUI observes restored edit.
+        cli.clock.store(t0 + 8_000, Ordering::Relaxed);
+        cli.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "cli-loser".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        gui.clock.store(t0 + 9_000, Ordering::Relaxed);
+        gui.client
+            .call(Request::SetText {
+                id: entry.id,
+                description: "gui-winner".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        gui.clock.store(t0 + 10_000, Ordering::Relaxed);
+        gui.client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        cli.clock.store(t0 + 11_000, Ordering::Relaxed);
+        let cli_sync = cli
+            .client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        assert_eq!(cli_sync.new_conflicts, 1);
+
+        let cli_conflicts = cli
+            .client
+            .call(Request::SyncConflicts {
+                include_restored: false,
+            })
+            .unwrap()
+            .sync_conflicts()
+            .unwrap();
+        assert_eq!(cli_conflicts.len(), 1);
+        assert!(cli_conflicts[0].summary.contains("cli-loser"));
+
+        cli.clock.store(t0 + 12_000, Ordering::Relaxed);
+        cli.client
+            .call(Request::SyncRestoreConflict {
+                id: cli_conflicts[0].id.clone(),
+            })
+            .unwrap()
+            .unit()
+            .unwrap();
+        cli.client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+
+        gui.clock.store(t0 + 13_000, Ordering::Relaxed);
+        gui.client
+            .call(Request::SyncNow)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        let gui_final = gui
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(gui_final.entries[0].description, "cli-loser");
+
+        let _ = (cli.svc, gui.svc, cli.creds, gui.creds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
