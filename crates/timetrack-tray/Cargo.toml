@@ -28,7 +28,7 @@ ksni = { workspace = true }
 # via tray-icon, and a named mutex plus Win32 message loop via windows-sys.
 # Both are tokio-free, like everything else in this workspace.
 [target.'cfg(target_os = "windows")'.dependencies]
-tray-icon = { version = "0.21", default-features = false }
+tray-icon = { version = "0.26", default-features = false }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -42,7 +42,7 @@ windows-sys = { version = "0.60", features = [
 # the flock single-instance claim. All are tokio-free, like everything
 # else in this workspace.
 [target.'cfg(target_os = "macos")'.dependencies]
-tray-icon = { version = "0.21", default-features = false }
+tray-icon = { version = "0.26", default-features = false }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
