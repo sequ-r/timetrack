@@ -240,6 +240,8 @@ pub enum Request {
     SyncRestoreConflict {
         id: String,
     },
+    /// Drop stale departed/pre-compaction state against active peers and reseed (#175).
+    SyncRepair,
 }
 
 /// One call's successful answer.
