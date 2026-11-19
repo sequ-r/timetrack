@@ -143,12 +143,22 @@ iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/TimeTrack.icns" \
 # The P12 arrives base64'd so it can live in a GitHub secret; the password
 # may legitimately be empty. A throwaway keychain holds the import so the
 # login keychain is never touched, and the trap below always removes both.
+need codesign "macOS only"
+xattr -cr "$APP" 2>/dev/null || true
 SIGNING=0
+KEYCHAIN_DIR=""
 KEYCHAIN=""
 P12=""
+ORIG_KEYCHAINS=()
 cleanup() {
+    if [ "${#ORIG_KEYCHAINS[@]}" -gt 0 ]; then
+        security list-keychains -d user -s "${ORIG_KEYCHAINS[@]}" >/dev/null 2>&1 || true
+    fi
     if [ -n "$KEYCHAIN" ] && [ -f "$KEYCHAIN" ]; then
         security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$KEYCHAIN_DIR" ] && [ -d "$KEYCHAIN_DIR" ]; then
+        rm -rf "$KEYCHAIN_DIR"
     fi
     if [ -n "$P12" ] && [ -f "$P12" ]; then
         rm -f "$P12"
@@ -156,26 +166,38 @@ cleanup() {
 }
 trap cleanup EXIT
 if [ -n "${APPLE_CERT_P12_BASE64:-}" ]; then
-    need codesign "macOS only"
     need security "macOS only"
+    need uuidgen "macOS only"
     [ -n "${APPLE_DEVELOPER_ID:-}" ] \
         || die "APPLE_CERT_P12_BASE64 is set but APPLE_DEVELOPER_ID is empty"
     P12="$(mktemp -t timetrack-sign).p12"
     printf '%s' "$APPLE_CERT_P12_BASE64" | base64 --decode > "$P12"
-    KEYCHAIN="$(mktemp -d -t timetrack-sign)/build.keychain"
-    security create-keychain -p "" "$KEYCHAIN"
+    KEYCHAIN_PASS="$(uuidgen)"
+    KEYCHAIN_DIR="$(mktemp -d -t timetrack-sign)"
+    KEYCHAIN="$KEYCHAIN_DIR/build.keychain-db"
+    while IFS= read -r kc; do
+        kc="${kc#"${kc%%[![:space:]]*}"}"
+        kc="${kc%"${kc##*[![:space:]]}"}"
+        kc="${kc#\"}"
+        kc="${kc%\"}"
+        [ -n "$kc" ] && ORIG_KEYCHAINS+=("$kc")
+    done < <(security list-keychains -d user)
+    security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+    security set-keychain-settings -lut 21600 "$KEYCHAIN"
+    security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
     security import "$P12" -k "$KEYCHAIN" \
         -P "${APPLE_CERT_PASSWORD:-}" -T /usr/bin/codesign
-    security set-key-partition-list -S apple-tool:,apple: -s \
-        -k "" "$KEYCHAIN" >/dev/null
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+        -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
+    security list-keychains -d user -s "$KEYCHAIN" "${ORIG_KEYCHAINS[@]+"${ORIG_KEYCHAINS[@]}"}"
     echo "-- signing bundle (Hardened Runtime)"
     for b in $BINARIES; do
-        codesign --force --sign "$APPLE_DEVELOPER_ID" --timestamp \
+        codesign --force --sign "$APPLE_DEVELOPER_ID" --keychain "$KEYCHAIN" --timestamp \
             --options runtime --entitlements "$ENTITLEMENTS" \
             "$CONTENTS/MacOS/$b" \
             || die "codesign failed on $b"
     done
-    codesign --force --sign "$APPLE_DEVELOPER_ID" --timestamp \
+    codesign --force --sign "$APPLE_DEVELOPER_ID" --keychain "$KEYCHAIN" --timestamp \
         --options runtime --entitlements "$ENTITLEMENTS" "$APP" \
         || die "codesign failed on TimeTrack.app"
     codesign --verify --deep --strict "$APP" \
@@ -186,6 +208,15 @@ else
     echo "build-bundle: The DMG installs and runs, but Gatekeeper refuses it until" >&2
     echo "build-bundle: the user right-click-Opens it once. Releases must say so" >&2
     echo "build-bundle: explicitly in their notes." >&2
+    echo "-- ad-hoc signing bundle (still unsigned for Gatekeeper)"
+    for b in $BINARIES; do
+        codesign --force --sign - "$CONTENTS/MacOS/$b" \
+            || die "ad-hoc codesign failed on $b"
+    done
+    codesign --force --sign - "$APP" \
+        || die "ad-hoc codesign failed on TimeTrack.app"
+    codesign --verify --deep --strict "$APP" \
+        || die "ad-hoc signed bundle failed codesign --verify"
 fi
 
 # --- disk image: the bundle plus a drop target ---
@@ -200,7 +231,7 @@ hdiutil create -volname "TimeTrack" -srcfolder "$DMG_ROOT" \
     -ov -format UDZO "$DMG" >/dev/null \
     || die "hdiutil create failed"
 if [ "$SIGNING" -eq 1 ]; then
-    codesign --force --sign "$APPLE_DEVELOPER_ID" --timestamp "$DMG" \
+    codesign --force --sign "$APPLE_DEVELOPER_ID" --keychain "$KEYCHAIN" --timestamp "$DMG" \
         || die "codesign failed on the DMG"
 fi
 
