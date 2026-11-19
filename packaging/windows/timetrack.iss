@@ -119,7 +119,7 @@ procedure AddUserPath();
 var
   Path: String;
 begin
-  if RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+  if RegQueryStringValue(HKCU, 'Environment', 'Path', Path) and (Path <> '') then
   begin
     if Pos(';' + AppDir() + ';', ';' + Path + ';') = 0 then
       RegWriteStringValue(HKCU, 'Environment', 'Path', Path + ';' + AppDir());

@@ -51,8 +51,10 @@ function Find-Iscc {
   foreach ($p in @(
       "$env:ProgramFiles\Inno Setup 7\ISCC.exe",
       "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+      "$env:LOCALAPPDATA\Programs\Inno Setup 7\ISCC.exe",
       "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-      "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+      "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+      "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe")) {
     if (Test-Path $p) { return $p }
   }
   throw ('ISCC.exe not found. Install Inno Setup 7 (release.yml pins ' +
@@ -114,13 +116,13 @@ if (-not [string]::IsNullOrEmpty($env:WINDOWS_PFX_BASE64)) {
 }
 
 function Invoke-Signtool([string[]]$Files) {
-  $args = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com',
-    '/td', 'SHA256', '/f', $pfxPath')
+  $signArgs = @('sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com',
+    '/td', 'SHA256', '/f', $pfxPath)
   if (-not [string]::IsNullOrEmpty($env:WINDOWS_PFX_PASSWORD)) {
-    $args += @('/p', $env:WINDOWS_PFX_PASSWORD)
+    $signArgs += @('/p', $env:WINDOWS_PFX_PASSWORD)
   }
-  $args += $Files
-  & $signtool @args
+  $signArgs += $Files
+  & $signtool @signArgs
   if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit $LASTEXITCODE" }
 }
 

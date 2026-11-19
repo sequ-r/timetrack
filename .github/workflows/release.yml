@@ -170,6 +170,8 @@ jobs:
     needs: [checks, version]
     runs-on: windows-latest
     timeout-minutes: 60
+    outputs:
+      signing_status: ${{ steps.build.outputs.signing_status }}
     env:
       INNO_VERSION: 7.1.1
       # Pinned like the AppImage tools: bump URL and sum together, verified
@@ -197,31 +199,45 @@ jobs:
       # them the script prints an UNSIGNED warning and the installer ships
       # unsigned, which the release notes must then say explicitly
       # (packaging/windows/README.md, "the unsigned fallback").
-      - name: Build the installer
+      - id: build
+        name: Build the installer
         shell: pwsh
         env:
           WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
           WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
-        run: .\packaging\windows\build-installer.ps1 -Version '${{ needs.version.outputs.version }}' -OutputDir dist
+        run: |
+          .\packaging\windows\build-installer.ps1 -Version '${{ needs.version.outputs.version }}' -OutputDir dist
+          if ([string]::IsNullOrEmpty($env:WINDOWS_PFX_BASE64)) {
+            "signing_status=unsigned" >> $env:GITHUB_OUTPUT
+          } else {
+            "signing_status=signed" >> $env:GITHUB_OUTPUT
+          }
       # A per-user install touches only the runner's own profile, so the
       # installer can prove itself end to end here: silent install, the
       # installed CLI answers (clap replies before any bus traffic, same as
       # the AppImage check above), then silent uninstall leaves no program
-      # dir behind. Data preservation needs a seeded store on a clean VM and
+      # dir behind. Inno Setup's unins000.exe clones itself to %TEMP% and
+      # exits before cleanup finishes, so poll briefly for the directory to
+      # vanish. Data preservation needs a seeded store on a clean VM and
       # stays a manual acceptance step (#158).
       - name: Silent install and uninstall smoke check
         shell: pwsh
         run: |
           $exe = "dist\TimeTrack-Setup-${{ needs.version.outputs.version }}.exe"
           if (-not (Test-Path $exe)) { throw "missing installer: $exe" }
-          Start-Process $exe -ArgumentList '/VERYSILENT', '/NORESTART' -Wait
+          $install = Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "installer exited with $($install.ExitCode)" }
           $app = "$env:LOCALAPPDATA\Programs\TimeTrack"
           foreach ($b in @('timetrack-gui.exe', 'timetrack-service.exe', 'timetrack.exe', 'timetrack-tray.exe')) {
             if (-not (Test-Path "$app\$b")) { throw "missing installed binary: $b" }
           }
           & "$app\timetrack.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'installed CLI did not answer --version' }
-          Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/NORESTART' -Wait
+          $uninst = Start-Process "$app\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($uninst.ExitCode -ne 0) { throw "uninstaller exited with $($uninst.ExitCode)" }
+          for ($i = 0; $i -lt 60 -and (Test-Path $app); $i++) {
+            Start-Sleep -Milliseconds 500
+          }
           if (Test-Path $app) { throw "uninstall left $app behind" }
       - uses: actions/upload-artifact@v7
         with:
@@ -241,6 +257,8 @@ jobs:
     needs: [checks, version]
     runs-on: macos-latest
     timeout-minutes: 60
+    outputs:
+      signing_status: ${{ steps.build.outputs.signing_status }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -255,7 +273,8 @@ jobs:
       # say explicitly (packaging/macos/README.md, "the unsigned
       # fallback"). Without only the API secrets the DMG ships
       # signed-but-unnotarized, which the notes must say instead.
-      - name: Build the disk image
+      - id: build
+        name: Build the disk image
         env:
           APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
           APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
@@ -263,19 +282,29 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: ./packaging/macos/build-bundle.sh --version '${{ needs.version.outputs.version }}' --output-dir dist
+        run: |
+          ./packaging/macos/build-bundle.sh --version '${{ needs.version.outputs.version }}' --output-dir dist
+          if [ -z "${APPLE_CERT_P12_BASE64:-}" ]; then
+            echo "signing_status=unsigned" >> "$GITHUB_OUTPUT"
+          elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+            echo "signing_status=notarized" >> "$GITHUB_OUTPUT"
+          else
+            echo "signing_status=signed-unnotarized" >> "$GITHUB_OUTPUT"
+          fi
       # The DMG proves itself end to end here: mount it, check the bundle
       # layout (all four binaries co-located for the sibling spawn), run
       # the bundled CLI (clap replies before any bus traffic, same as the
-      # AppImage check above), verify a signature when one was made, then
-      # detach. Data preservation and the clean-account walkthrough stay
-      # manual acceptance steps (#159).
+      # AppImage check above), verify the signature (ad-hoc sealed when
+      # unsigned, Developer ID when signed), then detach. Data
+      # preservation and the clean-account walkthrough stay manual
+      # acceptance steps (#159).
       - name: Mount the image and smoke-check the bundle
         run: |
           shopt -s nullglob
           dmg=(dist/TimeTrack-*.dmg)
           if [ "${#dmg[@]}" -ne 1 ]; then echo "::error::expected one DMG, found ${#dmg[@]}"; exit 1; fi
           hdiutil attach -nobrowse -readonly "${dmg[0]}"
+          trap 'hdiutil detach /Volumes/TimeTrack >/dev/null 2>&1 || true' EXIT
           app=/Volumes/TimeTrack/TimeTrack.app
           test -x "$app/Contents/MacOS/timetrack-gui"
           test -x "$app/Contents/MacOS/timetrack-service"
@@ -283,7 +312,18 @@ jobs:
           test -x "$app/Contents/MacOS/timetrack-tray"
           test -f "$app/Contents/Info.plist"
           "$app/Contents/MacOS/timetrack" --version
-          if codesign -dv "$app" 2>/dev/null; then codesign --verify --deep --strict "$app"; else echo "unsigned build: no signature to verify"; fi
+          codesign --verify --deep --strict "$app"
+          sig_info="$(codesign -dv "$app" 2>&1)"
+          if [ "${{ steps.build.outputs.signing_status }}" = "unsigned" ]; then
+            printf '%s\n' "$sig_info" | grep -q 'Signature=adhoc'
+            echo "unsigned (ad-hoc sealed) build verified"
+          else
+            if printf '%s\n' "$sig_info" | grep -q 'Signature=adhoc'; then
+              echo "::error::expected Developer ID signature, got ad-hoc"
+              exit 1
+            fi
+            echo "Developer ID signed build verified"
+          fi
           hdiutil detach /Volumes/TimeTrack
       - uses: actions/upload-artifact@v7
         with:
@@ -315,6 +355,36 @@ jobs:
       - name: Show what would be published
         working-directory: dist
         run: ls -l
+      - id: notes
+        name: Prepare release notes notice
+        env:
+          WINDOWS_SIGNING_STATUS: ${{ needs.windows-installer.outputs.signing_status }}
+          MACOS_SIGNING_STATUS: ${{ needs.macos-dmg.outputs.signing_status }}
+        run: |
+          notices=()
+          if [ "${WINDOWS_SIGNING_STATUS:-}" = "unsigned" ]; then
+            notices+=("- **Windows installer is unsigned in this release** — Windows SmartScreen will show an \"unknown publisher\" prompt (see \`packaging/windows/README.md\`).")
+          fi
+          if [ "${MACOS_SIGNING_STATUS:-}" = "unsigned" ]; then
+            notices+=("- **macOS disk image is unsigned in this release** — right-click → Open on first launch to bypass Gatekeeper (see \`packaging/macos/README.md\`).")
+          elif [ "${MACOS_SIGNING_STATUS:-}" = "signed-unnotarized" ]; then
+            notices+=("- **macOS disk image is signed but not notarized in this release** — Gatekeeper will warn on first launch (see \`packaging/macos/README.md\`).")
+          fi
+          if [ "${#notices[@]}" -gt 0 ]; then
+            body="### Signing status"
+            for line in "${notices[@]}"; do
+              body="${body}"$'\n'"${line}"
+            done
+            printf '%s\n' "$body"
+            {
+              echo "body<<EOF_RELEASE_NOTES"
+              printf '%s\n' "$body"
+              echo "EOF_RELEASE_NOTES"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "All release artifacts are signed and notarized."
+            echo "body=" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@v7
         if: ${{ inputs.dry_run }}
         with:
@@ -332,6 +402,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         with:
           tag_name: ${{ needs.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
           files: |
             dist/*.AppImage
             dist/*.zsync

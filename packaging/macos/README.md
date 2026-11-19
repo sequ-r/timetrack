@@ -130,11 +130,14 @@ secrets, never baked into a config file:
    shared `SHA256SUMS`.
 
 **Unsigned fallback (explicit):** with no `APPLE_CERT_P12_BASE64` the
-build still succeeds and prints an `UNSIGNED build` warning. Such a DMG
-installs and runs, but Gatekeeper refuses the quarantined app until the
-user right-click-Opens it once (Finder → right click → Open). A release
-cut without the secrets **must say so in its release notes** ("macOS
-disk image is unsigned in this release; right-click-Open on first
+build still succeeds and prints an `UNSIGNED build` warning. `build-bundle.sh`
+applies an ad-hoc signature (`codesign --force --sign -`) so the bundle
+and its resources seal cleanly on Apple Silicon and pass
+`codesign --verify --deep --strict`, while remaining unsigned to Gatekeeper.
+Such a DMG installs and runs, but Gatekeeper refuses the quarantined app
+until the user right-click-Opens it once (Finder → right click → Open). A
+release cut without the secrets **must say so in its release notes**
+("macOS disk image is unsigned in this release; right-click-Open on first
 launch") — that sentence, not silence, is the accepted limitation from
 #159. Signed-but-unnotarized (certificate without the API secrets) is
 the middle state: Gatekeeper still warns on first launch, and the notes
