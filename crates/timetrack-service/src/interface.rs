@@ -934,11 +934,21 @@ impl EntryService {
         let view = protocol::entry_to_view(&entry);
         let g = lock(&self.inner);
         g.store
-            .link_suggestion_entry(id, &entry.id)
+            .link_confirmed_entry(
+                id,
+                &entry.id,
+                &suggestion.source_id,
+                &suggestion.external_uid,
+                suggestion.started_at,
+            )
             .map_err(|e| ServiceError::Storage(e.to_string()))?;
         Ok(view)
     }
 
+    /// Dismiss a pending suggestion locally.
+    ///
+    /// Dismissals intentionally remain per-device (ADR 0020, #174): what one
+    /// machine dismisses, another machine may still suggest independently.
     pub fn dismiss_suggestion(&self, id: &str) -> Result<(), ServiceError> {
         let g = lock(&self.inner);
         let decided = g

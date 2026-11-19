@@ -44,7 +44,7 @@ use timetrack_core::{
 /// The schema version this build writes, kept in `PRAGMA user_version`.
 /// Bump with a numbered migration in [`migrate`]; a newer database is
 /// refused, never silently reset (§17, the §2 rule).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Whether `id` is already a UUID in hyphenated shape (ADR 0018):
 /// 8-4-4-4-12 hex with hyphens in place. Either hex case counts — a
@@ -753,6 +753,7 @@ impl SqliteStore {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, project_id, description, started_at, ended_at, source, note,
+                            external_source_id, external_uid, external_started_at,
                             created_at, updated_at, device_id
                      FROM entries ORDER BY seq",
                 )
@@ -771,12 +772,12 @@ impl SqliteStore {
                                 source: EntrySource::Manual,
                                 note: row.get(6)?,
                             },
-                            external_source_id: None,
-                            external_uid: None,
-                            external_started_at: None,
-                            created_at: row.get(7)?,
-                            updated_at: row.get(8)?,
-                            device_id: row.get(9)?,
+                            external_source_id: row.get(7)?,
+                            external_uid: row.get(8)?,
+                            external_started_at: row.get(9)?,
+                            created_at: row.get(10)?,
+                            updated_at: row.get(11)?,
+                            device_id: row.get(12)?,
                         },
                         source_code,
                     ))
@@ -898,11 +899,15 @@ impl SqliteStore {
         for er in &write.upsert_entries {
             tx.execute(
                 "INSERT INTO entries(id, project_id, description, started_at, ended_at, source, note,
+                     external_source_id, external_uid, external_started_at,
                      created_at, updated_at, device_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id,
                      description = excluded.description, started_at = excluded.started_at,
                      ended_at = excluded.ended_at, source = excluded.source, note = excluded.note,
+                     external_source_id = excluded.external_source_id,
+                     external_uid = excluded.external_uid,
+                     external_started_at = excluded.external_started_at,
                      created_at = CASE WHEN entries.created_at > 0 AND entries.created_at < excluded.created_at THEN entries.created_at ELSE excluded.created_at END,
                      updated_at = excluded.updated_at, device_id = excluded.device_id",
                 params![
@@ -913,12 +918,24 @@ impl SqliteStore {
                     er.entry.ended_at,
                     source_code(er.entry.source),
                     er.entry.note,
+                    er.external_source_id,
+                    er.external_uid,
+                    er.external_started_at,
                     er.created_at,
                     er.updated_at,
                     er.device_id
                 ],
             )
             .map_err(|e| sqlite(&self.path, e))?;
+            if let (Some(src_id), Some(uid)) = (&er.external_source_id, &er.external_uid) {
+                let match_started = er.external_started_at.unwrap_or(er.entry.started_at);
+                tx.execute(
+                    "UPDATE suggestions SET status = 'confirmed', entry_id = ?1, decided_at = ?2
+                     WHERE source_id = ?3 AND external_uid = ?4 AND started_at = ?5 AND status = 'pending'",
+                    params![er.entry.id, er.updated_at, src_id, uid, match_started],
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            }
         }
 
         // Park any existing source whose `(kind, locator)` is changing in
@@ -1133,9 +1150,31 @@ impl SqliteStore {
                 upsert_project(&tx, p, now_ms, &self.device_id)
                     .map_err(|e| sqlite(&self.path, e))?;
             }
-            RestoredRecord::Entry { entry, .. } => {
+            RestoredRecord::Entry {
+                entry,
+                external_source_id,
+                external_uid,
+                external_started_at,
+            } => {
                 upsert_entry(&tx, entry, now_ms, &self.device_id)
                     .map_err(|e| sqlite(&self.path, e))?;
+                if external_source_id.is_some()
+                    || external_uid.is_some()
+                    || external_started_at.is_some()
+                {
+                    tx.execute(
+                        "UPDATE entries
+                         SET external_source_id = ?2, external_uid = ?3, external_started_at = ?4
+                         WHERE id = ?1",
+                        params![
+                            entry.id,
+                            external_source_id,
+                            external_uid,
+                            external_started_at
+                        ],
+                    )
+                    .map_err(|e| sqlite(&self.path, e))?;
+                }
             }
             RestoredRecord::Source {
                 id,
@@ -1220,6 +1259,11 @@ impl SqliteStore {
         let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
         let mut inserted = 0;
         for item in items {
+            if is_confirmed_in_entries(&tx, source_id, &item.uid, item.started_at)
+                .map_err(|e| sqlite(&self.path, e))?
+            {
+                continue;
+            }
             let id = mint_id(&tx, "sg-").map_err(|e| sqlite(&self.path, e))?;
             let kind = match item.kind {
                 ExternalKind::Event => "event",
@@ -1285,20 +1329,34 @@ impl SqliteStore {
         Ok(self.suggestions(false)?.into_iter().find(|s| s.id == id))
     }
 
-    /// Decide a pending suggestion. Returns false when it was not
-    /// pending (unknown, or already decided): deciding twice is a
-    /// no-op, never a second entry.
-    /// Attach the created entry to a confirmed suggestion (the service
-    /// claims the suggestion first, then creates the entry, then links
-    /// it — so a racing second confirm can never create a duplicate).
-    pub fn link_suggestion_entry(&self, id: &str, entry_id: &str) -> StoreResult<()> {
-        self.lock()
-            .execute(
-                "UPDATE suggestions SET entry_id = ?2 WHERE id = ?1",
-                params![id, entry_id],
-            )
-            .map_err(|e| sqlite(&self.path, e))?;
-        Ok(())
+    /// Attach the created entry to a confirmed suggestion and stamp the
+    /// entry with `(source_id, external_uid, external_started_at)` so sync
+    /// carries confirmation attribution across devices (#174). The service
+    /// claims the suggestion first, then creates the entry, then links it —
+    /// so a racing second confirm can never create a duplicate.
+    pub fn link_confirmed_entry(
+        &self,
+        suggestion_id: &str,
+        entry_id: &str,
+        source_id: &str,
+        external_uid: &str,
+        external_started_at: i64,
+    ) -> StoreResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        tx.execute(
+            "UPDATE suggestions SET entry_id = ?2 WHERE id = ?1",
+            params![suggestion_id, entry_id],
+        )
+        .map_err(|e| sqlite(&self.path, e))?;
+        tx.execute(
+            "UPDATE entries
+             SET external_source_id = ?2, external_uid = ?3, external_started_at = ?4
+             WHERE id = ?1",
+            params![entry_id, source_id, external_uid, external_started_at],
+        )
+        .map_err(|e| sqlite(&self.path, e))?;
+        tx.commit().map_err(|e| sqlite(&self.path, e))
     }
 
     pub fn decide_suggestion(
@@ -1498,6 +1556,11 @@ impl SqliteStore {
                     }
                 }
                 None => {
+                    if is_confirmed_in_entries(&tx, source_id, &item.uid, item.started_at)
+                        .map_err(|e| sqlite(&self.path, e))?
+                    {
+                        continue;
+                    }
                     let id = mint_id(&tx, "sg-").map_err(|e| sqlite(&self.path, e))?;
                     counts.inserted += tx
                         .execute(
@@ -1751,6 +1814,27 @@ pub struct SyncMergeWrite {
     pub needs_repair: Option<bool>,
 }
 
+fn is_confirmed_in_entries(
+    tx: &Connection,
+    source_id: &str,
+    external_uid: &str,
+    started_at: i64,
+) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension as _;
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM entries
+             WHERE external_source_id = ?1
+               AND external_uid = ?2
+               AND COALESCE(external_started_at, started_at) = ?3
+             LIMIT 1",
+            params![source_id, external_uid, started_at],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 fn delete_source_rows(tx: &Connection, id: &str) -> rusqlite::Result<()> {
     tx.execute(
         "DELETE FROM suggestions WHERE source_id = ?1 AND status = 'pending'",
@@ -1978,6 +2062,38 @@ const SCHEMA_V7: &str = "CREATE TABLE sync_conflicts (
              );
              PRAGMA user_version = 7;";
 
+/// The v8 addition (#174, ADR 0020) plus its bump: confirmed `External` entries
+/// carry `(external_source_id, external_uid, external_started_at)` across sync
+/// so peer fetches dedup against synced confirmed entries even when local
+/// suggestion rows live on another machine. Backfills existing confirmed rows.
+const SCHEMA_V8: &str = "ALTER TABLE entries ADD COLUMN external_source_id TEXT;
+             ALTER TABLE entries ADD COLUMN external_uid TEXT;
+             ALTER TABLE entries ADD COLUMN external_started_at INTEGER;
+             CREATE INDEX idx_entries_external_uid ON entries(external_source_id, external_uid)
+                 WHERE external_source_id IS NOT NULL AND external_uid IS NOT NULL;
+             UPDATE entries SET
+                 external_source_id = (
+                     SELECT s.source_id FROM suggestions s
+                     WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+                     LIMIT 1
+                 ),
+                 external_uid = (
+                     SELECT s.external_uid FROM suggestions s
+                     WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+                     LIMIT 1
+                 ),
+                 external_started_at = (
+                     SELECT s.started_at FROM suggestions s
+                     WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+                     LIMIT 1
+                 )
+             WHERE source = 2 AND external_source_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM suggestions s
+                   WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+               );
+             PRAGMA user_version = 8;";
+
 /// Numbered schema migrations, applied in order on open. Each step runs
 /// in its own transaction with the `user_version` bump inside it, so a
 /// crash mid-migration leaves the previous version whole.
@@ -2058,6 +2174,13 @@ fn migrate_with(
         // #173 (ADR 0020): local conflict journal and tracked peer watermarks.
         let tx = conn.transaction().map_err(|e| sqlite(path, e))?;
         tx.execute_batch(SCHEMA_V7).map_err(|e| sqlite(path, e))?;
+        tx.commit().map_err(|e| sqlite(path, e))?;
+        version = 7;
+    }
+    if version < 8 {
+        // #174 (ADR 0020): confirmed External entry UID carriage + backfill.
+        let tx = conn.transaction().map_err(|e| sqlite(path, e))?;
+        tx.execute_batch(SCHEMA_V8).map_err(|e| sqlite(path, e))?;
         tx.commit().map_err(|e| sqlite(path, e))?;
     }
     Ok(())
@@ -3624,5 +3747,102 @@ mod tests {
         assert!(db.sync_peers().unwrap().is_empty());
         assert_eq!(db.sync_conflicts(true).unwrap().len(), 1);
         assert_eq!(db.load().unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn migration_v7_to_v8_backfills_confirmed_entries_and_dedups_recurring_occurrences() {
+        let path = dir("v7-to-v8").join("store.db");
+        let src_id = "11111111-1111-4111-8111-111111111111";
+        let proj_id = "22222222-2222-4222-8222-222222222222";
+        let entry_id = "33333333-3333-4333-8333-333333333333";
+
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            tx.execute_batch(SCHEMA_V2).unwrap();
+            tx.execute_batch("PRAGMA user_version = 3;").unwrap();
+            tx.execute_batch(SCHEMA_V4).unwrap();
+            tx.execute_batch(SCHEMA_V5).unwrap();
+            tx.execute_batch("PRAGMA user_version = 6;").unwrap();
+            tx.execute_batch(SCHEMA_V7).unwrap();
+            tx.execute(
+                "INSERT INTO projects(id, name, created_at, updated_at, device_id)
+                 VALUES (?1, 'Work', 1, 1, 'd')",
+                params![proj_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO entries(id, project_id, description, started_at, ended_at, source, created_at, updated_at, device_id)
+                 VALUES (?1, ?2, 'Standup', 1000, 2000, 2, 10, 10, 'd')",
+                params![entry_id, proj_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO external_sources(id, kind, locator, label, created_at, updated_at, device_id)
+                 VALUES (?1, 'ics_file', '/tmp/work.ics', 'Work', 1, 1, 'd')",
+                params![src_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO suggestions(id, source_id, external_uid, kind, title, started_at, ended_at, status, entry_id, fetched_at, decided_at)
+                 VALUES ('sg-1', ?1, 'standup@cal', 'event', 'Standup', 1000, 2000, 'confirmed', ?2, 5, 10)",
+                params![src_id, entry_id],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let db = SqliteStore::open_file(&path).unwrap();
+        let v: i64 = db
+            .lock()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let rows = db.load_sync_rows().unwrap();
+        assert_eq!(rows.entries[0].external_source_id.as_deref(), Some(src_id));
+        assert_eq!(rows.entries[0].external_uid.as_deref(), Some("standup@cal"));
+        assert_eq!(rows.entries[0].external_started_at, Some(1000));
+
+        // Normal time edit preserves `external_started_at = 1000` so re-fetch still dedups occ 1.
+        let mut store = db.load().unwrap();
+        store.entries[0].started_at = 1200;
+        let rec = Journal::between(&db.load().unwrap(), &store);
+        db.apply(&rec, 20).unwrap();
+
+        // Wipe suggestion cache as on another device: occ 1 is dedupped against `entries`,
+        // while recurring occ 2 (`started_at = 86_401_000`) still surfaces.
+        db.lock().execute("DELETE FROM suggestions", []).unwrap();
+        let items = vec![
+            ExternalItem {
+                uid: "standup@cal".into(),
+                kind: ExternalKind::Event,
+                title: "Standup".into(),
+                started_at: 1000,
+                ended_at: 2000,
+                recurring: true,
+            },
+            ExternalItem {
+                uid: "standup@cal".into(),
+                kind: ExternalKind::Event,
+                title: "Standup".into(),
+                started_at: 86_401_000,
+                ended_at: 86_402_000,
+                recurring: true,
+            },
+        ];
+        assert_eq!(db.upsert_suggestions(src_id, &items, 30).unwrap(), 1);
+        let pending = db.suggestions(true).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].started_at, 86_401_000);
+
+        // CalDAV reconcile path skips confirmed occ 1 as well.
+        db.lock().execute("DELETE FROM suggestions", []).unwrap();
+        let counts = db
+            .reconcile_caldav_resource(src_id, "/cal/standup.ics", &items, 40)
+            .unwrap();
+        assert_eq!(counts.inserted, 1);
+        assert_eq!(db.suggestions(true).unwrap()[0].started_at, 86_401_000);
     }
 }
