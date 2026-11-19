@@ -1177,4 +1177,184 @@ mod tests {
         let _ = (a.svc, b.svc, a.creds, b.creds);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn confirmed_external_entry_dedups_across_devices_and_dismissals_stay_local() {
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("ext-dedup");
+        let sync_dir = dir.join("shared");
+        let ics_path = dir.join("team.ics");
+        // Nov 15 & Nov 16 2023 sit within [1_700_000_000_000 - 31d, +93d].
+        let ics = "\
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//TimeTrack//Test//EN
+BEGIN:VEVENT
+UID:standup@team
+DTSTART:20231115T090000Z
+DTEND:20231115T093000Z
+SUMMARY:Standup
+RRULE:FREQ=DAILY;COUNT=2
+END:VEVENT
+BEGIN:VEVENT
+UID:optional-coffee@team
+DTSTART:20231115T150000Z
+DTEND:20231115T153000Z
+SUMMARY:Coffee Chat
+END:VEVENT
+END:VCALENDAR
+";
+        std::fs::write(&ics_path, ics).unwrap();
+
+        let a = spawn_test_node(&dir, "node-a", 1_700_000_000_000);
+        let b = spawn_test_node(&dir, "node-b", 1_700_000_001_000);
+
+        let en_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        b.client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: en_a.pairing_code,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+
+        let src = a
+            .client
+            .call(Request::AddSource {
+                kind: "ics_file".into(),
+                locator: ics_path.to_string_lossy().into_owned(),
+                project_id: None,
+                label: "Team".into(),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        let ref_a = a
+            .client
+            .call(Request::RefreshSource {
+                id: Some(src.id.clone()),
+            })
+            .unwrap()
+            .refresh()
+            .unwrap();
+        assert_eq!(ref_a.inserted, 3, "2 standup occurrences + 1 coffee chat");
+
+        let mut suggs_a = a
+            .client
+            .call(Request::ListSuggestions)
+            .unwrap()
+            .suggestions()
+            .unwrap();
+        suggs_a.sort_by_key(|s| (s.started_at, s.external_uid.clone()));
+        // Confirm Standup occ 1; dismiss Coffee Chat; leave Standup occ 2 pending.
+        let occ1 = suggs_a
+            .iter()
+            .find(|s| s.external_uid == "standup@team")
+            .unwrap()
+            .clone();
+        let occ2 = suggs_a
+            .iter()
+            .filter(|s| s.external_uid == "standup@team")
+            .nth(1)
+            .unwrap()
+            .clone();
+        let coffee = suggs_a
+            .iter()
+            .find(|s| s.external_uid == "optional-coffee@team")
+            .unwrap()
+            .clone();
+
+        a.clock.fetch_add(1_000, Ordering::Relaxed);
+        a.client
+            .call(Request::ConfirmSuggestion {
+                id: occ1.id.clone(),
+                project_id: None,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        a.client
+            .call(Request::DismissSuggestion {
+                id: coffee.id.clone(),
+            })
+            .unwrap()
+            .unit()
+            .unwrap();
+
+        // Sync A -> B: B receives the source and confirmed occ 1 entry.
+        a.clock.fetch_add(1_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        b.clock.fetch_add(2_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // When B refreshes the same ICS file, confirmed occ 1 is NEVER suggested again,
+        // while recurring occ 2 AND Coffee Chat (per-device dismissal by design) ARE suggested.
+        let ref_b = b
+            .client
+            .call(Request::RefreshSource {
+                id: Some(src.id.clone()),
+            })
+            .unwrap()
+            .refresh()
+            .unwrap();
+        assert_eq!(ref_b.inserted, 2);
+        let suggs_b = b
+            .client
+            .call(Request::ListSuggestions)
+            .unwrap()
+            .suggestions()
+            .unwrap();
+        assert!(
+            !suggs_b
+                .iter()
+                .any(|s| s.started_at == occ1.started_at && s.external_uid == "standup@team")
+        );
+        assert!(
+            suggs_b
+                .iter()
+                .any(|s| s.started_at == occ2.started_at && s.external_uid == "standup@team")
+        );
+        assert!(
+            suggs_b
+                .iter()
+                .any(|s| s.external_uid == "optional-coffee@team")
+        );
+
+        // Second check: B already has occ 2 pending locally when A confirms occ 2 and syncs.
+        // Pulling A's synced confirmed entry auto-confirms B's pending suggestion.
+        a.clock.fetch_add(5_000, Ordering::Relaxed);
+        a.client
+            .call(Request::ConfirmSuggestion {
+                id: occ2.id.clone(),
+                project_id: None,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        b.clock.fetch_add(6_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        let suggs_b_after = b
+            .client
+            .call(Request::ListSuggestions)
+            .unwrap()
+            .suggestions()
+            .unwrap();
+        assert_eq!(suggs_b_after.len(), 1);
+        assert_eq!(suggs_b_after[0].external_uid, "optional-coffee@team");
+
+        let _ = (a.svc, b.svc, a.creds, b.creds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
