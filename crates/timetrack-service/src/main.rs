@@ -24,6 +24,7 @@ mod credentials;
 mod interface;
 mod platform;
 mod socket;
+mod sync;
 
 use interface::EntryService;
 use std::sync::Arc;

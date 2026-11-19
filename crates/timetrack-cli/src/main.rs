@@ -332,7 +332,7 @@ enum Command {
     /// kind, empty locator, a CalDAV password in the URL, or another
     /// source's identity all refuse).
     SourceUpdate {
-        /// Source id (from `sources`).
+        /// Source id or unambiguous id prefix (from `sources`).
         id: String,
         /// New kind: `ics_file`, `ics_url`, or `caldav`.
         #[arg(long)]
@@ -363,8 +363,8 @@ enum Command {
         /// Server, account, principal, or home URL to discover from.
         endpoint: String,
         /// Lend a registered source's stored credential to the
-        /// discovery (source id from `sources`); without one the
-        /// endpoint's userinfo and TIMETRACK_CALDAV_PASSWORD apply.
+        /// discovery (source id or prefix from `sources`); without one
+        /// the endpoint's userinfo and TIMETRACK_CALDAV_PASSWORD apply.
         #[arg(long)]
         source: Option<String>,
         /// Print a JSON array for scripts instead of the human list.
@@ -375,7 +375,7 @@ enum Command {
     /// Fetch one source (or all) now and store new suggestions.
     /// Fetching creates no entries — `confirm` does that.
     Refresh {
-        /// Source id (from `sources`); omitted refreshes all.
+        /// Source id or prefix (from `sources`); omitted refreshes all.
         id: Option<String>,
     },
 
@@ -405,7 +405,7 @@ enum Command {
     /// secret is never an argument: it is prompted for (un-echoed) on
     /// a terminal, or read as the first stdin line when piped.
     SourceSetCredential {
-        /// Source id (from `sources`).
+        /// Source id or unambiguous id prefix (from `sources`).
         id: String,
         /// Login name; defaults to the `user@` in the source URL.
         #[arg(short, long)]
@@ -414,7 +414,7 @@ enum Command {
 
     /// Forget a source's stored secret.
     SourceRemoveCredential {
-        /// Source id (from `sources`).
+        /// Source id or unambiguous id prefix (from `sources`).
         id: String,
     },
 
@@ -422,7 +422,7 @@ enum Command {
     /// stored secret (#153). Decided suggestions stay as history, and
     /// confirmed entries stay.
     SourceRemove {
-        /// Source id (from `sources`).
+        /// Source id or unambiguous id prefix (from `sources`).
         id: String,
     },
 }
@@ -1057,9 +1057,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             // the flags, send it all back. Omitted flags keep their
             // values, so a label-only edit is one flag.
             let sources = client.sources().await?;
-            let current = sources.iter().find(|s| s.id == id).ok_or_else(|| {
-                anyhow::anyhow!("no external source with id '{id}' (see: timetrack sources)")
-            })?;
+            let current = find_source(&sources, &id)?;
             let project_id = if clear_project {
                 None
             } else {
@@ -1073,7 +1071,7 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
             };
             let updated = client
                 .update_source(
-                    &id,
+                    &current.id,
                     kind.as_deref().unwrap_or(&current.kind),
                     locator.as_deref().unwrap_or(&current.locator),
                     project_id.as_deref(),
@@ -1204,19 +1202,17 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
 
         Command::SourceSetCredential { id, username } => {
             let sources = client.sources().await?;
-            let src = sources.iter().find(|s| s.id == id).ok_or_else(|| {
-                anyhow::anyhow!("no external source with id '{id}' (see: timetrack sources)")
-            })?;
+            let src = find_source(&sources, &id)?;
             let username = username.unwrap_or_default();
             // Fail before prompting: no point reading a secret the
             // service would refuse for want of a username. The service
             // re-resolves authoritatively (including percent-decoding).
             if username.trim().is_empty() && !locator_has_userinfo(&src.locator) {
-                anyhow::bail!("source '{id}' names no user; pass --username <name>");
+                anyhow::bail!("source '{}' names no user; pass --username <name>", src.id);
             }
             let secret = read_credential_secret()?;
             let updated = client
-                .set_source_credential(&id, &username, &secret)
+                .set_source_credential(&src.id, &username, &secret)
                 .await?;
             emit(&format!(
                 "stored a credential for {} on source {} ({})",
@@ -1237,13 +1233,11 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
 
         Command::SourceRemove { id } => {
             let sources = client.sources().await?;
-            let label = sources
-                .iter()
-                .find(|s| s.id == id)
-                .map(|s| disp(&s.label))
-                .unwrap_or_else(|| id.clone());
-            client.remove_source(&id).await?;
-            emit(&format!("removed source {label} ({id})"));
+            let src = find_source(&sources, &id)?;
+            let label = disp(&src.label);
+            let resolved_id = src.id.clone();
+            client.remove_source(&resolved_id).await?;
+            emit(&format!("removed source {label} ({resolved_id})"));
         }
 
         Command::Export {
@@ -1559,6 +1553,25 @@ fn find_project<'a>(snap: &'a Snapshot, wanted: &str) -> Result<&'a ProjectView>
         )),
         timetrack_core::IdResolution::Ambiguous => Err(anyhow::Error::new(
             timetrack_core::RuleError::AmbiguousProject(wanted.to_string()),
+        )),
+    }
+}
+
+/// Resolve an external source argument to its `SourceView`: exact id wins,
+/// then a unique id prefix (ADR 0018, #172).
+fn find_source<'a>(
+    sources: &'a [timetrack_proto::SourceView],
+    wanted: &str,
+) -> Result<&'a timetrack_proto::SourceView> {
+    match timetrack_core::resolve_id_prefix(wanted, sources.iter().map(|s| s.id.as_str())) {
+        timetrack_core::IdResolution::Resolved(id) => {
+            Ok(sources.iter().find(|s| s.id == id).expect("resolved above"))
+        }
+        timetrack_core::IdResolution::Unknown => Err(anyhow::Error::new(
+            timetrack_core::RuleError::UnknownSource(wanted.to_string()),
+        )),
+        timetrack_core::IdResolution::Ambiguous => Err(anyhow::Error::new(
+            timetrack_core::RuleError::AmbiguousSource(wanted.to_string()),
         )),
     }
 }
@@ -2574,6 +2587,58 @@ mod tests {
         assert_eq!(
             find_project(&snap, "nope").unwrap_err().to_string(),
             "no project with id 'nope'"
+        );
+    }
+
+    #[test]
+    fn find_source_resolves_exact_then_unique_prefix() {
+        let sources = vec![
+            timetrack_proto::SourceView {
+                id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+                kind: "ics_file".into(),
+                locator: "/tmp/a.ics".into(),
+                project_id: None,
+                label: "A".into(),
+                has_credential: false,
+                username: None,
+            },
+            timetrack_proto::SourceView {
+                id: "aaaaaaaa-0000-4000-8000-000000000002".into(),
+                kind: "ics_file".into(),
+                locator: "/tmp/b.ics".into(),
+                project_id: None,
+                label: "B".into(),
+                has_credential: false,
+                username: None,
+            },
+            timetrack_proto::SourceView {
+                id: "cccccccc-0000-4000-8000-000000000001".into(),
+                kind: "caldav".into(),
+                locator: "https://cal.test/c/".into(),
+                project_id: None,
+                label: "C".into(),
+                has_credential: false,
+                username: None,
+            },
+        ];
+        assert_eq!(
+            find_source(&sources, "aaaaaaaa-0000-4000-8000-000000000002")
+                .unwrap()
+                .label,
+            "B"
+        );
+        assert_eq!(find_source(&sources, "cccccccc").unwrap().label, "C");
+        assert_eq!(
+            find_source(&sources, "aaaaaaaa").unwrap_err().to_string(),
+            "ambiguous source id prefix 'aaaaaaaa'"
+        );
+        assert_eq!(
+            find_source(&sources, "nope").unwrap_err().to_string(),
+            "no external source with id 'nope'"
+        );
+        assert_eq!(
+            find_source(&sources, "").unwrap_err().to_string(),
+            "no external source with id ''"
         );
     }
 

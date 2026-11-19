@@ -760,16 +760,21 @@ out=$("$CLI" suggestions)
 check "no suggestions remain pending" "no pending suggestions (try: timetrack refresh)" "$out"
 
 echo
-echo "== source update and remove (#153) =="
+echo "== source update and remove (#153, UUID + prefix #172) =="
 SRC=$("$CLI" sources | sed -n '1p' | cut -d' ' -f1)
-out=$("$CLI" source-update "$SRC" --label Renamed)
-contains "update relabels" "updated source Renamed (ics_file)" "$out"
+check "source id is a UUID" "1" "$(printf '%s' "$SRC" | grep -cE "^$UUID$")"
+SRC_PREFIX=${SRC:0:12}
+out=$("$CLI" source-update "$SRC_PREFIX" --label Renamed)
+contains "update relabels via unique prefix" "updated source Renamed (ics_file)" "$out"
 out=$("$CLI" sources)
 contains "sources shows the new label" "Renamed" "$out"
 # A second source, for the duplicate check and the removal below.
-# Source ids are `src-…`, not UUIDs: the new id is the last field.
+# Source ids are UUIDv4 (#172): the new id is the last field.
 cp "$WORK/cal.ics" "$WORK/other.ics"
 SRC2=$("$CLI" source-add "$WORK/other.ics" | awk '{print $NF}')
+check "second source id is a UUID" "1" "$(printf '%s' "$SRC2" | grep -cE "^$UUID$")"
+out=$("$CLI" refresh "$SRC_PREFIX")
+contains "refresh accepts source id prefix" "fetched 2 item(s)" "$out"
 out=$("$CLI" source-update "$SRC2" --locator "$WORK/cal.ics" 2>&1)
 contains "an edit onto another source refuses" "already exists" "$out"
 out=$("$CLI" source-update "$SRC" --kind bogus 2>&1)
@@ -786,8 +791,8 @@ out=$("$CLI" sources)
 check "one source is left" "1" "$(printf '%s' "$out" | grep -c .)"
 # The confirmed entry and the dismissal both predate the removal: the
 # entry stays tracked time, and the pending list stays empty.
-out=$("$CLI" source-remove "$SRC")
-contains "remove answers" "removed source Renamed" "$out"
+out=$("$CLI" source-remove "$SRC_PREFIX")
+contains "remove answers via unique prefix" "removed source Renamed" "$out"
 out=$("$CLI" sources)
 contains "no sources remain" "no external sources yet" "$out"
 out=$("$CLI" export --scope all | grep "Calendar review")

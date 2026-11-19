@@ -16,9 +16,15 @@ timetrack-core = { workspace = true }
 timetrack-store = { workspace = true }
 timetrack-proto = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 ureq = { workspace = true }
 uuid = { workspace = true }
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = "0.4"
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # The rollback test holds a real SQLite write lock on the service's
