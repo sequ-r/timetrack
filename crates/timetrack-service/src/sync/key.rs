@@ -70,6 +70,7 @@ impl SyncKey {
     }
 
     /// Wrap raw 32-byte key material.
+    #[cfg(test)]
     pub fn from_bytes(bytes: [u8; SYNC_KEY_LEN]) -> Self {
         SyncKey(bytes)
     }

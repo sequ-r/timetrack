@@ -171,6 +171,7 @@ pub fn open_envelope(bytes: &[u8], key: &SyncKey) -> Result<Envelope, EnvelopeEr
 }
 
 /// Result of opening a batch of named peer envelopes under the §2 policy.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenedBatch {
     pub envelopes: Vec<Envelope>,
@@ -181,6 +182,7 @@ pub struct OpenedBatch {
 /// - Any newer-format envelope (`TooNew`) fails the whole batch loudly.
 /// - Corrupt frames, decryption failures, or mismatched filenames emit a
 ///   warning and are skipped so previously merged state stands.
+#[cfg(test)]
 pub fn open_envelope_batch<'a, I>(items: I, key: &SyncKey) -> Result<OpenedBatch, EnvelopeError>
 where
     I: IntoIterator<Item = (&'a str, &'a [u8])>,

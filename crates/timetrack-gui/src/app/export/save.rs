@@ -234,34 +234,83 @@ async fn platform_portal_save_file(_current_name: &str) -> PortalOutcome {
 }
 
 #[cfg(target_os = "linux")]
-async fn platform_portal_save_file(current_name: &str) -> PortalOutcome {
-    let request = ashpd::desktop::file_chooser::SelectedFiles::save_file()
-        .title("Save export")
-        .current_name(current_name)
-        .send()
-        .await;
-    let files = match request {
-        Ok(request) => match request.response() {
-            Ok(files) => files,
-            Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
-                return PortalOutcome::Cancelled;
-            }
-            Err(_) => return PortalOutcome::Unavailable,
-        },
-        Err(_) => return PortalOutcome::Unavailable,
-    };
+fn picked_uri_outcome(files: ashpd::desktop::file_chooser::SelectedFiles) -> PortalOutcome {
     let Some(uri) = files.uris().first() else {
         return PortalOutcome::Cancelled;
     };
-    // ashpd 0.13 hands back a string URI; parsing it as a file URI (and
-    // refusing anything that is not a local path) is what `url` does here,
-    // exactly as ashpd 0.11's `Uri::to_file_path` did on our behalf.
+    // ashpd 0.14 hands back a string URI; parse and restrict to local file paths.
     let path = url::Url::parse(uri.as_str())
         .ok()
         .and_then(|parsed| parsed.to_file_path().ok());
     match path {
         Some(path) => PortalOutcome::Granted(path.to_string_lossy().into_owned()),
         None => PortalOutcome::Unavailable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn platform_portal_save_file(current_name: &str) -> PortalOutcome {
+    let request = ashpd::desktop::file_chooser::SelectedFiles::save_file()
+        .title("Save export")
+        .current_name(current_name)
+        .send()
+        .await;
+    match request {
+        Ok(request) => match request.response() {
+            Ok(files) => picked_uri_outcome(files),
+            Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
+                PortalOutcome::Cancelled
+            }
+            Err(_) => PortalOutcome::Unavailable,
+        },
+        Err(_) => PortalOutcome::Unavailable,
+    }
+}
+
+/// Ask the system chooser for a folder to sync with (#176).
+///
+/// Follows the same contract as [`portal_save_file`]: granted on confirm,
+/// quiet cancel on dismiss, unavailable when no desktop portal answers (or
+/// when the headless portal stub is armed).
+pub(crate) async fn portal_pick_folder() -> PortalOutcome {
+    #[cfg(feature = "portal-stub")]
+    if std::env::var_os("TIMETRACK_PORTAL_STUB").is_some() {
+        return PortalOutcome::Unavailable;
+    }
+    platform_portal_pick_folder().await
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+async fn platform_portal_pick_folder() -> PortalOutcome {
+    let picked = std::panic::catch_unwind(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose sync folder")
+            .pick_folder()
+    });
+    native_save_outcome(picked)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+async fn platform_portal_pick_folder() -> PortalOutcome {
+    PortalOutcome::Unavailable
+}
+
+#[cfg(target_os = "linux")]
+async fn platform_portal_pick_folder() -> PortalOutcome {
+    let request = ashpd::desktop::file_chooser::SelectedFiles::open_file()
+        .title("Choose sync folder")
+        .directory(true)
+        .send()
+        .await;
+    match request {
+        Ok(request) => match request.response() {
+            Ok(files) => picked_uri_outcome(files),
+            Err(ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)) => {
+                PortalOutcome::Cancelled
+            }
+            Err(_) => PortalOutcome::Unavailable,
+        },
+        Err(_) => PortalOutcome::Unavailable,
     }
 }
 

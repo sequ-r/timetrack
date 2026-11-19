@@ -44,7 +44,7 @@ use timetrack_core::{
 /// The schema version this build writes, kept in `PRAGMA user_version`.
 /// Bump with a numbered migration in [`migrate`]; a newer database is
 /// refused, never silently reset (§17, the §2 rule).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Whether `id` is already a UUID in hyphenated shape (ADR 0018):
 /// 8-4-4-4-12 hex with hyphens in place. Either hex case counts — a
@@ -603,18 +603,7 @@ impl SqliteStore {
     pub fn remove_source(&self, id: &str, now_ms: i64) -> StoreResult<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
-        tx.execute(
-            "DELETE FROM suggestions WHERE source_id = ?1 AND status = 'pending'",
-            params![id],
-        )
-        .map_err(|e| sqlite(&self.path, e))?;
-        tx.execute("DELETE FROM caldav_sync WHERE source_id = ?1", params![id])
-            .map_err(|e| sqlite(&self.path, e))?;
-        tx.execute(
-            "DELETE FROM caldav_resources WHERE source_id = ?1",
-            params![id],
-        )
-        .map_err(|e| sqlite(&self.path, e))?;
+        delete_source_rows(&tx, id).map_err(|e| sqlite(&self.path, e))?;
         let removed = tx
             .execute("DELETE FROM external_sources WHERE id = ?1", params![id])
             .map_err(|e| sqlite(&self.path, e))?;
@@ -624,6 +613,636 @@ impl SqliteStore {
         }
         tx.commit().map_err(|e| sqlite(&self.path, e))?;
         Ok(removed == 1)
+    }
+
+    // --- folder sync state, merge persistence, and conflict journal (#173) ---
+
+    fn get_meta_in(conn: &Connection, path: &Path, key: &str) -> StoreResult<Option<String>> {
+        use rusqlite::OptionalExtension;
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| sqlite(path, e))
+    }
+
+    fn set_meta_in(conn: &Connection, path: &Path, key: &str, value: &str) -> StoreResult<()> {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|e| sqlite(path, e))?;
+        Ok(())
+    }
+
+    fn delete_meta_in(conn: &Connection, path: &Path, key: &str) -> StoreResult<()> {
+        conn.execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .map_err(|e| sqlite(path, e))?;
+        Ok(())
+    }
+
+    /// Current sync configuration and watermarks kept in `meta`.
+    pub fn sync_config(&self) -> StoreResult<SyncConfig> {
+        let conn = self.lock();
+        let parse_i64 = |key: &str| -> StoreResult<Option<i64>> {
+            Ok(Self::get_meta_in(&conn, &self.path, key)?.and_then(|v| v.parse::<i64>().ok()))
+        };
+        Ok(SyncConfig {
+            folder: Self::get_meta_in(&conn, &self.path, "sync_folder")?,
+            merged_through: parse_i64("sync_merged_through")?.unwrap_or(0),
+            compacted_through: parse_i64("sync_compacted_through")?.unwrap_or(0),
+            last_sync_at: parse_i64("sync_last_sync_at")?,
+            last_error: Self::get_meta_in(&conn, &self.path, "sync_last_error")?,
+            needs_repair: Self::get_meta_in(&conn, &self.path, "sync_needs_repair")?.as_deref()
+                == Some("1"),
+        })
+    }
+
+    /// Enable sync against `folder` (clearing any stale error/repair state).
+    pub fn set_sync_folder(&self, folder: &str) -> StoreResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        Self::set_meta_in(&tx, &self.path, "sync_folder", folder)?;
+        Self::delete_meta_in(&tx, &self.path, "sync_last_error")?;
+        Self::delete_meta_in(&tx, &self.path, "sync_needs_repair")?;
+        tx.commit().map_err(|e| sqlite(&self.path, e))
+    }
+
+    /// Record or clear `sync_last_error`, `sync_last_sync_at`, or `sync_needs_repair`.
+    pub fn record_sync_status(
+        &self,
+        last_sync_at: Option<i64>,
+        last_error: Option<Option<&str>>,
+        needs_repair: Option<bool>,
+    ) -> StoreResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        if let Some(ts) = last_sync_at {
+            Self::set_meta_in(&tx, &self.path, "sync_last_sync_at", &ts.to_string())?;
+        }
+        if let Some(err_opt) = last_error {
+            match err_opt {
+                Some(msg) => Self::set_meta_in(&tx, &self.path, "sync_last_error", msg)?,
+                None => Self::delete_meta_in(&tx, &self.path, "sync_last_error")?,
+            }
+        }
+        if let Some(flag) = needs_repair {
+            if flag {
+                Self::set_meta_in(&tx, &self.path, "sync_needs_repair", "1")?;
+            } else {
+                Self::delete_meta_in(&tx, &self.path, "sync_needs_repair")?;
+            }
+        }
+        tx.commit().map_err(|e| sqlite(&self.path, e))
+    }
+
+    /// Unpair sync configuration and peer table without touching local
+    /// entries, projects, sources, tombstones, or the conflict journal.
+    pub fn clear_sync_config(&self) -> StoreResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        for key in [
+            "sync_folder",
+            "sync_merged_through",
+            "sync_compacted_through",
+            "sync_last_sync_at",
+            "sync_last_error",
+            "sync_needs_repair",
+        ] {
+            Self::delete_meta_in(&tx, &self.path, key)?;
+        }
+        tx.execute("DELETE FROM sync_peers", [])
+            .map_err(|e| sqlite(&self.path, e))?;
+        tx.commit().map_err(|e| sqlite(&self.path, e))
+    }
+
+    /// Read all syncable rows (projects, entries, sources, tombstones)
+    /// with their full `(created_at, updated_at, device_id)` metadata.
+    pub fn load_sync_rows(&self) -> StoreResult<SyncRows> {
+        let conn = self.lock();
+        let mut projects = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, colour, archived, created_at, updated_at, device_id
+                     FROM projects ORDER BY seq",
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ProjectRow {
+                        project: Project {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            colour: row.get::<_, Option<i64>>(2)?.map(|c| c as u32),
+                            archived: row.get::<_, i64>(3)? != 0,
+                        },
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        device_id: row.get(6)?,
+                    })
+                })
+                .map_err(|e| sqlite(&self.path, e))?;
+            for row in rows {
+                projects.push(row.map_err(|e| sqlite(&self.path, e))?);
+            }
+        }
+        let mut entries = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, project_id, description, started_at, ended_at, source, note,
+                            external_source_id, external_uid, external_started_at,
+                            created_at, updated_at, device_id
+                     FROM entries ORDER BY seq",
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let source_code: i64 = row.get(5)?;
+                    Ok((
+                        EntryRow {
+                            entry: Entry {
+                                id: row.get(0)?,
+                                project_id: row.get(1)?,
+                                description: row.get(2)?,
+                                started_at: row.get(3)?,
+                                ended_at: row.get(4)?,
+                                source: EntrySource::Manual,
+                                note: row.get(6)?,
+                            },
+                            external_source_id: row.get(7)?,
+                            external_uid: row.get(8)?,
+                            external_started_at: row.get(9)?,
+                            created_at: row.get(10)?,
+                            updated_at: row.get(11)?,
+                            device_id: row.get(12)?,
+                        },
+                        source_code,
+                    ))
+                })
+                .map_err(|e| sqlite(&self.path, e))?;
+            for row in rows {
+                let (mut er, code) = row.map_err(|e| sqlite(&self.path, e))?;
+                er.entry.source = match code {
+                    0 => EntrySource::Manual,
+                    1 => EntrySource::QuickAdd,
+                    2 => EntrySource::External,
+                    other => {
+                        return Err(StoreError::Invalid {
+                            path: self.path.display().to_string(),
+                            reason: format!("entry {} has unknown source {other}", er.entry.id),
+                        });
+                    }
+                };
+                entries.push(er);
+            }
+        }
+        let mut sources = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, kind, locator, project_id, label, cred_ref, cred_username,
+                            created_at, updated_at, device_id
+                     FROM external_sources ORDER BY seq",
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ExternalSourceRow {
+                        source: ExternalSource {
+                            id: row.get(0)?,
+                            kind: row.get(1)?,
+                            locator: row.get(2)?,
+                            project_id: row.get(3)?,
+                            label: row.get(4)?,
+                            cred_ref: row.get(5)?,
+                            cred_username: row.get(6)?,
+                        },
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        device_id: row.get(9)?,
+                    })
+                })
+                .map_err(|e| sqlite(&self.path, e))?;
+            for row in rows {
+                sources.push(row.map_err(|e| sqlite(&self.path, e))?);
+            }
+        }
+        drop(conn);
+        let tombstones = self.tombstones()?;
+        Ok(SyncRows {
+            projects,
+            entries,
+            sources,
+            tombstones,
+        })
+    }
+
+    /// Apply an entire sync merge atomically in a single SQLite transaction.
+    /// Returns any local OS credential references (`cred_ref`) belonging to
+    /// deleted sources so the service can purge them best-effort off-lock.
+    pub fn apply_sync_merge(&self, write: &SyncMergeWrite) -> StoreResult<Vec<String>> {
+        use rusqlite::OptionalExtension;
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        let mut purged_cred_refs = Vec::new();
+
+        for id in &write.delete_sources {
+            let cred_ref: Option<String> = tx
+                .query_row(
+                    "SELECT cred_ref FROM external_sources WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| sqlite(&self.path, e))?
+                .flatten();
+            if let Some(reference) = cred_ref {
+                purged_cred_refs.push(reference);
+            }
+            delete_source_rows(&tx, id).map_err(|e| sqlite(&self.path, e))?;
+            tx.execute("DELETE FROM external_sources WHERE id = ?1", params![id])
+                .map_err(|e| sqlite(&self.path, e))?;
+        }
+        for id in &write.delete_entries {
+            tx.execute("DELETE FROM entries WHERE id = ?1", params![id])
+                .map_err(|e| sqlite(&self.path, e))?;
+        }
+        for id in &write.delete_projects {
+            tx.execute("DELETE FROM projects WHERE id = ?1", params![id])
+                .map_err(|e| sqlite(&self.path, e))?;
+        }
+
+        for pr in &write.upsert_projects {
+            tx.execute(
+                "INSERT INTO projects(id, name, colour, archived, created_at, updated_at, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name, colour = excluded.colour,
+                     archived = excluded.archived,
+                     created_at = CASE WHEN projects.created_at > 0 AND projects.created_at < excluded.created_at THEN projects.created_at ELSE excluded.created_at END,
+                     updated_at = excluded.updated_at, device_id = excluded.device_id",
+                params![
+                    pr.project.id,
+                    pr.project.name,
+                    pr.project.colour.map(|c| c as i64),
+                    pr.project.archived as i64,
+                    pr.created_at,
+                    pr.updated_at,
+                    pr.device_id
+                ],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        }
+
+        for er in &write.upsert_entries {
+            tx.execute(
+                "INSERT INTO entries(id, project_id, description, started_at, ended_at, source, note,
+                     external_source_id, external_uid, external_started_at,
+                     created_at, updated_at, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id,
+                     description = excluded.description, started_at = excluded.started_at,
+                     ended_at = excluded.ended_at, source = excluded.source, note = excluded.note,
+                     external_source_id = excluded.external_source_id,
+                     external_uid = excluded.external_uid,
+                     external_started_at = excluded.external_started_at,
+                     created_at = CASE WHEN entries.created_at > 0 AND entries.created_at < excluded.created_at THEN entries.created_at ELSE excluded.created_at END,
+                     updated_at = excluded.updated_at, device_id = excluded.device_id",
+                params![
+                    er.entry.id,
+                    er.entry.project_id,
+                    er.entry.description,
+                    er.entry.started_at,
+                    er.entry.ended_at,
+                    source_code(er.entry.source),
+                    er.entry.note,
+                    er.external_source_id,
+                    er.external_uid,
+                    er.external_started_at,
+                    er.created_at,
+                    er.updated_at,
+                    er.device_id
+                ],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+            if let (Some(src_id), Some(uid)) = (&er.external_source_id, &er.external_uid) {
+                let match_started = er.external_started_at.unwrap_or(er.entry.started_at);
+                tx.execute(
+                    "UPDATE suggestions SET status = 'confirmed', entry_id = ?1, decided_at = ?2
+                     WHERE source_id = ?3 AND external_uid = ?4 AND started_at = ?5 AND status = 'pending'",
+                    params![er.entry.id, er.updated_at, src_id, uid, match_started],
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            }
+        }
+
+        // Park any existing source whose `(kind, locator)` is changing in
+        // this batch so a two-source swap cannot trip `UNIQUE(kind, locator)`
+        // mid-loop; clear its CalDAV cache while we still see the old key.
+        for sr in &write.upsert_sources {
+            let prev: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT kind, locator FROM external_sources WHERE id = ?1",
+                    params![sr.source.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| sqlite(&self.path, e))?;
+            if let Some((old_kind, old_locator)) = prev
+                && (old_kind != sr.source.kind || old_locator != sr.source.locator)
+            {
+                tx.execute(
+                    "DELETE FROM caldav_sync WHERE source_id = ?1",
+                    params![sr.source.id],
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+                tx.execute(
+                    "DELETE FROM caldav_resources WHERE source_id = ?1",
+                    params![sr.source.id],
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+                let swap_locator = format!("__timetrack_sync_swap_{}", sr.source.id);
+                tx.execute(
+                    "UPDATE external_sources SET locator = ?1 WHERE id = ?2",
+                    params![swap_locator, sr.source.id],
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            }
+        }
+
+        for sr in &write.upsert_sources {
+            // Note: `cred_ref` and `cred_username` are deliberately omitted
+            // from the upsert so local OS credential pointers never overwrite
+            // or travel across devices.
+            tx.execute(
+                "INSERT INTO external_sources(id, kind, locator, project_id, label,
+                     created_at, updated_at, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, locator = excluded.locator,
+                     project_id = excluded.project_id, label = excluded.label,
+                     created_at = CASE WHEN external_sources.created_at > 0 AND external_sources.created_at < excluded.created_at THEN external_sources.created_at ELSE excluded.created_at END,
+                     updated_at = excluded.updated_at, device_id = excluded.device_id",
+                params![
+                    sr.source.id,
+                    sr.source.kind,
+                    sr.source.locator,
+                    sr.source.project_id,
+                    sr.source.label,
+                    sr.created_at,
+                    sr.updated_at,
+                    sr.device_id
+                ],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        }
+
+        for t in &write.upsert_tombstones {
+            tombstone(&tx, &t.id, &t.kind, t.deleted_at, &t.device_id)
+                .map_err(|e| sqlite(&self.path, e))?;
+        }
+        for (id, kind) in &write.delete_tombstones {
+            tx.execute(
+                "DELETE FROM tombstones WHERE id = ?1 AND kind = ?2",
+                params![id, kind],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        }
+
+        for c in &write.new_conflicts {
+            tx.execute(
+                "INSERT INTO sync_conflicts(id, kind, record_id, recorded_at,
+                     loser_updated_at, loser_device_id, winner_updated_at,
+                     winner_device_id, loser_payload, restored_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(kind, record_id, loser_updated_at, loser_device_id) DO NOTHING",
+                params![
+                    c.id,
+                    c.kind,
+                    c.record_id,
+                    c.recorded_at,
+                    c.loser_updated_at,
+                    c.loser_device_id,
+                    c.winner_updated_at,
+                    c.winner_device_id,
+                    c.loser_payload,
+                    c.restored_at
+                ],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        }
+
+        for p in &write.upsert_peers {
+            tx.execute(
+                "INSERT INTO sync_peers(device_id, last_published_at, last_merged_through,
+                     last_seen_at, quarantined, last_warning)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(device_id) DO UPDATE SET last_published_at = excluded.last_published_at,
+                     last_merged_through = excluded.last_merged_through,
+                     last_seen_at = excluded.last_seen_at,
+                     quarantined = excluded.quarantined,
+                     last_warning = excluded.last_warning",
+                params![
+                    p.device_id,
+                    p.last_published_at,
+                    p.last_merged_through,
+                    p.last_seen_at,
+                    p.quarantined as i64,
+                    p.last_warning
+                ],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        }
+        for device_id in &write.delete_peers {
+            tx.execute(
+                "DELETE FROM sync_peers WHERE device_id = ?1",
+                params![device_id],
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        }
+
+        if let Some(mt) = write.merged_through {
+            Self::set_meta_in(&tx, &self.path, "sync_merged_through", &mt.to_string())?;
+        }
+        if let Some(ct) = write.compacted_through {
+            Self::set_meta_in(&tx, &self.path, "sync_compacted_through", &ct.to_string())?;
+        }
+        if let Some(ts) = write.last_sync_at {
+            Self::set_meta_in(&tx, &self.path, "sync_last_sync_at", &ts.to_string())?;
+        }
+        if let Some(ref err_opt) = write.last_error {
+            match err_opt {
+                Some(msg) => Self::set_meta_in(&tx, &self.path, "sync_last_error", msg)?,
+                None => Self::delete_meta_in(&tx, &self.path, "sync_last_error")?,
+            }
+        }
+        if let Some(flag) = write.needs_repair {
+            if flag {
+                Self::set_meta_in(&tx, &self.path, "sync_needs_repair", "1")?;
+            } else {
+                Self::delete_meta_in(&tx, &self.path, "sync_needs_repair")?;
+            }
+        }
+
+        tx.commit().map_err(|e| sqlite(&self.path, e))?;
+        Ok(purged_cred_refs)
+    }
+
+    /// Every conflict journal row, newest recorded first.
+    pub fn sync_conflicts(&self, include_restored: bool) -> StoreResult<Vec<SyncConflictRow>> {
+        let conn = self.lock();
+        let sql = if include_restored {
+            "SELECT id, kind, record_id, recorded_at, loser_updated_at, loser_device_id,
+                    winner_updated_at, winner_device_id, loser_payload, restored_at
+             FROM sync_conflicts ORDER BY recorded_at DESC, id"
+        } else {
+            "SELECT id, kind, record_id, recorded_at, loser_updated_at, loser_device_id,
+                    winner_updated_at, winner_device_id, loser_payload, restored_at
+             FROM sync_conflicts WHERE restored_at IS NULL ORDER BY recorded_at DESC, id"
+        };
+        let mut stmt = conn.prepare(sql).map_err(|e| sqlite(&self.path, e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SyncConflictRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    record_id: row.get(2)?,
+                    recorded_at: row.get(3)?,
+                    loser_updated_at: row.get(4)?,
+                    loser_device_id: row.get(5)?,
+                    winner_updated_at: row.get(6)?,
+                    winner_device_id: row.get(7)?,
+                    loser_payload: row.get(8)?,
+                    restored_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| sqlite(&self.path, e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| sqlite(&self.path, e))?);
+        }
+        Ok(out)
+    }
+
+    /// Re-save a losing record from the conflict journal with fresh
+    /// `(updated_at = now_ms, device_id = self.device_id)` so it wins the
+    /// next merge, remove any superseded local tombstone, and mark the
+    /// journal entry restored.
+    pub fn restore_sync_conflict(
+        &self,
+        conflict_id: &str,
+        now_ms: i64,
+        restored: &RestoredRecord,
+    ) -> StoreResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        let (kind, record_id): (String, String) = tx
+            .query_row(
+                "SELECT kind, record_id FROM sync_conflicts
+                 WHERE id = ?1 AND restored_at IS NULL",
+                params![conflict_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        match restored {
+            RestoredRecord::Project(p) => {
+                upsert_project(&tx, p, now_ms, &self.device_id)
+                    .map_err(|e| sqlite(&self.path, e))?;
+            }
+            RestoredRecord::Entry {
+                entry,
+                external_source_id,
+                external_uid,
+                external_started_at,
+            } => {
+                upsert_entry(&tx, entry, now_ms, &self.device_id)
+                    .map_err(|e| sqlite(&self.path, e))?;
+                if external_source_id.is_some()
+                    || external_uid.is_some()
+                    || external_started_at.is_some()
+                {
+                    tx.execute(
+                        "UPDATE entries
+                         SET external_source_id = ?2, external_uid = ?3, external_started_at = ?4
+                         WHERE id = ?1",
+                        params![
+                            entry.id,
+                            external_source_id,
+                            external_uid,
+                            external_started_at
+                        ],
+                    )
+                    .map_err(|e| sqlite(&self.path, e))?;
+                }
+            }
+            RestoredRecord::Source {
+                id,
+                kind: src_kind,
+                locator,
+                project_id,
+                label,
+            } => {
+                tx.execute(
+                    "INSERT INTO external_sources(id, kind, locator, project_id, label,
+                         created_at, updated_at, device_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, locator = excluded.locator,
+                         project_id = excluded.project_id, label = excluded.label,
+                         updated_at = excluded.updated_at, device_id = excluded.device_id",
+                    params![
+                        id,
+                        src_kind,
+                        locator,
+                        project_id,
+                        label,
+                        now_ms,
+                        self.device_id
+                    ],
+                )
+                .map_err(|e| sqlite(&self.path, e))?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM tombstones WHERE id = ?1 AND kind = ?2 AND deleted_at < ?3",
+            params![record_id, kind, now_ms],
+        )
+        .map_err(|e| sqlite(&self.path, e))?;
+        tx.execute(
+            "UPDATE sync_conflicts SET restored_at = ?2 WHERE id = ?1",
+            params![conflict_id, now_ms],
+        )
+        .map_err(|e| sqlite(&self.path, e))?;
+        tx.commit().map_err(|e| sqlite(&self.path, e))
+    }
+
+    /// Tracked peer devices in `sync_peers`, ordered by `device_id`.
+    pub fn sync_peers(&self) -> StoreResult<Vec<SyncPeerRow>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT device_id, last_published_at, last_merged_through,
+                        last_seen_at, quarantined, last_warning
+                 FROM sync_peers ORDER BY device_id",
+            )
+            .map_err(|e| sqlite(&self.path, e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SyncPeerRow {
+                    device_id: row.get(0)?,
+                    last_published_at: row.get(1)?,
+                    last_merged_through: row.get(2)?,
+                    last_seen_at: row.get(3)?,
+                    quarantined: row.get::<_, i64>(4)? != 0,
+                    last_warning: row.get(5)?,
+                })
+            })
+            .map_err(|e| sqlite(&self.path, e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| sqlite(&self.path, e))?);
+        }
+        Ok(out)
     }
 
     /// Store freshly fetched items as pending suggestions. An item
@@ -640,6 +1259,11 @@ impl SqliteStore {
         let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
         let mut inserted = 0;
         for item in items {
+            if is_confirmed_in_entries(&tx, source_id, &item.uid, item.started_at)
+                .map_err(|e| sqlite(&self.path, e))?
+            {
+                continue;
+            }
             let id = mint_id(&tx, "sg-").map_err(|e| sqlite(&self.path, e))?;
             let kind = match item.kind {
                 ExternalKind::Event => "event",
@@ -705,20 +1329,34 @@ impl SqliteStore {
         Ok(self.suggestions(false)?.into_iter().find(|s| s.id == id))
     }
 
-    /// Decide a pending suggestion. Returns false when it was not
-    /// pending (unknown, or already decided): deciding twice is a
-    /// no-op, never a second entry.
-    /// Attach the created entry to a confirmed suggestion (the service
-    /// claims the suggestion first, then creates the entry, then links
-    /// it — so a racing second confirm can never create a duplicate).
-    pub fn link_suggestion_entry(&self, id: &str, entry_id: &str) -> StoreResult<()> {
-        self.lock()
-            .execute(
-                "UPDATE suggestions SET entry_id = ?2 WHERE id = ?1",
-                params![id, entry_id],
-            )
-            .map_err(|e| sqlite(&self.path, e))?;
-        Ok(())
+    /// Attach the created entry to a confirmed suggestion and stamp the
+    /// entry with `(source_id, external_uid, external_started_at)` so sync
+    /// carries confirmation attribution across devices (#174). The service
+    /// claims the suggestion first, then creates the entry, then links it —
+    /// so a racing second confirm can never create a duplicate.
+    pub fn link_confirmed_entry(
+        &self,
+        suggestion_id: &str,
+        entry_id: &str,
+        source_id: &str,
+        external_uid: &str,
+        external_started_at: i64,
+    ) -> StoreResult<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
+        tx.execute(
+            "UPDATE suggestions SET entry_id = ?2 WHERE id = ?1",
+            params![suggestion_id, entry_id],
+        )
+        .map_err(|e| sqlite(&self.path, e))?;
+        tx.execute(
+            "UPDATE entries
+             SET external_source_id = ?2, external_uid = ?3, external_started_at = ?4
+             WHERE id = ?1",
+            params![entry_id, source_id, external_uid, external_started_at],
+        )
+        .map_err(|e| sqlite(&self.path, e))?;
+        tx.commit().map_err(|e| sqlite(&self.path, e))
     }
 
     pub fn decide_suggestion(
@@ -918,6 +1556,11 @@ impl SqliteStore {
                     }
                 }
                 None => {
+                    if is_confirmed_in_entries(&tx, source_id, &item.uid, item.started_at)
+                        .map_err(|e| sqlite(&self.path, e))?
+                    {
+                        continue;
+                    }
                     let id = mint_id(&tx, "sg-").map_err(|e| sqlite(&self.path, e))?;
                     counts.inserted += tx
                         .execute(
@@ -1053,6 +1696,156 @@ pub struct Suggestion {
     /// `pending`, `confirmed`, or `dismissed`.
     pub status: String,
     pub entry_id: Option<String>,
+}
+
+/// Sync configuration and watermarks persisted in `meta` (#173).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncConfig {
+    pub folder: Option<String>,
+    pub merged_through: i64,
+    pub compacted_through: i64,
+    pub last_sync_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub needs_repair: bool,
+}
+
+/// A project row with full sync metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRow {
+    pub project: Project,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub device_id: String,
+}
+
+/// An entry row with full sync metadata and optional external UID carriage (#174).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryRow {
+    pub entry: Entry,
+    pub external_source_id: Option<String>,
+    pub external_uid: Option<String>,
+    pub external_started_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub device_id: String,
+}
+
+/// An external-source row with full sync metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalSourceRow {
+    pub source: ExternalSource,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub device_id: String,
+}
+
+/// All syncable local store state read in one snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncRows {
+    pub projects: Vec<ProjectRow>,
+    pub entries: Vec<EntryRow>,
+    pub sources: Vec<ExternalSourceRow>,
+    pub tombstones: Vec<Tombstone>,
+}
+
+/// A local losing record recorded by LWW conflict resolution (#173).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncConflictRow {
+    pub id: String,
+    pub kind: String,
+    pub record_id: String,
+    pub recorded_at: i64,
+    pub loser_updated_at: i64,
+    pub loser_device_id: String,
+    pub winner_updated_at: i64,
+    pub winner_device_id: String,
+    pub loser_payload: String,
+    pub restored_at: Option<i64>,
+}
+
+/// A tracked peer device seen in the sync folder (#173, #175).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncPeerRow {
+    pub device_id: String,
+    pub last_published_at: i64,
+    pub last_merged_through: i64,
+    pub last_seen_at: i64,
+    pub quarantined: bool,
+    pub last_warning: Option<String>,
+}
+
+/// The payload restored into the store when a conflict loser is re-saved (#173).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoredRecord {
+    Project(Project),
+    Entry {
+        entry: Entry,
+        external_source_id: Option<String>,
+        external_uid: Option<String>,
+        external_started_at: Option<i64>,
+    },
+    Source {
+        id: String,
+        kind: String,
+        locator: String,
+        project_id: Option<String>,
+        label: String,
+    },
+}
+
+/// Transactional write plan produced by a sync merge round (#173, #175).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncMergeWrite {
+    pub upsert_projects: Vec<ProjectRow>,
+    pub delete_projects: Vec<String>,
+    pub upsert_entries: Vec<EntryRow>,
+    pub delete_entries: Vec<String>,
+    pub upsert_sources: Vec<ExternalSourceRow>,
+    pub delete_sources: Vec<String>,
+    pub upsert_tombstones: Vec<Tombstone>,
+    pub delete_tombstones: Vec<(String, String)>,
+    pub new_conflicts: Vec<SyncConflictRow>,
+    pub upsert_peers: Vec<SyncPeerRow>,
+    pub delete_peers: Vec<String>,
+    pub merged_through: Option<i64>,
+    pub compacted_through: Option<i64>,
+    pub last_sync_at: Option<i64>,
+    pub last_error: Option<Option<String>>,
+    pub needs_repair: Option<bool>,
+}
+
+fn is_confirmed_in_entries(
+    tx: &Connection,
+    source_id: &str,
+    external_uid: &str,
+    started_at: i64,
+) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension as _;
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM entries
+             WHERE external_source_id = ?1
+               AND external_uid = ?2
+               AND COALESCE(external_started_at, started_at) = ?3
+             LIMIT 1",
+            params![source_id, external_uid, started_at],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+fn delete_source_rows(tx: &Connection, id: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM suggestions WHERE source_id = ?1 AND status = 'pending'",
+        params![id],
+    )?;
+    tx.execute("DELETE FROM caldav_sync WHERE source_id = ?1", params![id])?;
+    tx.execute(
+        "DELETE FROM caldav_resources WHERE source_id = ?1",
+        params![id],
+    )?;
+    Ok(())
 }
 
 fn mint_id(conn: &Connection, prefix: &str) -> rusqlite::Result<String> {
@@ -1243,6 +2036,64 @@ const SCHEMA_V5: &str = "CREATE TABLE caldav_sync (
              ALTER TABLE suggestions ADD COLUMN resource_href TEXT;
              PRAGMA user_version = 5;";
 
+/// The v7 addition (#173) plus its bump: local sync conflict journal
+/// (never synced, never auto-deleted) and tracked sync peers. Pure
+/// additions — no existing row moves. See [`SCHEMA_V1`].
+const SCHEMA_V7: &str = "CREATE TABLE sync_conflicts (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 record_id TEXT NOT NULL,
+                 recorded_at INTEGER NOT NULL,
+                 loser_updated_at INTEGER NOT NULL,
+                 loser_device_id TEXT NOT NULL,
+                 winner_updated_at INTEGER NOT NULL,
+                 winner_device_id TEXT NOT NULL,
+                 loser_payload TEXT NOT NULL,
+                 restored_at INTEGER,
+                 UNIQUE(kind, record_id, loser_updated_at, loser_device_id)
+             );
+             CREATE TABLE sync_peers (
+                 device_id TEXT PRIMARY KEY,
+                 last_published_at INTEGER NOT NULL,
+                 last_merged_through INTEGER NOT NULL,
+                 last_seen_at INTEGER NOT NULL,
+                 quarantined INTEGER NOT NULL DEFAULT 0,
+                 last_warning TEXT
+             );
+             PRAGMA user_version = 7;";
+
+/// The v8 addition (#174, ADR 0020) plus its bump: confirmed `External` entries
+/// carry `(external_source_id, external_uid, external_started_at)` across sync
+/// so peer fetches dedup against synced confirmed entries even when local
+/// suggestion rows live on another machine. Backfills existing confirmed rows.
+const SCHEMA_V8: &str = "ALTER TABLE entries ADD COLUMN external_source_id TEXT;
+             ALTER TABLE entries ADD COLUMN external_uid TEXT;
+             ALTER TABLE entries ADD COLUMN external_started_at INTEGER;
+             CREATE INDEX idx_entries_external_uid ON entries(external_source_id, external_uid)
+                 WHERE external_source_id IS NOT NULL AND external_uid IS NOT NULL;
+             UPDATE entries SET
+                 external_source_id = (
+                     SELECT s.source_id FROM suggestions s
+                     WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+                     LIMIT 1
+                 ),
+                 external_uid = (
+                     SELECT s.external_uid FROM suggestions s
+                     WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+                     LIMIT 1
+                 ),
+                 external_started_at = (
+                     SELECT s.started_at FROM suggestions s
+                     WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+                     LIMIT 1
+                 )
+             WHERE source = 2 AND external_source_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM suggestions s
+                   WHERE s.entry_id = entries.id AND s.status = 'confirmed'
+               );
+             PRAGMA user_version = 8;";
+
 /// Numbered schema migrations, applied in order on open. Each step runs
 /// in its own transaction with the `user_version` bump inside it, so a
 /// crash mid-migration leaves the previous version whole.
@@ -1316,6 +2167,20 @@ fn migrate_with(
         remint_v5_source_ids(&tx, path, mint)?;
         tx.execute_batch("PRAGMA user_version = 6;")
             .map_err(|e| sqlite(path, e))?;
+        tx.commit().map_err(|e| sqlite(path, e))?;
+        version = 6;
+    }
+    if version < 7 {
+        // #173 (ADR 0020): local conflict journal and tracked peer watermarks.
+        let tx = conn.transaction().map_err(|e| sqlite(path, e))?;
+        tx.execute_batch(SCHEMA_V7).map_err(|e| sqlite(path, e))?;
+        tx.commit().map_err(|e| sqlite(path, e))?;
+        version = 7;
+    }
+    if version < 8 {
+        // #174 (ADR 0020): confirmed External entry UID carriage + backfill.
+        let tx = conn.transaction().map_err(|e| sqlite(path, e))?;
+        tx.execute_batch(SCHEMA_V8).map_err(|e| sqlite(path, e))?;
         tx.commit().map_err(|e| sqlite(path, e))?;
     }
     Ok(())
@@ -2246,7 +3111,6 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 6);
         // Old rows survive, with no attribution — the state reconcile
         // treats as "cannot attribute, never withdraw".
         let sources = db.sources().unwrap();
@@ -2762,5 +3626,223 @@ mod tests {
             .unwrap();
         assert!(is_uuid(&readded.id));
         assert_ne!(readded.id, src.id);
+    }
+
+    #[test]
+    fn migration_v6_to_v7_and_sync_merge_preserve_local_cred_and_conflicts() {
+        let path = dir("v6-v7").join("store.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.execute(
+                "INSERT INTO external_sources(id, kind, locator, project_id, label,
+                     cred_ref, cred_username, created_at, updated_at, device_id)
+                 VALUES ('11111111-1111-4111-8111-111111111111', 'caldav', 'https://cal.test/1/', NULL, 'Cal',
+                     'caldav/11111111-1111-4111-8111-111111111111', 'alice', 10, 10, 'dev-a'),
+                        ('22222222-2222-4222-8222-222222222222', 'caldav', 'https://cal.test/2/', NULL, 'Del',
+                     'caldav/22222222-2222-4222-8222-222222222222', 'bob', 10, 10, 'dev-a')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+        let db = SqliteStore::open_file(&path).unwrap();
+        let v: i64 = db
+            .lock()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        db.set_sync_folder("/tmp/sync").unwrap();
+        assert_eq!(
+            db.sync_config().unwrap().folder.as_deref(),
+            Some("/tmp/sync")
+        );
+
+        let write = SyncMergeWrite {
+            upsert_sources: vec![ExternalSourceRow {
+                source: ExternalSource {
+                    id: "11111111-1111-4111-8111-111111111111".into(),
+                    kind: "caldav".into(),
+                    locator: "https://cal.test/1/".into(),
+                    project_id: None,
+                    label: "Renamed remotely".into(),
+                    cred_ref: None,
+                    cred_username: None,
+                },
+                created_at: 10,
+                updated_at: 200,
+                device_id: "dev-b".into(),
+            }],
+            delete_sources: vec!["22222222-2222-4222-8222-222222222222".into()],
+            new_conflicts: vec![SyncConflictRow {
+                id: "cccccccc-0000-4000-8000-000000000001".into(),
+                kind: "project".into(),
+                record_id: "pppppppp-0000-4000-8000-000000000001".into(),
+                recorded_at: 300,
+                loser_updated_at: 150,
+                loser_device_id: db.device_id().into(),
+                winner_updated_at: 250,
+                winner_device_id: "dev-b".into(),
+                loser_payload: r#"{"kind":"project","id":"pppppppp-0000-4000-8000-000000000001","name":"Local","colour":null,"archived":false,"created_at":100,"updated_at":150,"device_id":"d"}"#.into(),
+                restored_at: None,
+            }],
+            upsert_peers: vec![SyncPeerRow {
+                device_id: "dev-b".into(),
+                last_published_at: 250,
+                last_merged_through: 50,
+                last_seen_at: 300,
+                quarantined: false,
+                last_warning: None,
+            }],
+            merged_through: Some(250),
+            last_sync_at: Some(300),
+            last_error: Some(None),
+            ..Default::default()
+        };
+
+        let purged = db.apply_sync_merge(&write).unwrap();
+        assert_eq!(
+            purged,
+            vec!["caldav/22222222-2222-4222-8222-222222222222".to_string()]
+        );
+
+        let kept = db
+            .source("11111111-1111-4111-8111-111111111111")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.label, "Renamed remotely");
+        assert_eq!(
+            kept.cred_ref.as_deref(),
+            Some("caldav/11111111-1111-4111-8111-111111111111"),
+            "local OS credential pointer must survive remote source update"
+        );
+        assert_eq!(kept.cred_username.as_deref(), Some("alice"));
+
+        assert_eq!(db.sync_conflicts(false).unwrap().len(), 1);
+        assert_eq!(db.sync_peers().unwrap().len(), 1);
+
+        // Restoring the conflict re-saves the project and marks the journal row restored.
+        db.restore_sync_conflict(
+            "cccccccc-0000-4000-8000-000000000001",
+            400,
+            &RestoredRecord::Project(Project {
+                id: "pppppppp-0000-4000-8000-000000000001".into(),
+                name: "Local".into(),
+                colour: None,
+                archived: false,
+            }),
+        )
+        .unwrap();
+        assert!(db.sync_conflicts(false).unwrap().is_empty());
+        assert_eq!(db.sync_conflicts(true).unwrap()[0].restored_at, Some(400));
+        assert_eq!(db.load().unwrap().projects[0].name, "Local");
+
+        // Unpairing clears sync config & peers but keeps the conflict journal and data.
+        db.clear_sync_config().unwrap();
+        assert_eq!(db.sync_config().unwrap().folder, None);
+        assert!(db.sync_peers().unwrap().is_empty());
+        assert_eq!(db.sync_conflicts(true).unwrap().len(), 1);
+        assert_eq!(db.load().unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn migration_v7_to_v8_backfills_confirmed_entries_and_dedups_recurring_occurrences() {
+        let path = dir("v7-to-v8").join("store.db");
+        let src_id = "11111111-1111-4111-8111-111111111111";
+        let proj_id = "22222222-2222-4222-8222-222222222222";
+        let entry_id = "33333333-3333-4333-8333-333333333333";
+
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            tx.execute_batch(SCHEMA_V2).unwrap();
+            tx.execute_batch("PRAGMA user_version = 3;").unwrap();
+            tx.execute_batch(SCHEMA_V4).unwrap();
+            tx.execute_batch(SCHEMA_V5).unwrap();
+            tx.execute_batch("PRAGMA user_version = 6;").unwrap();
+            tx.execute_batch(SCHEMA_V7).unwrap();
+            tx.execute(
+                "INSERT INTO projects(id, name, created_at, updated_at, device_id)
+                 VALUES (?1, 'Work', 1, 1, 'd')",
+                params![proj_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO entries(id, project_id, description, started_at, ended_at, source, created_at, updated_at, device_id)
+                 VALUES (?1, ?2, 'Standup', 1000, 2000, 2, 10, 10, 'd')",
+                params![entry_id, proj_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO external_sources(id, kind, locator, label, created_at, updated_at, device_id)
+                 VALUES (?1, 'ics_file', '/tmp/work.ics', 'Work', 1, 1, 'd')",
+                params![src_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO suggestions(id, source_id, external_uid, kind, title, started_at, ended_at, status, entry_id, fetched_at, decided_at)
+                 VALUES ('sg-1', ?1, 'standup@cal', 'event', 'Standup', 1000, 2000, 'confirmed', ?2, 5, 10)",
+                params![src_id, entry_id],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let db = SqliteStore::open_file(&path).unwrap();
+        let v: i64 = db
+            .lock()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let rows = db.load_sync_rows().unwrap();
+        assert_eq!(rows.entries[0].external_source_id.as_deref(), Some(src_id));
+        assert_eq!(rows.entries[0].external_uid.as_deref(), Some("standup@cal"));
+        assert_eq!(rows.entries[0].external_started_at, Some(1000));
+
+        // Normal time edit preserves `external_started_at = 1000` so re-fetch still dedups occ 1.
+        let mut store = db.load().unwrap();
+        store.entries[0].started_at = 1200;
+        let rec = Journal::between(&db.load().unwrap(), &store);
+        db.apply(&rec, 20).unwrap();
+
+        // Wipe suggestion cache as on another device: occ 1 is dedupped against `entries`,
+        // while recurring occ 2 (`started_at = 86_401_000`) still surfaces.
+        db.lock().execute("DELETE FROM suggestions", []).unwrap();
+        let items = vec![
+            ExternalItem {
+                uid: "standup@cal".into(),
+                kind: ExternalKind::Event,
+                title: "Standup".into(),
+                started_at: 1000,
+                ended_at: 2000,
+                recurring: true,
+            },
+            ExternalItem {
+                uid: "standup@cal".into(),
+                kind: ExternalKind::Event,
+                title: "Standup".into(),
+                started_at: 86_401_000,
+                ended_at: 86_402_000,
+                recurring: true,
+            },
+        ];
+        assert_eq!(db.upsert_suggestions(src_id, &items, 30).unwrap(), 1);
+        let pending = db.suggestions(true).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].started_at, 86_401_000);
+
+        // CalDAV reconcile path skips confirmed occ 1 as well.
+        db.lock().execute("DELETE FROM suggestions", []).unwrap();
+        let counts = db
+            .reconcile_caldav_resource(src_id, "/cal/standup.ics", &items, 40)
+            .unwrap();
+        assert_eq!(counts.inserted, 1);
+        assert_eq!(db.suggestions(true).unwrap()[0].started_at, 86_401_000);
     }
 }

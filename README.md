@@ -187,7 +187,9 @@ activation file, no systemd unit — so there is nothing left that can
 dangle. Your tracked time lives outside the image at
 `~/.local/share/timetrack/store.db` (SQLite, §17) and is untouched by
 this. To back up or move it, stop the service first and copy `store.db`
-plus its `store.db-wal` sibling together. Upgrading from the JSON era
+plus its `store.db-wal` sibling together (see
+[Sync, backup, and recovery](#sync-backup-and-recovery) below — a sync
+folder is never a substitute for a backup). Upgrading from the JSON era
 needs nothing: the first start imports `store.json` (plus its journal)
 into the database and leaves both files untouched as your backup.
 
@@ -431,6 +433,77 @@ the `.zsync` file next to it, so the external
 [AppImageUpdate](https://github.com/AppImage/AppImageUpdate) tool can
 delta-update the same file. The in-app updater downloads the whole image
 instead (~10 MB) and needs neither.
+
+## Sync, backup, and recovery
+
+TimeTrack supports optional encrypted folder sync across your own devices
+([ADR 0020](docs/adr/0020-one-person-folder-sync.md)): each device writes
+only its own encrypted `<device-id>` snapshot file into a user-held
+folder (Syncthing, Nextcloud, NAS, USB drive, etc.) using a shared
+256-bit sync key kept in the OS credential store — never SQLite.
+
+### Backup vs. sync (a sync folder is not a backup)
+
+- **A real backup** is either copying `store.db` plus its `store.db-wal`
+  sibling together while `timetrack-service` is stopped, or writing a
+  CSV export (`timetrack export --scope all` / GUI **Export**, §17).
+- **The sync folder is explicitly NOT a backup**:
+  - Conflict losers (`sync_conflicts`) live only in the losing device's
+    local database until reviewed/restored — they are not stored in the
+    sync folder.
+  - Tombstones past the compaction watermark are purged once all active
+    devices have merged them.
+  - Quarantined (>90 days behind or behind compaction) or unreadable peer
+    files withhold records rather than acting as historical archives.
+
+### Pairing devices
+
+1. **First device**: in the GUI click `SYNC → enable sync`, pick or type
+   the shared folder path, and note the generated pairing code (or run
+   `timetrack sync enable /path/to/shared-folder`).
+2. **Second device**: in the GUI click `SYNC → join folder` (or
+   `SYNC → enable sync` and switch mode to `join`), point at the same
+   folder, and paste/type the pairing code (or run
+   `timetrack sync enable /path/to/shared-folder --join`, reading the
+   pairing code from stdin/prompt — never on the command line). The
+   device pulls and merges existing peers before publishing its snapshot.
+3. **Conflicts & external calendar suggestions**: when two devices edit
+   the same `entry`, `project`, or `external source` concurrently,
+   last-write-wins resolves the winner and the losing version is saved
+   locally in `CONFLICTS` (`timetrack sync conflicts`). Click `restore`
+   (or run `timetrack sync restore <id>`) and sync to propagate the
+   restored record. External calendar `suggestion` dismissals stay local
+   per device by design; confirmed external `entry` records carry their
+   source & UID across sync so other devices deduplicate them.
+
+### Lost-device recovery runbook
+
+If a paired device is lost, stolen, or wiped:
+
+1. Delete the lost device's 32-hex `<device-id>` file from the sync
+   folder so it stops holding back tombstone compaction or showing as
+   stale/quarantined.
+2. On a surviving device, rotate the sync key with
+   `timetrack sync rotate-key` (or in the GUI: `SYNC → show code → Rotate key`).
+   This generates a fresh 256-bit key in the OS credential store and
+   republishes this device's snapshot under the new key.
+3. On every other surviving device, re-pair using the new pairing code
+   (`timetrack sync enable /path/to/shared-folder --join` or GUI
+   `SYNC → join folder`).
+
+### Old-backup restore runbook
+
+If you restore an older `store.db` (+ `store.db-wal`) backup onto a
+device that was already syncing:
+
+1. Stop `timetrack-service`, restore the `store.db` / `store.db-wal`
+   backup files into the data directory, and start the service again.
+2. Run `timetrack sync repair` (or click `SYNC → repair` in the GUI).
+   Regular `sync now` also refuses to publish ahead of a pull-merge when
+   the local database is behind compaction or >90 days old; `repair`
+   pulls and merges all active peers *before* republishing, keeping
+   post-departure local edits while ensuring compacted deletes never
+   resurrect.
 
 ## Known issues
 

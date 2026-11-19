@@ -39,7 +39,7 @@ use std::path::PathBuf;
 
 use super::{
     CALL_TIMEOUT, ClientError, EntryView, ProjectView, RefreshView, ServiceError, Snapshot,
-    SourceView, SuggestionView,
+    SourceView, SuggestionView, SyncConflictView, SyncEnableResult, SyncNowView, SyncStatusView,
 };
 
 /// The socket protocol revision an `ApiVersion` reply reports. Bump
@@ -222,6 +222,26 @@ pub enum Request {
         id: String,
         note: Option<String>,
     },
+    /// Enable folder sync (#173), generating a new key or joining with `pairing_code`.
+    SyncEnable {
+        folder: String,
+        pairing_code: Option<String>,
+    },
+    SyncStatus,
+    SyncNow,
+    SyncUnpair {
+        delete_file: bool,
+    },
+    SyncShowCode,
+    SyncRotateKey,
+    SyncConflicts {
+        include_restored: bool,
+    },
+    SyncRestoreConflict {
+        id: String,
+    },
+    /// Drop stale departed/pre-compaction state against active peers and reseed (#175).
+    SyncRepair,
 }
 
 /// One call's successful answer.
@@ -240,6 +260,11 @@ pub enum Response {
     Suggestions(Vec<SuggestionView>),
     Refresh(RefreshView),
     CaldavCollections(Vec<super::CaldavCollectionView>),
+    SyncStatus(Box<SyncStatusView>),
+    SyncEnable(Box<SyncEnableResult>),
+    SyncNow(Box<SyncNowView>),
+    SyncCode(String),
+    SyncConflicts(Vec<SyncConflictView>),
 }
 
 impl Response {
@@ -323,6 +348,41 @@ impl Response {
         match self {
             Response::CaldavCollections(c) => Ok(c),
             other => Err(other.mismatch("discovered collections")),
+        }
+    }
+
+    pub fn sync_status(self) -> Result<SyncStatusView, ClientError> {
+        match self {
+            Response::SyncStatus(s) => Ok(*s),
+            other => Err(other.mismatch("a sync status")),
+        }
+    }
+
+    pub fn sync_enable(self) -> Result<SyncEnableResult, ClientError> {
+        match self {
+            Response::SyncEnable(r) => Ok(*r),
+            other => Err(other.mismatch("a sync enable result")),
+        }
+    }
+
+    pub fn sync_now(self) -> Result<SyncNowView, ClientError> {
+        match self {
+            Response::SyncNow(r) => Ok(*r),
+            other => Err(other.mismatch("a sync result")),
+        }
+    }
+
+    pub fn sync_code(self) -> Result<String, ClientError> {
+        match self {
+            Response::SyncCode(c) => Ok(c),
+            other => Err(other.mismatch("a sync pairing code")),
+        }
+    }
+
+    pub fn sync_conflicts(self) -> Result<Vec<SyncConflictView>, ClientError> {
+        match self {
+            Response::SyncConflicts(c) => Ok(c),
+            other => Err(other.mismatch("sync conflicts")),
         }
     }
 }

@@ -53,6 +53,7 @@ use super::dialogs::entry::EntryDialog;
 use super::dialogs::project::ProjectPrompt;
 use super::dialogs::source::SourceDialog;
 use super::dialogs::split::SplitPrompt;
+use super::dialogs::sync::SyncDialog;
 use super::export::picker::{ExportPicker, ExportRange, RangeEnd};
 use super::textline::{self, Caret, ImeEdit};
 
@@ -62,6 +63,7 @@ enum ImeTarget<'a> {
     Project(&'a mut ProjectPrompt),
     Split(&'a mut SplitPrompt),
     Source(&'a mut SourceDialog),
+    Sync(&'a mut SyncDialog),
     Anchor(&'a mut ExportPicker),
     Range(&'a mut ExportRange),
 }
@@ -76,6 +78,7 @@ impl ImeTarget<'_> {
             ImeTarget::Project(prompt) => Some((&prompt.name, &prompt.caret)),
             ImeTarget::Split(prompt) => Some((&prompt.at, &prompt.caret)),
             ImeTarget::Source(dlg) => dlg.focused_text(),
+            ImeTarget::Sync(dlg) => dlg.focused_text(),
             ImeTarget::Anchor(picker) => Some((&picker.anchor_text, &picker.caret)),
             ImeTarget::Range(range) => match range.editing {
                 Some(RangeEnd::From) => Some((&range.from_text, &range.from_caret)),
@@ -99,6 +102,7 @@ impl ImeTarget<'_> {
                 true
             }
             ImeTarget::Source(dlg) => dlg.ime_edit(edit),
+            ImeTarget::Sync(dlg) => dlg.ime_edit(edit),
             ImeTarget::Anchor(picker) => picker.ime_edit(edit),
             ImeTarget::Range(range) => range.ime_edit(edit),
         }
@@ -108,8 +112,8 @@ impl ImeTarget<'_> {
 impl TimetrackView {
     /// The dialog owning the focused textline field. Mirrors the
     /// routing priority of `focused_text_mut`: the entry dialog, then
-    /// the project, split and source prompts, then the export anchor,
-    /// then the open range day.
+    /// the project, split and source prompts, then the sync dialog,
+    /// then the export anchor, then the open range day.
     fn ime_target(&mut self) -> Option<ImeTarget<'_>> {
         if let Some(dlg) = self.dialog.as_mut() {
             return Some(ImeTarget::Entry(dlg));
@@ -122,6 +126,9 @@ impl TimetrackView {
         }
         if let Some(dlg) = self.source_dialog.as_mut() {
             return Some(ImeTarget::Source(dlg));
+        }
+        if let Some(dlg) = self.sync_dialog.as_mut() {
+            return Some(ImeTarget::Sync(dlg));
         }
         if self.export_picker.editing {
             return Some(ImeTarget::Anchor(&mut self.export_picker));
@@ -147,6 +154,9 @@ impl TimetrackView {
             return Some((&prompt.at, &prompt.caret));
         }
         if let Some(dlg) = self.source_dialog.as_ref() {
+            return dlg.focused_text();
+        }
+        if let Some(dlg) = self.sync_dialog.as_ref() {
             return dlg.focused_text();
         }
         if self.export_picker.editing {

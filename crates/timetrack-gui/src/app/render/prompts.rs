@@ -27,14 +27,17 @@ use super::super::dialogs::source::{
     masked_secret_with_caret,
 };
 use super::super::dialogs::split::SplitPrompt;
+use super::super::dialogs::sync::{
+    SyncCodeDialog, SyncDialog, SyncField, SyncMode, SyncUnpairConfirm,
+};
 use super::super::mouse::{FieldHit, MouseField, field_mouse};
 use super::super::{display_tz, theme};
 use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt as _, Div, ElementId, Entity, IntoElement, Rgba, div, ease_out_quint,
-    px, rgba,
+    Animation, AnimationExt as _, AnyElement, Div, ElementId, Entity, IntoElement, Rgba, div,
+    ease_out_quint, px, rgba,
 };
 
 /// The shared prompt panel shell: one bordered panel above the tab content,
@@ -179,6 +182,15 @@ impl TimetrackView {
             })
             .when_some(self.source_remove_confirm.as_ref(), |el, confirm| {
                 el.child(self.render_source_remove_confirm(confirm))
+            })
+            .when_some(self.sync_dialog.as_ref(), |el, dlg| {
+                el.child(self.render_sync_dialog(dlg))
+            })
+            .when_some(self.sync_code_dialog.as_ref(), |el, dlg| {
+                el.child(self.render_sync_code_dialog(dlg))
+            })
+            .when_some(self.sync_unpair_confirm.as_ref(), |el, confirm| {
+                el.child(self.render_sync_unpair_confirm(confirm))
             })
             .with_animation(
                 ElementId::from((ElementId::from("prompt-fade"), key)),
@@ -941,5 +953,436 @@ impl TimetrackView {
             TimetrackView::confirm_source_remove,
             TimetrackView::cancel_source_remove,
         )
+    }
+
+    /// Folder-sync setup dialog (#176): create a synced folder on the
+    /// first device or join an existing one with a pairing code.
+    fn render_sync_dialog(&self, dlg: &SyncDialog) -> impl IntoElement {
+        let title = match dlg.mode {
+            SyncMode::Create => "ENABLE FOLDER SYNC",
+            SyncMode::Join => "JOIN SYNC FOLDER",
+        };
+        let current_field = dlg.field;
+        let mode_focused = current_field == SyncField::Mode;
+        let entity_mode = self.entity.clone();
+        let entity_folder = self.entity.clone();
+        let entity_browse = self.entity.clone();
+        let entity_code = self.entity.clone();
+        let entity_save = self.entity.clone();
+        let entity_cancel = self.entity.clone();
+
+        let text_row = |id: &'static str,
+                        field: SyncField,
+                        label: &str,
+                        value: &str,
+                        hint: &str,
+                        extra: Option<AnyElement>| {
+            let focused = current_field == field;
+            let entity = if field == SyncField::Folder {
+                entity_folder.clone()
+            } else {
+                entity_code.clone()
+            };
+            let hit_entity = entity.clone();
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_1()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w(px(110.))
+                        .text_color(if focused {
+                            rgba(theme::SELECTED_TEXT)
+                        } else {
+                            rgba(theme::MUTED_TEXT)
+                        })
+                        .child(format!("{} {label}", if focused { ">" } else { " " })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(if focused {
+                            rgba(theme::FOCUS_RING)
+                        } else {
+                            rgba(theme::TRANSPARENT)
+                        })
+                        .bg(if focused {
+                            rgba(theme::RAISED_BG)
+                        } else {
+                            rgba(theme::TRANSPARENT)
+                        })
+                        .text_color(rgba(theme::BODY_TEXT))
+                        .child(FieldHit::wrap(
+                            MouseField::Sync(field),
+                            hit_entity,
+                            if focused {
+                                super::super::textline::render_with_caret(value, &dlg.caret)
+                            } else {
+                                timetrack_core::sanitize_display(value)
+                            },
+                        )),
+                )
+                .when_some(extra, |el, btn| el.child(btn))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgba(theme::HINT_TEXT))
+                        .child(hint.to_string()),
+                )
+                .when_some(entity, move |this, entity| {
+                    field_mouse(this, MouseField::Sync(field), entity)
+                })
+        };
+
+        let browse_btn = div()
+            .id("sync-pick-folder")
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+            .text_color(rgba(theme::BODY_TEXT))
+            .child("browse")
+            .when_some(entity_browse, |this, entity| {
+                this.on_click(move |_ev, _window, cx| {
+                    entity.update(cx, |view, cx| {
+                        view.focus_sync_field(SyncField::Folder);
+                        view.pick_sync_folder();
+                        cx.notify();
+                    });
+                })
+            })
+            .into_any_element();
+
+        let mut panel = prompt_panel()
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .text_color(if mode_focused {
+                                rgba(theme::SELECTED_TEXT)
+                            } else {
+                                rgba(theme::MUTED_TEXT)
+                            })
+                            .child(format!("{} mode", if mode_focused { ">" } else { " " })),
+                    )
+                    .child(
+                        div()
+                            .id("sync-field-mode")
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(if mode_focused {
+                                rgba(theme::FOCUS_RING)
+                            } else {
+                                rgba(theme::TRANSPARENT)
+                            })
+                            .bg(if mode_focused {
+                                rgba(theme::RAISED_BG)
+                            } else {
+                                rgba(theme::TRANSPARENT)
+                            })
+                            .text_color(rgba(theme::BODY_TEXT))
+                            .child(format!("‹ {} ›", dlg.mode.as_str()))
+                            .when_some(entity_mode, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.focus_sync_field(SyncField::Mode);
+                                        view.cycle_sync_mode(1);
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgba(theme::HINT_TEXT))
+                            .child("h/l or click to switch"),
+                    ),
+            )
+            .child(text_row(
+                "sync-field-folder",
+                SyncField::Folder,
+                "folder",
+                &dlg.folder,
+                "shared folder path",
+                Some(browse_btn),
+            ));
+
+        if dlg.mode == SyncMode::Join {
+            panel = panel.child(text_row(
+                "sync-field-code",
+                SyncField::PairingCode,
+                "code",
+                &dlg.pairing_code,
+                "code from first device",
+                None,
+            ));
+        }
+
+        panel = panel
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        div()
+                            .id("confirm-sync-enable")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::ACCENT))
+                            .child(if dlg.mode == SyncMode::Create {
+                                "Enable sync"
+                            } else {
+                                "Join folder"
+                            })
+                            .when_some(entity_save, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.sync_save();
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("cancel-sync-enable")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::STRONG_TEXT))
+                            .child("Cancel")
+                            .when_some(entity_cancel, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.close_sync_dialog();
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgba(theme::HINT_TEXT))
+                    .child("type or paste · tab next field · h/l mode · enter enable · esc cancel"),
+            );
+
+        if let Some(err) = &dlg.error {
+            panel = panel.child(
+                div()
+                    .pt_1()
+                    .text_color(rgba(theme::WARNING))
+                    .child(err.clone()),
+            );
+        }
+        panel
+    }
+
+    /// Pairing-code modal (#176): displays the active key for pairing a new
+    /// device and offers clipboard copy and key rotation.
+    fn render_sync_code_dialog(&self, dlg: &SyncCodeDialog) -> impl IntoElement {
+        let title = if dlg.rotated {
+            "NEW PAIRING CODE — RE-PAIR OTHER DEVICES"
+        } else {
+            "SYNC PAIRING CODE"
+        };
+        let entity_copy = self.entity.clone();
+        let entity_rotate = self.entity.clone();
+        let entity_close = self.entity.clone();
+        prompt_panel()
+            .child(div().text_color(rgba(theme::ACCENT)).child(title))
+            .child(
+                div()
+                    .mt_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgba(theme::RAISED_BG))
+                    .text_color(rgba(theme::SELECTED_TEXT))
+                    .child(dlg.code.clone()),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .text_sm()
+                    .text_color(rgba(theme::HINT_TEXT))
+                    .child("Enter this code on another device joining the same sync folder."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        div()
+                            .id("sync-code-copy")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::ACCENT))
+                            .child(if dlg.copied { "Copied" } else { "Copy code" })
+                            .when_some(entity_copy, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.copy_sync_code(cx);
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("sync-code-rotate")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::WARNING))
+                            .child("Rotate key")
+                            .when_some(entity_rotate, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.rotate_sync_key();
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("sync-code-close")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::STRONG_TEXT))
+                            .child("Close")
+                            .when_some(entity_close, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.close_sync_code_dialog();
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    ),
+            )
+    }
+
+    /// Confirmation banner for unpairing folder sync (#176): lets the user
+    /// choose whether to keep or delete this device's sync file.
+    fn render_sync_unpair_confirm(&self, confirm: &SyncUnpairConfirm) -> impl IntoElement {
+        let entity_keep = self.entity.clone();
+        let entity_delete = self.entity.clone();
+        let entity_cancel = self.entity.clone();
+        prompt_panel()
+            .child(
+                div()
+                    .text_color(rgba(theme::ACCENT))
+                    .child(confirm.summary.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        div()
+                            .id("confirm-unpair-keep")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::STRONG_TEXT))
+                            .child("Keep file & unpair")
+                            .when_some(entity_keep, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.confirm_sync_unpair(false);
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("confirm-unpair-delete")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::DANGER))
+                            .text_color(rgba(theme::SELECTED_TEXT))
+                            .child("Delete device file & unpair")
+                            .when_some(entity_delete, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.confirm_sync_unpair(true);
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("cancel-unpair")
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgba(theme::NEUTRAL_BUTTON_BG))
+                            .text_color(rgba(theme::STRONG_TEXT))
+                            .child("Cancel")
+                            .when_some(entity_cancel, |this, entity| {
+                                this.on_click(move |_ev, _window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.cancel_sync_unpair();
+                                        cx.notify();
+                                    });
+                                })
+                            }),
+                    ),
+            )
     }
 }

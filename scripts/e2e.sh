@@ -819,6 +819,18 @@ out=$("$CLI" export --from 2026-01-05 2>&1)
 contains "a range needs both ends" "needs both --from and --to" "$out"
 
 echo
+echo "== folder sync CLI surface (#173) =="
+out=$("$CLI" sync status --json)
+contains "sync status reports disabled initially" '"enabled":false' "$out"
+contains "sync status carries a 32-hex device_id" '"device_id":"' "$out"
+out=$("$CLI" sync conflicts)
+check "no sync conflicts initially" "no sync conflicts" "$out"
+out=$("$CLI" sync now 2>&1)
+contains "sync now before enabling gives guidance" "sync is not enabled" "$out"
+out=$("$CLI" sync show-code 2>&1)
+contains "sync show-code before enabling gives guidance" "sync is not enabled" "$out"
+
+echo
 echo "======================================"
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || { echo; echo "--- work dir ---"; ls -la "$WORK"; echo; echo "--- service log ---"; cat "$WORK/svc.log"; }
