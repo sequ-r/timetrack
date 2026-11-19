@@ -6124,7 +6124,7 @@ dependencies = [
  "timetrack-core",
  "timetrack-proto",
  "tray-icon",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "zbus 6.3.0",
 ]
 
