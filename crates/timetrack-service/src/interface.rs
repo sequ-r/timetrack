@@ -590,15 +590,7 @@ impl EntryService {
     ) -> Result<protocol::SourceView, ServiceError> {
         validate_source_identity(kind, locator)?;
         let g = lock(&self.inner);
-        if g.store
-            .source(id)
-            .map_err(|e| ServiceError::Storage(e.to_string()))?
-            .is_none()
-        {
-            return Err(ServiceError::Other(format!(
-                "no external source with id '{id}'"
-            )));
-        }
+        let current = resolve_source(&g.store, id)?;
         // Resolve before writing, as in registration.
         let project_id = project_id
             .map(|pid| core::resolve_project_id(&g.data, pid))
@@ -607,7 +599,7 @@ impl EntryService {
             .sources()
             .map_err(|e| ServiceError::Storage(e.to_string()))?
             .iter()
-            .any(|s| s.id != id && s.kind == kind && s.locator == locator)
+            .any(|s| s.id != current.id && s.kind == kind && s.locator == locator)
         {
             return Err(ServiceError::Other(format!(
                 "a {kind} source for '{locator}' already exists"
@@ -620,9 +612,16 @@ impl EntryService {
         };
         let src = g
             .store
-            .update_source(id, kind, locator, project_id.as_deref(), label, now_ms())
+            .update_source(
+                &current.id,
+                kind,
+                locator,
+                project_id.as_deref(),
+                label,
+                now_ms(),
+            )
             .map_err(|e| ServiceError::Storage(e.to_string()))?
-            .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+            .ok_or_else(|| ServiceError::Rule(RuleError::UnknownSource(id.to_string())))?;
         drop(g);
         self.notify_changed();
         Ok(source_view(src))
@@ -644,21 +643,12 @@ impl EntryService {
         let (tz, targets, credentials) = {
             let mut g = lock(&self.inner);
             refresh_tz(&mut g);
-            let all = g
-                .store
-                .sources()
-                .map_err(|e| ServiceError::Storage(e.to_string()))?;
             let targets: Vec<_> = match id {
-                Some(want) => {
-                    let found: Vec<_> = all.into_iter().filter(|s| s.id == want).collect();
-                    if found.is_empty() {
-                        return Err(ServiceError::Other(format!(
-                            "no external source with id '{want}'"
-                        )));
-                    }
-                    found
-                }
-                None => all,
+                Some(want) => vec![resolve_source(&g.store, want)?],
+                None => g
+                    .store
+                    .sources()
+                    .map_err(|e| ServiceError::Storage(e.to_string()))?,
             };
             (g.tz.clone(), targets, g.credentials.clone())
         };
@@ -940,19 +930,17 @@ impl EntryService {
         }
         let (source, reference) = {
             let g = lock(&self.inner);
-            let source = g
-                .store
-                .source(id)
-                .map_err(|e| ServiceError::Storage(e.to_string()))?
-                .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
-            (source, crate::credentials::credential_ref(id))
+            let source = resolve_source(&g.store, id)?;
+            let reference = crate::credentials::credential_ref(&source.id);
+            (source, reference)
         };
         let username = if username.trim().is_empty() {
             let (_, locator_user) =
                 crate::caldav::split_userinfo(&source.locator).map_err(ServiceError::Other)?;
             locator_user.ok_or_else(|| {
                 ServiceError::Other(format!(
-                    "source '{id}' names no user; pass --username <name>"
+                    "source '{}' names no user; pass --username <name>",
+                    source.id
                 ))
             })?
         } else {
@@ -967,22 +955,27 @@ impl EntryService {
             .map_err(|e| ServiceError::Other(e.to_string()))?;
         let recorded = lock(&self.inner)
             .store
-            .set_source_credential_ref(id, &reference, &username)
+            .set_source_credential_ref(&source.id, &reference, &username)
             .map_err(|e| ServiceError::Storage(e.to_string()))?;
         if !recorded {
             // The source vanished between the lookup and the write (a
             // racing remove): roll the orphaned OS entry back so no
             // unreachable secret is left behind.
             let _ = credentials.delete(&reference);
-            return Err(ServiceError::Other(format!(
-                "no external source with id '{id}'"
+            return Err(ServiceError::Rule(RuleError::UnknownSource(
+                source.id.clone(),
             )));
+        }
+        if let Some(old_ref) = source.cred_ref.as_deref()
+            && old_ref != reference
+        {
+            let _ = credentials.delete(old_ref);
         }
         let view = self
             .sources()?
             .into_iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+            .find(|s| s.id == source.id)
+            .ok_or_else(|| ServiceError::Rule(RuleError::UnknownSource(source.id.clone())))?;
         self.notify_changed();
         Ok(view)
     }
@@ -994,10 +987,7 @@ impl EntryService {
     pub fn remove_source_credential(&self, id: &str) -> Result<protocol::SourceView, ServiceError> {
         let source = {
             let g = lock(&self.inner);
-            g.store
-                .source(id)
-                .map_err(|e| ServiceError::Storage(e.to_string()))?
-                .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?
+            resolve_source(&g.store, id)?
         };
         let changed = source.cred_ref.is_some();
         if let Some(reference) = source.cred_ref {
@@ -1008,14 +998,14 @@ impl EntryService {
                 .map_err(|e| ServiceError::Other(e.to_string()))?;
             lock(&self.inner)
                 .store
-                .clear_source_credential_ref(id)
+                .clear_source_credential_ref(&source.id)
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
         }
         let view = self
             .sources()?
             .into_iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?;
+            .find(|s| s.id == source.id)
+            .ok_or_else(|| ServiceError::Rule(RuleError::UnknownSource(source.id.clone())))?;
         if changed {
             self.notify_changed();
         }
@@ -1023,38 +1013,35 @@ impl EntryService {
     }
 
     /// Delete a source, its still-pending suggestions, and its OS
-    /// credential (#153). Decided suggestions stay as history, and
-    /// confirmed entries stay — they are tracked time, not suggestions.
-    /// The credential purge is best-effort: when the store does not
-    /// answer, the row (the app's only reference to the secret) is
-    /// still removed, and the unreachable orphan is noted on stderr.
+    /// credential (#153), leaving a `kind="source"` tombstone (#172).
+    /// Decided suggestions stay as history, and confirmed entries stay
+    /// — they are tracked time, not suggestions. The credential purge is
+    /// best-effort: when the store does not answer, the row (the app's
+    /// only reference to the secret) is still removed, and the
+    /// unreachable orphan is noted on stderr.
     pub fn remove_source(&self, id: &str) -> Result<(), ServiceError> {
         let source = {
             let g = lock(&self.inner);
-            g.store
-                .source(id)
-                .map_err(|e| ServiceError::Storage(e.to_string()))?
-                .ok_or_else(|| ServiceError::Other(format!("no external source with id '{id}'")))?
+            resolve_source(&g.store, id)?
         };
         if let Some(reference) = source.cred_ref
             && let Err(e) = lock(&self.inner).credentials.clone().delete(&reference)
         {
             eprintln!(
-                "timetrack-service: removing source '{id}' left its OS credential behind ({e}); \
-                 delete it in your key manager"
+                "timetrack-service: removing source '{}' left its OS credential behind ({e}); \
+                 delete it in your key manager",
+                source.id
             );
         }
         let removed = lock(&self.inner)
             .store
-            .remove_source(id)
+            .remove_source(&source.id, now_ms())
             .map_err(|e| ServiceError::Storage(e.to_string()))?;
         if removed {
             self.notify_changed();
             Ok(())
         } else {
-            Err(ServiceError::Other(format!(
-                "no external source with id '{id}'"
-            )))
+            Err(ServiceError::Rule(RuleError::UnknownSource(source.id)))
         }
     }
 
@@ -1083,13 +1070,7 @@ impl EntryService {
         crate::caldav::split_userinfo(endpoint).map_err(ServiceError::Other)?;
         let (cred_ref, cred_username) = match source_id {
             Some(id) => {
-                let source = lock(&self.inner)
-                    .store
-                    .source(id)
-                    .map_err(|e| ServiceError::Storage(e.to_string()))?
-                    .ok_or_else(|| {
-                        ServiceError::Other(format!("no external source with id '{id}'"))
-                    })?;
+                let source = resolve_source(&lock(&self.inner).store, id)?;
                 (source.cred_ref, source.cred_username)
             }
             None => (None, None),
@@ -1124,6 +1105,20 @@ impl EntryService {
         let e = self.mutate(|s, _ids, _| core::set_text(s, id, None, Some(note)))?;
         Ok(protocol::entry_to_view(&e))
     }
+}
+
+/// Resolve an external source id or unique prefix against the store (#172).
+fn resolve_source(
+    store: &SqliteStore,
+    want: &str,
+) -> Result<timetrack_store::ExternalSource, ServiceError> {
+    let all = store
+        .sources()
+        .map_err(|e| ServiceError::Storage(e.to_string()))?;
+    let resolved = core::resolve_source_id(want, all.iter().map(|s| s.id.as_str()))?;
+    all.into_iter()
+        .find(|s| s.id == resolved)
+        .ok_or_else(|| ServiceError::Rule(RuleError::UnknownSource(want.to_string())))
 }
 
 /// What registration and editing agree a source's identity must be
@@ -3261,6 +3256,80 @@ mod tests {
                 .to_string()
                 .contains("src-nope"),
             "an unknown source refuses"
+        );
+    }
+
+    #[test]
+    fn source_id_prefix_resolution_works_and_ambiguous_refuses() {
+        let dir = std::env::temp_dir().join("tt-svc-source-prefix");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("store.db");
+        {
+            let store = SqliteStore::open_file(&db_path).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO external_sources(id, kind, locator, project_id, label, created_at, updated_at, device_id)
+                 VALUES ('aaaaaaaa-0000-4000-8000-000000000001', 'caldav', 'https://cal.test/1/', NULL, 'One', 1, 1, 'dev'),
+                        ('aaaaaaaa-0000-4000-8000-000000000002', 'caldav', 'https://cal.test/2/', NULL, 'Two', 1, 1, 'dev'),
+                        ('cccccccc-0000-4000-8000-000000000001', 'ics_file', '/tmp/no-such-file.ics', NULL, 'Unique', 1, 1, 'dev')",
+                [],
+            )
+            .unwrap();
+            drop(store);
+        }
+        let fake = Arc::new(FakeCredentialStore::new());
+        let svc = EntryService::new_with_credentials(
+            SqliteStore::open_file(&db_path).unwrap(),
+            fake.clone(),
+        )
+        .unwrap();
+
+        // Ambiguous prefix refuses without mutating anything across all paths.
+        for err in [
+            svc.update_source("aaaaaaaa", "ics_file", "/tmp/x.ics", None, "X")
+                .unwrap_err(),
+            svc.set_source_credential("aaaaaaaa", "alice", "s3cr3t")
+                .unwrap_err(),
+            svc.remove_source_credential("aaaaaaaa").unwrap_err(),
+            svc.remove_source("aaaaaaaa").unwrap_err(),
+            svc.refresh_source(Some("aaaaaaaa")).unwrap_err(),
+            svc.discover_caldav("https://cal.test/", Some("aaaaaaaa"))
+                .unwrap_err(),
+        ] {
+            assert_eq!(
+                err,
+                ServiceError::Rule(RuleError::AmbiguousSource("aaaaaaaa".into()))
+            );
+        }
+        assert_eq!(svc.sources().unwrap().len(), 3);
+
+        // Unique prefix resolves cleanly on update, credential ops, and remove.
+        let updated = svc
+            .update_source("cccccccc", "caldav", "https://cal.test/3/", None, "Three")
+            .unwrap();
+        assert_eq!(updated.id, "cccccccc-0000-4000-8000-000000000001");
+        assert_eq!(updated.label, "Three");
+
+        let cred = svc
+            .set_source_credential("cccccccc", "alice", "s3cr3t")
+            .unwrap();
+        assert!(cred.has_credential);
+        assert_eq!(
+            fake.get("caldav/cccccccc-0000-4000-8000-000000000001")
+                .unwrap()
+                .as_deref(),
+            Some("s3cr3t")
+        );
+        let cleared = svc.remove_source_credential("cccccccc").unwrap();
+        assert!(!cleared.has_credential);
+
+        svc.remove_source("cccccccc").unwrap();
+        assert_eq!(svc.sources().unwrap().len(), 2);
+        let stones = lock(&svc.inner).store.tombstones().unwrap();
+        assert!(
+            stones
+                .iter()
+                .any(|t| { t.id == "cccccccc-0000-4000-8000-000000000001" && t.kind == "source" })
         );
     }
 }

@@ -92,6 +92,12 @@ pub enum RuleError {
     /// See [`RuleError::AmbiguousEntry`].
     #[error("ambiguous project id prefix '{0}'")]
     AmbiguousProject(String),
+    /// An external source id matching no registered source (#172).
+    #[error("no external source with id '{0}'")]
+    UnknownSource(String),
+    /// An external source id prefix matching several sources (ADR 0018, #172).
+    #[error("ambiguous source id prefix '{0}'")]
+    AmbiguousSource(String),
 }
 
 pub type RuleResult<T> = Result<T, RuleError>;
@@ -268,6 +274,16 @@ pub fn resolve_project_id(store: &Store, want: &str) -> RuleResult<String> {
         IdResolution::Resolved(id) => Ok(id.to_string()),
         IdResolution::Unknown => Err(RuleError::UnknownProject(want.to_string())),
         IdResolution::Ambiguous => Err(RuleError::AmbiguousProject(want.to_string())),
+    }
+}
+
+/// Resolve an external source id argument against known source ids (#172).
+/// See [`resolve_entry_id`].
+pub fn resolve_source_id<'a>(want: &str, ids: impl Iterator<Item = &'a str>) -> RuleResult<String> {
+    match resolve_id_prefix(want, ids) {
+        IdResolution::Resolved(id) => Ok(id.to_string()),
+        IdResolution::Unknown => Err(RuleError::UnknownSource(want.to_string())),
+        IdResolution::Ambiguous => Err(RuleError::AmbiguousSource(want.to_string())),
     }
 }
 
