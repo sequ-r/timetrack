@@ -30,7 +30,7 @@ thiserror = "2"
 # SQLite from the crate so no platform's system library can version-skew
 # against the schema; only `timetrack-store` depends on it, and only the
 # service depends on that.
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 # Blocking HTTPS with rustls for the two network touches the app makes
 # at all: the AppImage update check and .ics URL fetches (§19). Both run
 # off any async executor; no tokio (see the zbus note below).
