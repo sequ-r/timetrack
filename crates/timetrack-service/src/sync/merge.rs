@@ -29,6 +29,9 @@ use super::envelope::{
 /// Stale peer warning threshold shown in status views (7 days).
 pub const STALE_PEER_WARNING_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Peers that have not published within 90 days are departed and quarantined (ADR 0020, #175).
+pub const DEPARTURE_HORIZON_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+
 /// Serialized losing-record payload preserved in the local `sync_conflicts` journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -180,14 +183,29 @@ pub fn summarize_conflict_payload(raw: &str) -> String {
 }
 
 /// Output of one deterministic snapshot merge pass.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MergeOutcome {
     pub write: SyncMergeWrite,
     pub peers_read: usize,
     pub applied_changes: usize,
     pub new_conflicts: usize,
     pub compacted_tombstones: usize,
+    pub should_publish: bool,
     pub warnings: Vec<String>,
+}
+
+impl Default for MergeOutcome {
+    fn default() -> Self {
+        Self {
+            write: SyncMergeWrite::default(),
+            peers_read: 0,
+            applied_changes: 0,
+            new_conflicts: 0,
+            compacted_tombstones: 0,
+            should_publish: true,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -567,6 +585,7 @@ fn resolve_family<T: SyncRecord>(
 }
 
 /// Merge `local` with decrypted `peer_envelopes` into a single transactional write plan.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_snapshots(
     local_device_id: &str,
     local: &SyncRows,
@@ -575,6 +594,7 @@ pub fn merge_snapshots(
     peer_envelopes: &[Envelope],
     peer_warnings: &[String],
     now_ms: i64,
+    repair_mode: bool,
 ) -> MergeOutcome {
     let mut outcome = MergeOutcome {
         peers_read: peer_envelopes.len(),
@@ -582,30 +602,153 @@ pub fn merge_snapshots(
         ..Default::default()
     };
 
-    // Index local records and local tombstones by kind.
-    let local_projects: HashMap<String, ProjectRow> = local
-        .projects
+    // Classify peers against the 90-day departure horizon and local compaction watermark (#175).
+    let mut active_peers: Vec<&Envelope> = Vec::new();
+    let mut non_age_quarantined_peers: Vec<&Envelope> = Vec::new();
+    let mut seen_peer_ids = std::collections::HashSet::new();
+    let mut quarantined_peer_count = 0usize;
+
+    for env in peer_envelopes {
+        if env.device_id == local_device_id {
+            continue;
+        }
+        seen_peer_ids.insert(env.device_id.as_str());
+        let age_departed = now_ms.saturating_sub(env.published_at) > DEPARTURE_HORIZON_MS;
+        if !age_departed {
+            non_age_quarantined_peers.push(env);
+        }
+        let behind_compaction = local_config.compacted_through > 0
+            && env.merged_through < local_config.compacted_through;
+
+        if age_departed || behind_compaction {
+            quarantined_peer_count += 1;
+            let short_dev: String = env.device_id.chars().take(8).collect();
+            let reason = if age_departed {
+                "departed (>90 days since last publish)"
+            } else {
+                "stale watermark behind local compaction; run `timetrack sync repair` on that device"
+            };
+            outcome
+                .warnings
+                .push(format!("peer {short_dev} quarantined: {reason}"));
+            outcome.write.upsert_peers.push(SyncPeerRow {
+                device_id: env.device_id.clone(),
+                last_published_at: env.published_at,
+                last_merged_through: env.merged_through,
+                last_seen_at: now_ms,
+                quarantined: true,
+                last_warning: Some(reason.to_string()),
+            });
+        } else {
+            active_peers.push(env);
+        }
+    }
+
+    // Detect if THIS device is returning after >90d silence, backup restore before peer compaction, or explicit repair.
+    let local_age_departed = local_config
+        .last_sync_at
+        .is_some_and(|t| now_ms.saturating_sub(t) > DEPARTURE_HORIZON_MS);
+    let peer_ahead_compaction = non_age_quarantined_peers
         .iter()
-        .cloned()
-        .map(|p| (p.project.id.clone(), p))
-        .collect();
-    let local_entries: HashMap<String, EntryRow> = local
-        .entries
-        .iter()
-        .cloned()
-        .map(|e| (e.entry.id.clone(), e))
-        .collect();
-    let local_sources: HashMap<String, ExternalSourceRow> = local
-        .sources
-        .iter()
-        .cloned()
-        .map(|s| (s.source.id.clone(), s))
-        .collect();
+        .any(|e| e.compacted_through > local_config.merged_through);
+    let local_is_returning =
+        repair_mode || local_config.needs_repair || local_age_departed || peer_ahead_compaction;
+
+    if peer_warnings.is_empty() {
+        for prev in prev_peers {
+            if !seen_peer_ids.contains(prev.device_id.as_str()) {
+                outcome.write.delete_peers.push(prev.device_id.clone());
+            }
+        }
+    }
+
+    if local_is_returning && active_peers.is_empty() && !repair_mode {
+        let msg = "local store is departed or behind peer compaction; waiting for an active peer or run `timetrack sync repair`".to_string();
+        outcome.should_publish = false;
+        outcome.write.needs_repair = Some(true);
+        outcome.write.last_sync_at = Some(now_ms);
+        outcome.warnings.push(msg);
+        outcome.write.last_error = Some(Some(outcome.warnings.join("; ")));
+        return outcome;
+    }
+
+    // Index local records, dropping pre-departure records absent from active peers when returning (#175).
+    // Note: if `repair_mode` runs with zero active peers (all devices slept >90d), keep local records
+    // rather than dropping everything against an empty active set.
+    let drop_against_active = local_is_returning && !active_peers.is_empty();
+    let mut local_projects: HashMap<String, ProjectRow> = HashMap::new();
+    let mut local_entries: HashMap<String, EntryRow> = HashMap::new();
+    let mut local_sources: HashMap<String, ExternalSourceRow> = HashMap::new();
+    let mut dropped_returning_projects: Vec<String> = Vec::new();
+    let mut dropped_returning_entries: Vec<String> = Vec::new();
+    let mut dropped_returning_sources: Vec<String> = Vec::new();
+
+    let mut active_proj_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut active_entry_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut active_source_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut max_active_peer_compacted = 0i64;
+    if drop_against_active {
+        for env in &active_peers {
+            max_active_peer_compacted = max_active_peer_compacted.max(env.compacted_through);
+            for p in &env.projects {
+                active_proj_ids.insert(p.id.as_str());
+            }
+            for e in &env.entries {
+                active_entry_ids.insert(e.id.as_str());
+            }
+            for s in &env.sources {
+                active_source_ids.insert(s.id.as_str());
+            }
+        }
+    }
+    let departure_boundary = local_config
+        .last_sync_at
+        .unwrap_or(0)
+        .max(local_config.merged_through);
+
+    for p in &local.projects {
+        if drop_against_active
+            && !active_proj_ids.contains(p.project.id.as_str())
+            && !(p.device_id == local_device_id && p.updated_at > departure_boundary)
+        {
+            dropped_returning_projects.push(p.project.id.clone());
+        } else {
+            local_projects.insert(p.project.id.clone(), p.clone());
+        }
+    }
+    for e in &local.entries {
+        if drop_against_active
+            && !active_entry_ids.contains(e.entry.id.as_str())
+            && !(e.device_id == local_device_id && e.updated_at > departure_boundary)
+        {
+            dropped_returning_entries.push(e.entry.id.clone());
+        } else {
+            local_entries.insert(e.entry.id.clone(), e.clone());
+        }
+    }
+    for s in &local.sources {
+        if drop_against_active
+            && !active_source_ids.contains(s.source.id.as_str())
+            && !(s.device_id == local_device_id && s.updated_at > departure_boundary)
+        {
+            dropped_returning_sources.push(s.source.id.clone());
+        } else {
+            local_sources.insert(s.source.id.clone(), s.clone());
+        }
+    }
 
     let mut local_proj_tombs: HashMap<String, Tombstone> = HashMap::new();
     let mut local_entry_tombs: HashMap<String, Tombstone> = HashMap::new();
     let mut local_source_tombs: HashMap<String, Tombstone> = HashMap::new();
+    let mut dropped_returning_tombs: Vec<(String, String)> = Vec::new();
     for t in &local.tombstones {
+        if drop_against_active
+            && t.deleted_at < max_active_peer_compacted
+            && t.deleted_at <= departure_boundary
+        {
+            dropped_returning_tombs.push((t.id.clone(), t.kind.clone()));
+            continue;
+        }
         match t.kind.as_str() {
             "project" => {
                 local_proj_tombs.insert(t.id.clone(), t.clone());
@@ -620,7 +763,7 @@ pub fn merge_snapshots(
         }
     }
 
-    // Gather all live and tombstone candidates from local + peer envelopes.
+    // Gather all live and tombstone candidates from retained local + active peer envelopes.
     let mut proj_cands: BTreeMap<String, Vec<LiveCandidate<ProjectRow>>> = BTreeMap::new();
     let mut entry_cands: BTreeMap<String, Vec<LiveCandidate<EntryRow>>> = BTreeMap::new();
     let mut source_cands: BTreeMap<String, Vec<LiveCandidate<ExternalSourceRow>>> = BTreeMap::new();
@@ -628,7 +771,7 @@ pub fn merge_snapshots(
     let mut entry_tombs: BTreeMap<String, Vec<TombCandidate>> = BTreeMap::new();
     let mut source_tombs: BTreeMap<String, Vec<TombCandidate>> = BTreeMap::new();
 
-    for p in &local.projects {
+    for p in local_projects.values() {
         proj_cands
             .entry(p.project.id.clone())
             .or_default()
@@ -639,7 +782,7 @@ pub fn merge_snapshots(
                 from_peer: None,
             });
     }
-    for e in &local.entries {
+    for e in local_entries.values() {
         entry_cands
             .entry(e.entry.id.clone())
             .or_default()
@@ -650,7 +793,7 @@ pub fn merge_snapshots(
                 from_peer: None,
             });
     }
-    for s in &local.sources {
+    for s in local_sources.values() {
         source_cands
             .entry(s.source.id.clone())
             .or_default()
@@ -661,7 +804,11 @@ pub fn merge_snapshots(
                 from_peer: None,
             });
     }
-    for t in &local.tombstones {
+    for t in local_proj_tombs
+        .values()
+        .chain(local_entry_tombs.values())
+        .chain(local_source_tombs.values())
+    {
         let cand = TombCandidate {
             tombstone: t.clone(),
             from_peer_merged_through: None,
@@ -674,7 +821,7 @@ pub fn merge_snapshots(
         }
     }
 
-    for env in peer_envelopes {
+    for env in &active_peers {
         for p in &env.projects {
             proj_cands
                 .entry(p.id.clone())
@@ -894,14 +1041,30 @@ pub fn merge_snapshots(
     }
 
     outcome.write.delete_projects = proj_del;
+    outcome
+        .write
+        .delete_projects
+        .extend(dropped_returning_projects);
     outcome.write.delete_entries = entry_del;
+    outcome
+        .write
+        .delete_entries
+        .extend(dropped_returning_entries);
     outcome.write.delete_sources = source_del;
+    outcome
+        .write
+        .delete_sources
+        .extend(dropped_returning_sources);
     outcome.write.upsert_tombstones.extend(proj_utomb);
     outcome.write.upsert_tombstones.extend(entry_utomb);
     outcome.write.upsert_tombstones.extend(source_utomb);
     outcome.write.delete_tombstones.extend(proj_dtomb);
     outcome.write.delete_tombstones.extend(entry_dtomb);
     outcome.write.delete_tombstones.extend(source_dtomb);
+    outcome
+        .write
+        .delete_tombstones
+        .extend(dropped_returning_tombs);
     outcome.write.new_conflicts.extend(proj_conf);
     outcome.write.new_conflicts.extend(entry_conf);
     outcome.write.new_conflicts.extend(source_conf);
@@ -917,22 +1080,9 @@ pub fn merge_snapshots(
         ))
     });
 
-    outcome.applied_changes = outcome.write.upsert_projects.len()
-        + outcome.write.delete_projects.len()
-        + outcome.write.upsert_entries.len()
-        + outcome.write.delete_entries.len()
-        + outcome.write.upsert_sources.len()
-        + outcome.write.delete_sources.len();
-    outcome.new_conflicts = outcome.write.new_conflicts.len();
-
-    // Update peer tracking and `merged_through` watermark (only when every peer file decoded cleanly).
-    let mut seen_peer_ids = std::collections::HashSet::new();
+    // Update peer tracking and `merged_through` watermark (only over active peers when every file decoded cleanly).
     let mut max_peer_pub = 0i64;
-    for env in peer_envelopes {
-        if env.device_id == local_device_id {
-            continue;
-        }
-        seen_peer_ids.insert(env.device_id.as_str());
+    for env in &active_peers {
         max_peer_pub = max_peer_pub.max(env.published_at);
         outcome.write.upsert_peers.push(SyncPeerRow {
             device_id: env.device_id.clone(),
@@ -943,19 +1093,99 @@ pub fn merge_snapshots(
             last_warning: None,
         });
     }
-    if peer_warnings.is_empty() {
-        for prev in prev_peers {
-            if !seen_peer_ids.contains(prev.device_id.as_str()) {
-                outcome.write.delete_peers.push(prev.device_id.clone());
+    let next_mt = if peer_warnings.is_empty() {
+        local_config.merged_through.max(max_peer_pub)
+    } else {
+        local_config.merged_through
+    };
+    if peer_warnings.is_empty() && next_mt != local_config.merged_through {
+        outcome.write.merged_through = Some(next_mt);
+    }
+
+    // Clear repair flag and adopt peer compaction boundary after a clean returning-device pull.
+    if local_is_returning {
+        let next_ct = local_config
+            .compacted_through
+            .max(max_active_peer_compacted);
+        if next_ct != local_config.compacted_through {
+            outcome.write.compacted_through = Some(next_ct);
+        }
+        outcome.write.needs_repair = Some(false);
+    } else if peer_warnings.is_empty() {
+        // Watermark-gated tombstone compaction (#175): never compact ahead of any in-horizon peer.
+        let compact_cutoff = if !active_peers.is_empty() {
+            Some(
+                active_peers
+                    .iter()
+                    .map(|e| e.merged_through)
+                    .min()
+                    .unwrap_or(0)
+                    .min(next_mt),
+            )
+        } else if quarantined_peer_count > 0 {
+            Some(now_ms)
+        } else {
+            None
+        };
+        if let Some(cutoff) = compact_cutoff {
+            let deleted_keys: std::collections::HashSet<(String, String)> =
+                outcome.write.delete_tombstones.iter().cloned().collect();
+            let mut surviving: BTreeMap<(String, String), Tombstone> = BTreeMap::new();
+            for t in local_proj_tombs
+                .values()
+                .chain(local_entry_tombs.values())
+                .chain(local_source_tombs.values())
+            {
+                let key = (t.id.clone(), t.kind.clone());
+                if !deleted_keys.contains(&key) {
+                    surviving.insert(key, t.clone());
+                }
+            }
+            for t in &outcome.write.upsert_tombstones {
+                surviving.insert((t.id.clone(), t.kind.clone()), t.clone());
+            }
+            let mut compacted_keys: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            for (key, t) in surviving {
+                if t.deleted_at < cutoff {
+                    compacted_keys.insert(key.clone());
+                    let had_local = match key.1.as_str() {
+                        "project" => local_proj_tombs.contains_key(&key.0),
+                        "entry" => local_entry_tombs.contains_key(&key.0),
+                        "source" => local_source_tombs.contains_key(&key.0),
+                        _ => false,
+                    };
+                    if had_local {
+                        outcome.write.delete_tombstones.push(key);
+                    }
+                    outcome.compacted_tombstones += 1;
+                }
+            }
+            if !compacted_keys.is_empty() {
+                outcome
+                    .write
+                    .upsert_tombstones
+                    .retain(|t| !compacted_keys.contains(&(t.id.clone(), t.kind.clone())));
+                let next_ct = local_config.compacted_through.max(cutoff);
+                if next_ct != local_config.compacted_through {
+                    outcome.write.compacted_through = Some(next_ct);
+                }
             }
         }
-        let next_mt = local_config.merged_through.max(max_peer_pub);
-        if next_mt != local_config.merged_through {
-            outcome.write.merged_through = Some(next_mt);
-        }
+    }
+
+    outcome.applied_changes = outcome.write.upsert_projects.len()
+        + outcome.write.delete_projects.len()
+        + outcome.write.upsert_entries.len()
+        + outcome.write.delete_entries.len()
+        + outcome.write.upsert_sources.len()
+        + outcome.write.delete_sources.len();
+    outcome.new_conflicts = outcome.write.new_conflicts.len();
+
+    if outcome.warnings.is_empty() {
         outcome.write.last_error = Some(None);
     } else {
-        outcome.write.last_error = Some(Some(peer_warnings.join("; ")));
+        outcome.write.last_error = Some(Some(outcome.warnings.join("; ")));
     }
     outcome.write.last_sync_at = Some(now_ms);
 

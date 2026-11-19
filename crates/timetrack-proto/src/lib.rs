@@ -942,6 +942,10 @@ impl Client {
             .unit()
     }
 
+    pub async fn sync_repair(&self) -> Result<SyncNowView, ClientError> {
+        self.call(SocketRequest::SyncRepair)?.sync_now()
+    }
+
     /// Poll until the service answers, or give up.
     ///
     /// The first method call is what proves the service, so that is
@@ -1356,6 +1360,7 @@ mod tests {
                 include_restored: false,
             },
             SocketRequest::SyncRestoreConflict { id: "c1".into() },
+            SocketRequest::SyncRepair,
         ] {
             let back: SocketRequest =
                 serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();

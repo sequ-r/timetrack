@@ -201,6 +201,7 @@ fn dispatch(service: &EntryService, request: Request) -> Result<Response, Servic
             service.sync_restore_conflict(&id)?;
             Response::Unit
         }
+        Request::SyncRepair => Response::SyncNow(Box::new(service.sync_repair()?)),
     })
 }
 

@@ -562,6 +562,7 @@ mod tests {
             &[env],
             &[],
             1_000,
+            false,
         );
         // Tombstone deleted on resurrection
         assert!(
@@ -1355,6 +1356,436 @@ END:VCALENDAR
         assert_eq!(suggs_b_after[0].external_uid, "optional-coffee@team");
 
         let _ = (a.svc, b.svc, a.creds, b.creds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_never_runs_ahead_of_slowest_in_horizon_peer() {
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("compact");
+        let sync_dir = dir.join("shared");
+        let t0 = 1_700_000_000_000i64;
+        let a = spawn_test_node(&dir, "node-a", t0);
+        let b = spawn_test_node(&dir, "node-b", t0 + 1_000);
+        let c = spawn_test_node(&dir, "node-c", t0 + 2_000);
+
+        let proj = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .projects[0]
+            .id
+            .clone();
+        let entry = a
+            .client
+            .call(Request::Add {
+                project_id: proj,
+                description: "To compact".into(),
+                started_at: t0 - 60_000,
+                ended_at: t0 - 30_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        let en_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        for node in [&b, &c] {
+            node.client
+                .call(Request::SyncEnable {
+                    folder: sync_dir.to_string_lossy().into_owned(),
+                    pairing_code: en_a.pairing_code.clone(),
+                })
+                .unwrap()
+                .sync_enable()
+                .unwrap();
+        }
+        a.clock.store(t0 + 5_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // A deletes the entry at t0 + 10s and publishes.
+        a.clock.store(t0 + 10_000, Ordering::Relaxed);
+        a.client
+            .call(Request::DeleteEntry {
+                id: entry.id.clone(),
+            })
+            .unwrap()
+            .unit()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // B syncs at t0 + 20s and receives the delete (`B.merged_through = t0 + 10s`).
+        // C lags (staying at t0 + 2s < delete @t0 + 10s, well within 90 days).
+        b.clock.store(t0 + 20_000, Ordering::Relaxed);
+        let b1 = b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(b1.compacted_tombstones, 0);
+
+        // A syncs at t0 + 30s: C is in-horizon and lagging (`C.merged_through < delete`),
+        // so A MUST NOT compact the tombstone.
+        a.clock.store(t0 + 30_000, Ordering::Relaxed);
+        let a2 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(a2.compacted_tombstones, 0);
+        assert_eq!(a2.status.compacted_through, 0);
+
+        // Now C syncs at t0 + 40s (pulls delete and advances C.merged_through = t0 + 20s).
+        c.clock.store(t0 + 40_000, Ordering::Relaxed);
+        c.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(
+            c.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        // Next sync on A (t0 + 50s): every in-horizon peer watermark has passed delete @t0+10s -> compacts!
+        a.clock.store(t0 + 50_000, Ordering::Relaxed);
+        let a3 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(a3.compacted_tombstones, 1);
+        assert!(a3.status.compacted_through > t0 + 10_000);
+
+        let _ = (a.svc, b.svc, c.svc, a.creds, b.creds, c.creds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn departed_peer_over_90_days_is_quarantined_stops_blocking_and_unquarantines() {
+        use super::merge::DEPARTURE_HORIZON_MS;
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("quarantine");
+        let sync_dir = dir.join("shared");
+        let t0 = 1_700_000_000_000i64;
+        let a = spawn_test_node(&dir, "node-a", t0);
+        let b = spawn_test_node(&dir, "node-b", t0 + 1_000);
+
+        let proj = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .projects[0]
+            .id
+            .clone();
+        let entry = a
+            .client
+            .call(Request::Add {
+                project_id: proj,
+                description: "Old deleted item".into(),
+                started_at: t0 - 60_000,
+                ended_at: t0 - 30_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        let en_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        b.client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: en_a.pairing_code,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        a.clock.store(t0 + 5_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // A deletes at day 1; B goes dark after t0 + 1_000 and never pulls the delete.
+        a.clock.store(t0 + 86_400_000, Ordering::Relaxed);
+        a.client
+            .call(Request::DeleteEntry {
+                id: entry.id.clone(),
+            })
+            .unwrap()
+            .unit()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // Within 90 days (e.g. day 10), B blocks compaction.
+        a.clock.store(t0 + 10 * 86_400_000, Ordering::Relaxed);
+        let a_day10 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(a_day10.compacted_tombstones, 0);
+        assert!(!a_day10.status.peers[0].quarantined);
+
+        // Past 90 days (day 91), A quarantines B and stops letting B block compaction!
+        let day91 = t0 + DEPARTURE_HORIZON_MS + 86_400_000;
+        a.clock.store(day91, Ordering::Relaxed);
+        let a_day91 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(a_day91.status.peers.len(), 1);
+        assert!(a_day91.status.peers[0].quarantined);
+        assert_eq!(a_day91.compacted_tombstones, 1);
+        assert!(a_day91.status.compacted_through >= day91);
+
+        // When B finally wakes up on day 91 and runs sync_now (or sync_repair),
+        // B pulls A BEFORE publishing -> compacted delete does NOT resurrect,
+        // and once B republishes fresh, A auto-unquarantines B!
+        b.clock.store(day91 + 1_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(
+            b.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .is_empty(),
+            "departed peer's pre-delete entry must never resurrect"
+        );
+
+        a.clock.store(day91 + 2_000, Ordering::Relaxed);
+        let a_rejoined = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(!a_rejoined.status.peers[0].quarantined);
+        assert!(
+            a.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let _ = (a.svc, b.svc, a.creds, b.creds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restored_backup_and_departed_local_writes_never_resurrect_compacted_deletes() {
+        use super::merge::DEPARTURE_HORIZON_MS;
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("restore-repair");
+        let sync_dir = dir.join("shared");
+        let t0 = 1_700_000_000_000i64;
+        let a = spawn_test_node(&dir, "node-a", t0);
+        let b = spawn_test_node(&dir, "node-b", t0 + 1_000);
+
+        let proj = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .projects[0]
+            .id
+            .clone();
+        let victim = a
+            .client
+            .call(Request::Add {
+                project_id: proj.clone(),
+                description: "Pre-backup deleted later".into(),
+                started_at: t0 - 60_000,
+                ended_at: t0 - 30_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        let en_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        b.client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: en_a.pairing_code.clone(),
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        a.clock.store(t0 + 5_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        b.clock.store(t0 + 6_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // Take a §17-style stopped copy of Node B's SQLite database + WAL while both have `victim`.
+        let bak_dir = dir.join("backup-b");
+        std::fs::create_dir_all(&bak_dir).unwrap();
+        std::fs::copy(dir.join("node-b/store.db"), bak_dir.join("store.db")).unwrap();
+        if dir.join("node-b/store.db-wal").exists() {
+            std::fs::copy(
+                dir.join("node-b/store.db-wal"),
+                bak_dir.join("store.db-wal"),
+            )
+            .unwrap();
+        }
+        // Also snapshot B's stale envelope bytes from that time so we can test quarantine.
+        let b_dev_id = b
+            .client
+            .call(Request::SyncStatus)
+            .unwrap()
+            .sync_status()
+            .unwrap()
+            .device_id;
+        let stale_b_env_bytes = std::fs::read(sync_dir.join(&b_dev_id)).unwrap();
+
+        // Now A deletes `victim` at t0 + 10s and B (before losing disk) syncs the delete, then A compacts.
+        a.clock.store(t0 + 10_000, Ordering::Relaxed);
+        a.client
+            .call(Request::DeleteEntry {
+                id: victim.id.clone(),
+            })
+            .unwrap()
+            .unit()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        b.clock.store(t0 + 15_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        a.clock.store(t0 + 20_000, Ordering::Relaxed);
+        let compacted = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(compacted.compacted_tombstones, 1);
+        assert!(compacted.status.compacted_through > t0 + 10_000);
+
+        // Simulate putting the pre-compaction stale envelope from backup back in the folder:
+        // A MUST quarantine it instead of resurrecting `victim`.
+        std::fs::write(sync_dir.join(&b_dev_id), &stale_b_env_bytes).unwrap();
+        a.clock.store(t0 + 25_000, Ordering::Relaxed);
+        let a_quar = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(a_quar.status.peers.iter().any(|p| p.quarantined));
+        assert!(
+            a.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .is_empty(),
+            "stale envelope behind compacted_through must be quarantined, not resurrect"
+        );
+
+        // Now restore the backup DB into a fresh node directory (`node-b-restored`) >90 days later
+        // (matching an old backup restore), AND write a brand-new local-only entry BEFORE repairing!
+        let restored_dir = dir.join("node-b-restored");
+        std::fs::create_dir_all(&restored_dir).unwrap();
+        std::fs::copy(bak_dir.join("store.db"), restored_dir.join("store.db")).unwrap();
+        if bak_dir.join("store.db-wal").exists() {
+            std::fs::copy(
+                bak_dir.join("store.db-wal"),
+                restored_dir.join("store.db-wal"),
+            )
+            .unwrap();
+        }
+        let day45 = t0 + 45 * 86_400_000;
+        let day95 = t0 + DEPARTURE_HORIZON_MS + 5 * 86_400_000;
+        // Keep A active across the 95-day span so A stays within the 90d horizon and publishes before B repairs.
+        a.clock.store(day45, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        a.clock.store(day95 - 1_000, Ordering::Relaxed);
+        let a_day95 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(!a_day95.status.needs_repair);
+
+        let creds_restored = std::sync::Arc::new(FakeCredentialStore::new());
+        // Restored machine keeps the sync key in its OS store (paired with `en_a.pairing_code`).
+        super::key::store_sync_key(
+            &*creds_restored,
+            &super::key::SyncKey::from_pairing_code(en_a.pairing_code.as_deref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let clock_r = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(day95));
+        let cr = std::sync::Arc::clone(&clock_r);
+        let store_r = SqliteStore::open_at(&restored_dir.join("store.json")).unwrap();
+        let svc_r = std::sync::Arc::new(
+            crate::interface::EntryService::new_with_credentials_and_clock(
+                store_r,
+                creds_restored.clone(),
+                std::sync::Arc::new(move || cr.load(Ordering::Relaxed)),
+            )
+            .unwrap(),
+        );
+        let sock_r = restored_dir.join(format!("s-r-{}.sock", std::process::id()));
+        crate::socket::serve_at(std::sync::Arc::clone(&svc_r), sock_r.clone()).unwrap();
+        let client_r = timetrack_proto::socket::SocketClient::new(sock_r);
+
+        // Confirm restored backup still holds `victim` locally before repair, and add a new local entry.
+        assert_eq!(
+            client_r
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        clock_r.store(day95 + 1_000, Ordering::Relaxed);
+        let kept_local = client_r
+            .call(Request::Add {
+                project_id: proj,
+                description: "Offline post-restore work".into(),
+                started_at: day95 - 10_000,
+                ended_at: day95 - 5_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        // Run one-action `SyncRepair`: drops stale file & compacted `victim`, preserves `kept_local`, reseeds.
+        clock_r.store(day95 + 2_000, Ordering::Relaxed);
+        let repaired = client_r
+            .call(Request::SyncRepair)
+            .unwrap()
+            .sync_now()
+            .unwrap();
+        assert!(!repaired.status.needs_repair);
+
+        let snap_r = client_r
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(
+            !snap_r.entries.iter().any(|e| e.id == victim.id),
+            "compacted delete must NEVER resurrect from restored backup"
+        );
+        assert!(
+            snap_r.entries.iter().any(|e| e.id == kept_local.id),
+            "local-only write made while departed must survive re-pair"
+        );
+
+        // Node A pulls repaired B: A un-quarantines B, receives `kept_local`, and `victim` stays dead!
+        a.clock.store(day95 + 3_000, Ordering::Relaxed);
+        let a_final = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(!a_final.status.peers.iter().any(|p| p.quarantined));
+        let snap_a_final = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snap_a_final.entries.len(), 1);
+        assert_eq!(snap_a_final.entries[0].id, kept_local.id);
+
+        let _ = (a.svc, b.svc, svc_r, a.creds, b.creds, creds_restored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

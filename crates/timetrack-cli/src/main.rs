@@ -482,6 +482,12 @@ enum SyncCommand {
         /// Conflict id or unambiguous id prefix (from `sync conflicts`).
         id: String,
     },
+    /// Drop stale departed/pre-compaction state, pull-merge active peers, and reseed.
+    Repair {
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The client is driven by `async_io` — this workspace has no tokio
@@ -1510,6 +1516,23 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                     "restored conflict {}; run `timetrack sync now` to propagate",
                     disp(&id)
                 ));
+            }
+            SyncCommand::Repair { json } => {
+                let res = client.sync_repair().await?;
+                if json {
+                    emit(&serde_json::to_string(&res)?);
+                } else {
+                    emit(&format!(
+                        "repaired: {} peer(s), {} change(s), {} new conflict(s), {} compacted tombstone(s)",
+                        res.peers_read,
+                        res.applied_changes,
+                        res.new_conflicts,
+                        res.compacted_tombstones
+                    ));
+                    for warn in res.warnings {
+                        emit(&format!("warning: {}", disp(&warn)));
+                    }
+                }
             }
         },
     }
@@ -3059,6 +3082,7 @@ mod tests {
         assert!(Cli::try_parse_from(["timetrack", "sync", "rotate-key"]).is_ok());
         assert!(Cli::try_parse_from(["timetrack", "sync", "conflicts", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["timetrack", "sync", "restore", "c1"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "repair", "--json"]).is_ok());
 
         use std::io::BufReader;
         let mut piped = BufReader::new("  ABCD-EFGH  \r\nignored\n".as_bytes());

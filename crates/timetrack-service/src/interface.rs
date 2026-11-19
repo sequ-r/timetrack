@@ -1322,6 +1322,7 @@ impl EntryService {
                 &read.envelopes,
                 &read.warnings,
                 now,
+                false,
             );
             if let Some(ref seed_id) = dropped_seed
                 && !outcome
@@ -1351,7 +1352,8 @@ impl EntryService {
                 .store
                 .sync_config()
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
-            let env = crate::sync::merge::build_envelope(&device_id, &post_rows, &post_cfg, now);
+            let pub_ts = publish_timestamp(&device_id, &post_rows, now);
+            let env = crate::sync::merge::build_envelope(&device_id, &post_rows, &post_cfg, pub_ts);
             (outcome, env, purged_creds, dropped_seed.is_some())
         };
 
@@ -1381,6 +1383,17 @@ impl EntryService {
     }
 
     pub fn sync_now(&self) -> Result<protocol::SyncNowView, ServiceError> {
+        self.sync_round(false)
+    }
+
+    /// Recover a departed or pre-compaction device (#175, ADR 0020): drop any
+    /// stale device file, pull-merge against active peers preserving local-only
+    /// writes made since departure, and re-publish a fresh envelope.
+    pub fn sync_repair(&self) -> Result<protocol::SyncNowView, ServiceError> {
+        self.sync_round(true)
+    }
+
+    fn sync_round(&self, repair_mode: bool) -> Result<protocol::SyncNowView, ServiceError> {
         let _sync_guard = self.lock_sync();
         let (folder_str, credentials, device_id) = {
             let g = lock(&self.inner);
@@ -1420,6 +1433,19 @@ impl EntryService {
             }
         };
 
+        if repair_mode
+            && let Err(e) = crate::sync::folder::delete_device_file(
+                std::path::Path::new(&folder_str),
+                &device_id,
+            )
+        {
+            let msg = e.to_string();
+            let _ = lock(&self.inner)
+                .store
+                .record_sync_status(None, Some(Some(&msg)), None);
+            return Err(ServiceError::Other(msg));
+        }
+
         let read = match crate::sync::folder::read_peer_envelopes(
             std::path::Path::new(&folder_str),
             &device_id,
@@ -1458,6 +1484,7 @@ impl EntryService {
                 &read.envelopes,
                 &read.warnings,
                 now,
+                repair_mode,
             );
             let purged_creds = g
                 .store
@@ -1468,15 +1495,22 @@ impl EntryService {
                 .load()
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
             g.data = fresh_data;
-            let post_rows = g
-                .store
-                .load_sync_rows()
-                .map_err(|e| ServiceError::Storage(e.to_string()))?;
-            let post_cfg = g
-                .store
-                .sync_config()
-                .map_err(|e| ServiceError::Storage(e.to_string()))?;
-            let env = crate::sync::merge::build_envelope(&device_id, &post_rows, &post_cfg, now);
+            let env = if outcome.should_publish {
+                let post_rows = g
+                    .store
+                    .load_sync_rows()
+                    .map_err(|e| ServiceError::Storage(e.to_string()))?;
+                let post_cfg = g
+                    .store
+                    .sync_config()
+                    .map_err(|e| ServiceError::Storage(e.to_string()))?;
+                let pub_ts = publish_timestamp(&device_id, &post_rows, now);
+                Some(crate::sync::merge::build_envelope(
+                    &device_id, &post_rows, &post_cfg, pub_ts,
+                ))
+            } else {
+                None
+            };
             (outcome, env, purged_creds)
         };
 
@@ -1484,11 +1518,10 @@ impl EntryService {
             let _ = credentials.delete(&cred_ref);
         }
 
-        if let Err(err) = crate::sync::folder::publish_envelope(
-            std::path::Path::new(&folder_str),
-            &envelope,
-            &key,
-        ) {
+        if let Some(ref env) = envelope
+            && let Err(err) =
+                crate::sync::folder::publish_envelope(std::path::Path::new(&folder_str), env, &key)
+        {
             let msg = err.to_string();
             let _ = lock(&self.inner)
                 .store
@@ -1729,6 +1762,18 @@ impl EntryService {
         drop(g);
         self.notify_changed();
         Ok(())
+    }
+}
+
+fn publish_timestamp(device_id: &str, rows: &timetrack_store::SyncRows, now: i64) -> i64 {
+    if rows
+        .tombstones
+        .iter()
+        .any(|t| t.device_id == device_id && t.deleted_at == now)
+    {
+        now.saturating_add(1)
+    } else {
+        now
     }
 }
 
