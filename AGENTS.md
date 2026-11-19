@@ -11,3 +11,13 @@ Five canonical roles, label strings equal to their names (`needs-triage`, `needs
 ### Domain docs
 
 Single-context: `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+## Commands
+
+- `cargo build --release` — build the project
+- `cargo test --workspace` — run the full test suite
+
+## Code Map
+
+- `crates/` — crates
+- `docs/` — project documentation
