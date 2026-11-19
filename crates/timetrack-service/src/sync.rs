@@ -458,8 +458,9 @@ mod tests {
     fn spawn_test_node(dir: &std::path::Path, name: &str, start_ms: i64) -> TestNode {
         use std::sync::{
             Arc,
-            atomic::{AtomicI64, Ordering},
+            atomic::{AtomicI64, AtomicU64, Ordering},
         };
+        static SOCK_SEQ: AtomicU64 = AtomicU64::new(1);
         let node_dir = dir.join(name);
         std::fs::create_dir_all(&node_dir).unwrap();
         let store = SqliteStore::open_at(&node_dir.join("store.json")).unwrap();
@@ -474,7 +475,13 @@ mod tests {
             )
             .unwrap(),
         );
-        let sock = node_dir.join("s.sock");
+        // Distinct socket filename per node so Windows named pipes (`pipe_name_of`
+        // uses only `file_name()`) never collide across nodes or parallel tests.
+        let sock = node_dir.join(format!(
+            "s-{}-{}.sock",
+            std::process::id(),
+            SOCK_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         crate::socket::serve_at(Arc::clone(&svc), sock.clone()).unwrap();
         let client = timetrack_proto::socket::SocketClient::new(sock);
         TestNode {
