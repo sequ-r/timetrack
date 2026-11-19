@@ -44,7 +44,7 @@ use timetrack_core::{
 /// The schema version this build writes, kept in `PRAGMA user_version`.
 /// Bump with a numbered migration in [`migrate`]; a newer database is
 /// refused, never silently reset (§17, the §2 rule).
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Whether `id` is already a UUID in hyphenated shape (ADR 0018):
 /// 8-4-4-4-12 hex with hyphens in place. Either hex case counts — a
@@ -151,7 +151,7 @@ fn system_now_ms() -> i64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tombstone {
     pub id: String,
-    /// `"entry"` or `"project"`.
+    /// `"entry"`, `"project"`, or `"source"`.
     pub kind: String,
     pub deleted_at: i64,
     pub device_id: String,
@@ -193,20 +193,27 @@ impl SqliteStore {
     /// persistence boundary; mutation stamps stay caller-supplied
     /// (`apply`/`save_all` take `now_ms`) so service tests stay exact.
     pub fn open_at(json_path: &Path) -> StoreResult<Self> {
+        Self::open_at_with(json_path, &mut || Ok(uuid::Uuid::new_v4().to_string()))
+    }
+
+    fn open_at_with(
+        json_path: &Path,
+        mint: &mut dyn FnMut() -> StoreResult<String>,
+    ) -> StoreResult<Self> {
         let db_path = Self::db_path_for(json_path);
         let existed = db_path.exists();
-        let store = Self::open_file(&db_path)?;
         if !existed && json_path.exists() {
             let mut legacy = JsonStore::new(json_path.to_path_buf()).load()?;
-            // The JSON ids are sequential, but this database is v3: remint
-            // before the first write so the import converges to the same
-            // UUID-only state the v2→v3 migration produces (ADR 0018).
-            // The JSON files themselves are still left untouched.
-            remint_store_ids(&mut legacy, &mut || Ok(uuid::Uuid::new_v4().to_string()))?;
+            // The JSON ids are sequential, but this database is v3+: remint
+            // before opening/writing SQLite so a generator failure aborts cleanly
+            // with neither a partial database nor modified JSON files (ADR 0018, #172).
+            remint_store_ids(&mut legacy, mint)?;
+            let store = Self::open_file(&db_path)?;
             store.save_all(&legacy, system_now_ms())?;
             store.set_meta("migrated_from", "store.json")?;
+            return Ok(store);
         }
-        Ok(store)
+        Self::open_file(&db_path)
     }
 
     /// Open (creating if needed) a database at an explicit path, with no
@@ -424,7 +431,7 @@ impl SqliteStore {
         now_ms: i64,
     ) -> StoreResult<ExternalSource> {
         let conn = self.lock();
-        let id = mint_id(&conn, "src-").map_err(|e| sqlite(&self.path, e))?;
+        let id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO external_sources(id, kind, locator, project_id, label, created_at, updated_at, device_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
@@ -584,14 +591,16 @@ impl SqliteStore {
         Ok(Some(updated))
     }
 
-    /// Delete a source (#149, refined by #153): its still-pending
-    /// suggestions go with it, in the same transaction. Decided rows
-    /// (confirmed/dismissed) stay as history, and confirmed entries
-    /// stay — they are real tracked time now, not suggestions. The
+    /// Delete a source (#149, refined by #153, tombstoned in #172): its
+    /// still-pending suggestions go with it, in the same transaction.
+    /// Decided rows (confirmed/dismissed) stay as history, and confirmed
+    /// entries stay — they are real tracked time now, not suggestions. The
     /// CalDAV sync state (#151) goes with the source, so a
     /// re-registered collection starts from a full fetch, not a stale
-    /// token. Returns false when the source was already unknown.
-    pub fn remove_source(&self, id: &str) -> StoreResult<bool> {
+    /// token. When deleted, writes a `kind="source"` tombstone joining
+    /// the same `(deleted_at, device_id)` ordering as entry/project
+    /// tombstones. Returns false when the source was already unknown.
+    pub fn remove_source(&self, id: &str, now_ms: i64) -> StoreResult<bool> {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(|e| sqlite(&self.path, e))?;
         tx.execute(
@@ -609,6 +618,10 @@ impl SqliteStore {
         let removed = tx
             .execute("DELETE FROM external_sources WHERE id = ?1", params![id])
             .map_err(|e| sqlite(&self.path, e))?;
+        if removed == 1 {
+            tombstone(&tx, id, "source", now_ms, &self.device_id)
+                .map_err(|e| sqlite(&self.path, e))?;
+        }
         tx.commit().map_err(|e| sqlite(&self.path, e))?;
         Ok(removed == 1)
     }
@@ -1294,6 +1307,16 @@ fn migrate_with(
         let tx = conn.transaction().map_err(|e| sqlite(path, e))?;
         tx.execute_batch(SCHEMA_V5).map_err(|e| sqlite(path, e))?;
         tx.commit().map_err(|e| sqlite(path, e))?;
+        version = 5;
+    }
+    if version < 6 {
+        // #172 (ADR 0020): remint `src-{rand}` source ids to UUIDv4,
+        // preserving `cred_ref` as a per-device OS keyring pointer.
+        let tx = conn.transaction().map_err(|e| sqlite(path, e))?;
+        remint_v5_source_ids(&tx, path, mint)?;
+        tx.execute_batch("PRAGMA user_version = 6;")
+            .map_err(|e| sqlite(path, e))?;
+        tx.commit().map_err(|e| sqlite(path, e))?;
     }
     Ok(())
 }
@@ -1402,6 +1425,86 @@ fn remint_v2_ids(
         conn.execute(
             "UPDATE tombstones SET id = ?1 WHERE id = ?2 AND kind = ?3",
             params![new, old, kind],
+        )
+        .map_err(|e| sqlite(path, e))?;
+    }
+    Ok(())
+}
+
+/// Remint every non-UUID external-source id a v5 database holds (#172).
+///
+/// External sources and any orphaned `suggestions` / `caldav_*` source
+/// references gain fresh UUIDs from `mint`, and `suggestions.source_id`,
+/// `caldav_sync.source_id`, `caldav_resources.source_id`, plus any
+/// `kind='source'` tombstones follow. `cred_ref` is deliberately left
+/// untouched because it is a per-device OS credential store pointer.
+fn remint_v5_source_ids(
+    conn: &Connection,
+    path: &Path,
+    mint: &mut dyn FnMut() -> StoreResult<String>,
+) -> StoreResult<()> {
+    use std::collections::HashMap;
+    let mut sources: HashMap<String, String> = HashMap::new();
+    for query in [
+        "SELECT id FROM external_sources ORDER BY seq",
+        "SELECT DISTINCT source_id FROM suggestions ORDER BY source_id",
+        "SELECT DISTINCT source_id FROM caldav_sync ORDER BY source_id",
+        "SELECT DISTINCT source_id FROM caldav_resources ORDER BY source_id",
+    ] {
+        let mut stmt = conn.prepare(query).map_err(|e| sqlite(path, e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| sqlite(path, e))?;
+        for row in rows {
+            let old = row.map_err(|e| sqlite(path, e))?;
+            if !is_uuid(&old) && !sources.contains_key(&old) {
+                sources.insert(old, mint()?);
+            }
+        }
+    }
+    for (old, new) in &sources {
+        conn.execute(
+            "UPDATE external_sources SET id = ?1 WHERE id = ?2",
+            params![new, old],
+        )
+        .map_err(|e| sqlite(path, e))?;
+        conn.execute(
+            "UPDATE suggestions SET source_id = ?1 WHERE source_id = ?2",
+            params![new, old],
+        )
+        .map_err(|e| sqlite(path, e))?;
+        conn.execute(
+            "UPDATE caldav_sync SET source_id = ?1 WHERE source_id = ?2",
+            params![new, old],
+        )
+        .map_err(|e| sqlite(path, e))?;
+        conn.execute(
+            "UPDATE caldav_resources SET source_id = ?1 WHERE source_id = ?2",
+            params![new, old],
+        )
+        .map_err(|e| sqlite(path, e))?;
+    }
+    let stones: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM tombstones WHERE kind = 'source' ORDER BY deleted_at, id")
+            .map_err(|e| sqlite(path, e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| sqlite(path, e))?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(|e| sqlite(path, e))?
+    };
+    for old in &stones {
+        if is_uuid(old) {
+            continue;
+        }
+        let new = match sources.get(old) {
+            Some(id) => id.clone(),
+            None => mint()?,
+        };
+        conn.execute(
+            "UPDATE tombstones SET id = ?1 WHERE id = ?2 AND kind = 'source'",
+            params![new, old],
         )
         .map_err(|e| sqlite(path, e))?;
     }
@@ -1796,15 +1899,23 @@ mod tests {
         assert_eq!(quick.project_id, home.id);
         assert_eq!(quick.source, EntrySource::QuickAdd);
         assert_eq!(store.total_ms(), 60_000 + 30_000);
-        // The source mapping and the confirmed suggestion's link followed.
+        // The source mapping and the confirmed suggestion's link followed;
+        // source ids reminted to UUIDs by v5→v6 (#172).
         let sources = db.sources().unwrap();
         assert_eq!(sources.len(), 1);
+        assert!(
+            is_uuid(&sources[0].id),
+            "source id reminted: {}",
+            sources[0].id
+        );
         assert_eq!(sources[0].project_id.as_deref(), Some(work.id.as_str()));
         let suggestions = db.suggestions(false).unwrap();
         assert_eq!(suggestions.len(), 2);
         let confirmed = suggestions.iter().find(|s| s.id == "sg-1").unwrap();
+        assert_eq!(confirmed.source_id, sources[0].id);
         assert_eq!(confirmed.entry_id.as_deref(), Some(review.id.as_str()));
         let pending = suggestions.iter().find(|s| s.id == "sg-2").unwrap();
+        assert_eq!(pending.source_id, sources[0].id);
         assert_eq!(pending.entry_id, None);
         // Tombstones for deleted records gained fresh ids; kinds and
         // timestamps preserved.
@@ -1985,8 +2096,11 @@ mod tests {
         assert_eq!(pending.len(), 2);
         db.decide_suggestion(&pending[0].id, "dismissed", None, 2_000)
             .unwrap();
-        assert!(db.remove_source(&src.id).unwrap());
-        assert!(!db.remove_source(&src.id).unwrap(), "twice is a no-op");
+        assert!(db.remove_source(&src.id, 3_000).unwrap());
+        assert!(
+            !db.remove_source(&src.id, 4_000).unwrap(),
+            "twice is a no-op"
+        );
         assert!(db.source(&src.id).unwrap().is_none());
         assert!(db.suggestions(true).unwrap().is_empty());
         let decided = db.suggestions(false).unwrap();
@@ -2132,11 +2246,15 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
         // Old rows survive, with no attribution — the state reconcile
         // treats as "cannot attribute, never withdraw".
+        let sources = db.sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(is_uuid(&sources[0].id));
         let pending = db.suggestions(true).unwrap();
         assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].source_id, sources[0].id);
         assert_eq!(pending[0].title, "Review");
         let href: Option<String> = db
             .lock()
@@ -2147,9 +2265,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(href, None);
-        // And the new tables answer.
-        assert_eq!(db.caldav_sync_state("src-1").unwrap(), None);
-        assert!(db.caldav_resources("src-1").unwrap().is_empty());
+        // And the new tables answer under the reminted source UUID.
+        assert_eq!(db.caldav_sync_state(&sources[0].id).unwrap(), None);
+        assert!(db.caldav_resources(&sources[0].id).unwrap().is_empty());
     }
 
     #[test]
@@ -2205,7 +2323,7 @@ mod tests {
             ]
         );
         // Removing the source takes the sync state with it.
-        assert!(db.remove_source(&src.id).unwrap());
+        assert!(db.remove_source(&src.id, 400).unwrap());
         assert_eq!(db.caldav_sync_state(&src.id).unwrap(), None);
         assert!(db.caldav_resources(&src.id).unwrap().is_empty());
     }
@@ -2425,5 +2543,224 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("boom"));
         assert_eq!(store, before);
+    }
+
+    fn v5_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        conn.execute_batch(SCHEMA_V5).unwrap();
+        let proj = "11111111-1111-4111-8111-111111111111";
+        let ent = "22222222-2222-4222-8222-222222222222";
+        let already_uuid_src = "33333333-3333-4333-8333-333333333333";
+        conn.execute(
+            "INSERT INTO projects(id, name, colour, archived, created_at, updated_at, device_id)
+             VALUES (?1, 'Work', 255, 0, 1, 2, 'dev')",
+            params![proj],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries(id, project_id, description, started_at, ended_at, source, note,
+                 created_at, updated_at, device_id)
+             VALUES (?1, ?2, 'review', 1000, 61000, 2, NULL, 1, 2, 'dev')",
+            params![ent, proj],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO external_sources(id, kind, locator, project_id, label,
+                 cred_ref, cred_username, created_at, updated_at, device_id)
+             VALUES ('src-legacy-1', 'caldav', 'https://cal.test/1/', ?1, 'One',
+                 'caldav/src-legacy-1', 'alice', 1, 2, 'dev'),
+                    (?2, 'ics_file', '/tmp/a.ics', ?1, 'Two',
+                 NULL, NULL, 1, 2, 'dev')",
+            params![proj, already_uuid_src],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO suggestions(id, source_id, external_uid, kind, title, started_at,
+                 ended_at, status, entry_id, fetched_at, decided_at, resource_href)
+             VALUES ('sg-1', 'src-legacy-1', 'ev1', 'event', 'Review', 1000, 61000,
+                 'confirmed', ?1, 1000, 2000, '/1/a.ics'),
+                    ('sg-2', 'src-deleted-old', 'ev2', 'event', 'Orphan', 2000, 62000,
+                 'dismissed', NULL, 1000, 2000, NULL),
+                    ('sg-3', ?2, 'ev3', 'event', 'Kept', 3000, 63000,
+                 'pending', NULL, 1000, NULL, NULL)",
+            params![ent, already_uuid_src],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO caldav_sync(source_id, sync_token, ctag, updated_at)
+             VALUES ('src-legacy-1', 'tok-1', 'ctag-1', 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO caldav_resources(source_id, href, etag, content_hash, seen_at)
+             VALUES ('src-legacy-1', '/1/a.ics', '\"v1\"', 'h1', 10)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_v5_to_v6_remints_source_ids_and_keeps_cred_ref() {
+        let path = dir("v5-v6").join("store.db");
+        v5_database(&path);
+        let db = SqliteStore::open_file(&path).unwrap();
+
+        let store = db.load().unwrap();
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.total_ms(), 60_000);
+
+        let sources = db.sources().unwrap();
+        assert_eq!(sources.len(), 2);
+        for s in &sources {
+            assert!(is_uuid(&s.id), "source id must be UUID: {}", s.id);
+            assert!(
+                !s.id.starts_with("src-"),
+                "no src-* id may remain: {}",
+                s.id
+            );
+        }
+        let one = sources.iter().find(|s| s.label == "One").unwrap();
+        let two = sources.iter().find(|s| s.label == "Two").unwrap();
+        assert_eq!(
+            two.id, "33333333-3333-4333-8333-333333333333",
+            "already-UUID source id is untouched"
+        );
+        // Per-device OS keyring pointer must stay intact across remint.
+        assert_eq!(one.cred_ref.as_deref(), Some("caldav/src-legacy-1"));
+        assert_eq!(one.cred_username.as_deref(), Some("alice"));
+
+        let suggestions = db.suggestions(false).unwrap();
+        for sg in &suggestions {
+            assert!(
+                is_uuid(&sg.source_id),
+                "suggestion {} source_id must be UUID: {}",
+                sg.id,
+                sg.source_id
+            );
+            assert!(!sg.source_id.starts_with("src-"));
+        }
+        let sg1 = suggestions.iter().find(|s| s.id == "sg-1").unwrap();
+        let sg2 = suggestions.iter().find(|s| s.id == "sg-2").unwrap();
+        let sg3 = suggestions.iter().find(|s| s.id == "sg-3").unwrap();
+        assert_eq!(sg1.source_id, one.id);
+        assert_ne!(sg2.source_id, one.id);
+        assert_eq!(sg3.source_id, two.id);
+
+        assert_eq!(
+            db.caldav_sync_state(&one.id)
+                .unwrap()
+                .unwrap()
+                .sync_token
+                .as_deref(),
+            Some("tok-1")
+        );
+        assert_eq!(db.caldav_resources(&one.id).unwrap().len(), 1);
+        assert_eq!(db.caldav_sync_state("src-legacy-1").unwrap(), None);
+        assert!(db.caldav_resources("src-legacy-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_v5_to_v6_source_remint_rolls_back_to_an_untouched_v5() {
+        let path = dir("v5-v6-rollback").join("store.db");
+        v5_database(&path);
+        let before = dump_all(&path);
+
+        // Fail on the 2nd mint (after the 1st source id was already mapped,
+        // before/during orphan suggestion remint): transaction must roll back.
+        let mut calls = 0;
+        let mut failing = || -> StoreResult<String> {
+            calls += 1;
+            if calls > 1 {
+                return Err(StoreError::Invalid {
+                    path: "test".into(),
+                    reason: "boom".into(),
+                });
+            }
+            Ok(format!("00000000-0000-4000-8000-{calls:012}"))
+        };
+        let mut conn = Connection::open(&path).unwrap();
+        let err = migrate_with(&mut conn, &path, &mut failing).unwrap_err();
+        assert!(err.to_string().contains("boom"));
+        drop(conn);
+
+        let v: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 5, "a failed migration keeps version 5");
+        assert_eq!(
+            dump_all(&path),
+            before,
+            "rollback leaves every row identical"
+        );
+
+        // Subsequent open recovers cleanly.
+        let db = SqliteStore::open_file(&path).unwrap();
+        assert!(db.sources().unwrap().iter().all(|s| is_uuid(&s.id)));
+    }
+
+    #[test]
+    fn a_failed_legacy_json_remint_during_open_at_leaves_no_db_and_touches_no_json() {
+        let d = dir("legacy-rollback");
+        let json_path = d.join("store.json");
+        let json = JsonStore::new(json_path.clone());
+        json.save(&sample()).unwrap();
+        let before = std::fs::read(&json_path).unwrap();
+
+        let mut calls = 0;
+        let err = SqliteStore::open_at_with(&json_path, &mut || {
+            calls += 1;
+            if calls > 1 {
+                return Err(StoreError::Invalid {
+                    path: "test".into(),
+                    reason: "boom".into(),
+                });
+            }
+            Ok("00000000-0000-4000-8000-000000000001".into())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+        assert!(
+            !SqliteStore::db_path_for(&json_path).exists(),
+            "failed import creates no database file"
+        );
+        assert_eq!(
+            std::fs::read(&json_path).unwrap(),
+            before,
+            "legacy JSON untouched"
+        );
+    }
+
+    #[test]
+    fn remove_source_writes_source_tombstone_and_readd_mints_fresh_uuid() {
+        let db = SqliteStore::open_file(&dir("src-tombstone").join("store.db")).unwrap();
+        let src = db
+            .add_source("ics_file", "/tmp/cal.ics", None, "Cal", 100)
+            .unwrap();
+        assert!(
+            is_uuid(&src.id),
+            "newly added source id is UUIDv4: {}",
+            src.id
+        );
+        assert!(db.remove_source(&src.id, 5_000).unwrap());
+
+        let stones = db.tombstones().unwrap();
+        assert_eq!(stones.len(), 1);
+        assert_eq!(stones[0].id, src.id);
+        assert_eq!(stones[0].kind, "source");
+        assert_eq!(stones[0].deleted_at, 5_000);
+        assert_eq!(stones[0].device_id, db.device_id());
+
+        // Re-adding the same locator creates a distinct fresh UUID, never
+        // colliding with the removed source's tombstone.
+        let readded = db
+            .add_source("ics_file", "/tmp/cal.ics", None, "Cal", 6_000)
+            .unwrap();
+        assert!(is_uuid(&readded.id));
+        assert_ne!(readded.id, src.id);
     }
 }
