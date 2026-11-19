@@ -9,6 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aead"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
+dependencies = [
+ "crypto-common 0.2.2",
+ "inout 0.2.6",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1002,8 +1012,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
+ "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher 0.5.2",
+ "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -1046,6 +1071,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
+ "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout 0.2.6",
 ]
@@ -4636,6 +4662,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5da3b0203fd7ee5720aa0b5e790b591aa5d3f41c3ed2c34a3a393382198af2f7"
 
 [[package]]
+name = "poly1305"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
+dependencies = [
+ "cpufeatures 0.3.1",
+ "universal-hash",
+]
+
+[[package]]
 name = "postage"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6474,13 +6510,19 @@ name = "timetrack-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chacha20poly1305",
+ "getrandom 0.4.3",
  "keyring",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "timetrack-core",
  "timetrack-proto",
  "timetrack-store",
  "ureq",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -6944,6 +6986,16 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+
+[[package]]
+name = "universal-hash"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils",
+]
 
 [[package]]
 name = "untrusted"
