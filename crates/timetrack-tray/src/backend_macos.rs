@@ -12,18 +12,20 @@
 //!
 //! The same `tray-icon` family as the Windows backend (#155): `tray-icon`
 //! covers macOS cleanly (status item plus title via `objc2`, menu via
-//! `muda`), so there is no bespoke AppKit layer. The menu-id wire format,
-//! the menu structure, and the generated icon bytes are shared with
-//! `backend_windows` — one stack, one set of rows — while this module adds
-//! only what macOS owns: the title text, the `flock` single-instance claim
-//! (identical for raw binaries and future bundles, since the lock path
-//! never depends on the executable's location), and the runner.
+//! `muda`), while this module drives the `NSApplication` event loop
+//! directly via `objc2` / `objc2-app-kit` / `objc2-foundation`. The
+//! menu-id wire format, the menu structure, and the generated icon bytes
+//! are shared with `backend_windows` — one stack, one set of rows — while
+//! this module adds only what macOS owns: the title text, the `flock`
+//! single-instance claim (identical for raw binaries and future bundles,
+//! since the lock path never depends on the executable's location), and
+//! the runner.
 //!
 //! Like the Windows backend, the pure mapping compiles on every target so
 //! the headless unit tests below pin it without a desktop. Only the runner
-//! — the status item, the menu event loop, the poll worker, and the lock
-//! claim — is `cfg(macos)`, with its `tray-icon`/`libc` dependencies gated
-//! the same way in the manifest.
+//! — the status item, the AppKit event loop, the poll worker, and the lock
+//! claim — is `cfg(target_os = "macos")`, with its `tray-icon`/`objc2`/
+//! `libc` dependencies gated the same way in the manifest.
 //!
 //! [`dispatch`]: crate::actions::dispatch
 
@@ -48,6 +50,11 @@ use std::sync::{Arc, Mutex};
 /// `Changed` announcement the moment a mutation persists; this only covers
 /// a missed signal and noticing that the service has gone away.
 pub const POLL_SECS: u64 = 60;
+
+/// Maximum wait before the UI event loop re-checks sticky action errors
+/// even when neither AppKit input nor a worker publish arrived, in
+/// milliseconds.
+pub const UI_TICK_MS: u32 = crate::backend_windows::UI_TICK_MS;
 
 /// The menu-bar title: this ISO week's total in the core's compact form
 /// (`1h 30m`), the same spelling as the menu rows beside it.
@@ -79,10 +86,10 @@ pub fn single_instance_lock_path() -> std::path::PathBuf {
     std::env::temp_dir().join(single_instance_lock_file_name())
 }
 
-/// Whether the Open row's target exists. No macOS GUI build exists yet
-/// (#156), so the sibling binary is usually absent: the runner logs that
-/// once at startup, and the click itself stays graceful through the
-/// neutral dispatch's spawn-failure log.
+/// Whether the Open row's target exists. A standalone tray install may
+/// not ship the sibling GUI binary, so the runner logs its presence once
+/// at startup and clicks degrade gracefully through neutral dispatch's
+/// spawn-failure log.
 pub fn gui_program_present(program: &str) -> bool {
     !program.is_empty() && std::path::Path::new(program).is_file()
 }
@@ -136,32 +143,188 @@ struct Published {
     unwell: Option<Unwell>,
 }
 
-/// The UI thread's inbox: worker publishes, or a clicked menu id.
+/// Sentinel subtype identifying synthetic wake events posted to AppKit.
 #[cfg(target_os = "macos")]
-enum MacEvent {
-    Update(Published),
-    Menu(String),
+const WAKE_EVENT_SUBTYPE: std::ffi::c_short = 0x5454;
+
+/// Sentinel data1 payload distinguishing our wake events from unrelated
+/// `ApplicationDefined` events.
+#[cfg(target_os = "macos")]
+const WAKE_EVENT_DATA1: objc2_foundation::NSInteger = 0x5454_5741;
+
+/// Build a synthetic `NSEvent` of type `ApplicationDefined` carrying our wake
+/// sentinel so `nextEventMatchingMask_untilDate_inMode_dequeue` unblocks.
+#[cfg(target_os = "macos")]
+fn build_wake_event() -> Option<objc2::rc::Retained<objc2_app_kit::NSEvent>> {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_foundation::NSPoint;
+    NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+        NSEventType::ApplicationDefined,
+        NSPoint::ZERO,
+        NSEventModifierFlags::empty(),
+        0.0,
+        0,
+        None,
+        WAKE_EVENT_SUBTYPE,
+        WAKE_EVENT_DATA1,
+        0,
+    )
 }
 
-/// Run the macOS tray: claim single instance, show the status item, and
-/// pump menu clicks plus worker publishes until Quit. Blocks the calling
-/// thread, which must be the main thread — `tray-icon` builds the
-/// `NSStatusItem` there and refuses (`NotMainThread`) anywhere else, so
-/// `main` calls this directly, never under `block_on` or on a worker. The
-/// service polling lives on a worker thread, like the Linux poll loop,
-/// and clicks dispatch the neutral [`TrayAction`]s.
+/// Return whether `event` is our synthetic wake sentinel.
+#[cfg(target_os = "macos")]
+fn is_wake_event(event: &objc2_app_kit::NSEvent) -> bool {
+    // IMPORTANT: short-circuit on `r#type() == ApplicationDefined` first;
+    // AppKit throws NSInternalInconsistencyException if `subtype` or `data1`
+    // is read on non-custom event types.
+    event.r#type() == objc2_app_kit::NSEventType::ApplicationDefined
+        && event.subtype().0 == WAKE_EVENT_SUBTYPE
+        && event.data1() == WAKE_EVENT_DATA1
+}
+
+/// Thread-safe handle for waking the AppKit event loop from the poll worker.
+#[cfg(target_os = "macos")]
+struct MacWake {
+    app: std::ptr::NonNull<objc2_app_kit::NSApplication>,
+}
+
+// SAFETY: `NSApplication::sharedApplication` is a process-lifetime singleton
+// created before `MacWake`, and Apple documents `-[NSApplication postEvent:atStart:]`
+// as thread-safe from background threads.
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacWake {}
+// SAFETY: See `Send` impl above.
+#[cfg(target_os = "macos")]
+unsafe impl Sync for MacWake {}
+
+#[cfg(target_os = "macos")]
+impl MacWake {
+    fn new(app: &objc2_app_kit::NSApplication) -> Self {
+        Self {
+            app: std::ptr::NonNull::from(app),
+        }
+    }
+
+    fn signal(&self) {
+        objc2::rc::autoreleasepool(|_| {
+            if let Some(event) = build_wake_event() {
+                // SAFETY: `self.app` points to the process-wide `NSApplication`
+                // singleton and `postEvent_atStart` is safe from any thread.
+                let app = unsafe { self.app.as_ref() };
+                app.postEvent_atStart(&event, false);
+            }
+        });
+    }
+}
+
+/// Worker-to-UI channel plus its AppKit wake handle so published updates
+/// interrupt `nextEventMatchingMask_untilDate_inMode_dequeue` immediately.
+#[cfg(target_os = "macos")]
+struct MacNotifier {
+    tx: Option<std::sync::mpsc::Sender<Published>>,
+    wake: Arc<MacWake>,
+}
+
+#[cfg(target_os = "macos")]
+impl MacNotifier {
+    fn new(tx: std::sync::mpsc::Sender<Published>, wake: Arc<MacWake>) -> Self {
+        Self { tx: Some(tx), wake }
+    }
+
+    fn send(&self, published: Published) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        if tx.send(published).is_err() {
+            return false;
+        }
+        self.wake.signal();
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacNotifier {
+    fn drop(&mut self) {
+        // Drop the sender before waking so the main thread observes
+        // `Disconnected` immediately when unblocked.
+        self.tx.take();
+        self.wake.signal();
+    }
+}
+
+/// Drain every pending menu click produced by `muda` on the main thread.
+#[cfg(target_os = "macos")]
+fn drain_menu_events(ctx: &crate::actions::DispatchContext) {
+    use crate::actions::dispatch;
+    use tray_icon::menu::MenuEvent;
+    while let Ok(event) = MenuEvent::receiver().try_recv() {
+        let id = event.id.as_ref();
+        if let Some(action) = decode_action(id) {
+            dispatch(action, ctx);
+        } else if let Some(entry_id) = parse_keep_id(id) {
+            println!("timetrack-tray: delete of {entry_id} cancelled");
+        } else {
+            eprintln!("timetrack-tray: ignoring unknown menu id");
+        }
+    }
+}
+
+/// Apply the latest worker snapshot if one arrived, and report whether the
+/// worker channel disconnected.
+#[cfg(target_os = "macos")]
+fn drain_updates(
+    rx: &std::sync::mpsc::Receiver<Published>,
+    tray: &tray_icon::TrayIcon,
+    last_quick_add: &Arc<Mutex<HashMap<String, String>>>,
+    last: &mut Published,
+) -> bool {
+    let mut latest = None;
+    let mut disconnected = false;
+    loop {
+        match rx.try_recv() {
+            Ok(published) => latest = Some(published),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    if let Some(published) = latest {
+        match build_native_menu(&build_window_menu(
+            &published.menu,
+            &crate::lock(last_quick_add),
+        )) {
+            Ok(menu) => tray.set_menu(Some(Box::new(menu))),
+            Err(e) => eprintln!("timetrack-tray: could not rebuild the menu: {e}"),
+        }
+        *last = published;
+    }
+    disconnected
+}
+
+/// Run the macOS tray: claim single instance, initialize AppKit, show the
+/// status item, and pump AppKit events, menu clicks, and worker publishes
+/// until Quit. Blocks the calling thread, which must be the main thread —
+/// `tray-icon` builds the `NSStatusItem` there and refuses (`NotMainThread`)
+/// anywhere else, so `main` calls this directly, never under `block_on` or
+/// on a worker. The service polling lives on a worker thread, like the Linux
+/// poll loop, and clicks dispatch the neutral [`TrayAction`]s.
 ///
 /// [`TrayAction`]: crate::actions::TrayAction
 #[cfg(target_os = "macos")]
 pub fn run() -> anyhow::Result<()> {
-    use crate::actions::{DispatchContext, dispatch};
+    use crate::actions::DispatchContext;
     use crate::ipc::set_shared_client;
+    use objc2::MainThreadMarker;
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventMask};
+    use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Duration;
-    use tray_icon::menu::MenuEvent;
     use tray_icon::{Icon, TrayIconBuilder};
 
     let Some(_instance) = SingleInstance::try_claim()? else {
@@ -169,9 +332,9 @@ pub fn run() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // No macOS GUI build exists yet, so say once, at startup, whether
-    // the Open row has anything to spawn; the click itself degrades to the
-    // neutral dispatch's spawn-failure log either way.
+    // Say once at startup whether the Open row's target is present beside
+    // the tray; clicks degrade gracefully to neutral dispatch's
+    // spawn-failure log when the GUI binary is absent.
     let argv = crate::platform::open_gui_command();
     let program = argv.first().cloned().unwrap_or_default();
     if gui_program_present(&program) {
@@ -179,6 +342,12 @@ pub fn run() -> anyhow::Result<()> {
     } else {
         eprintln!("timetrack-tray: no GUI at {program}; the Open row will report it");
     }
+
+    let mtm = MainThreadMarker::new()
+        .ok_or_else(|| anyhow::anyhow!("timetrack-tray must run on the main thread"))?;
+    let app = NSApplication::sharedApplication(mtm);
+    let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.finishLaunching();
 
     let last_quick_add = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -211,32 +380,18 @@ pub fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("could not register tray icon: {e}"))?;
     println!("timetrack-tray: registered {}", crate::TRAY_NAME);
 
-    let (tx, rx) = std::sync::mpsc::channel::<MacEvent>();
-    // Menu clicks arrive on muda's global channel; forward them into the
-    // one inbox so the UI loop has a single blocking wait.
-    let menu_tx = tx.clone();
-    std::thread::spawn(move || {
-        let receiver = MenuEvent::receiver();
-        while let Ok(event) = receiver.recv() {
-            if menu_tx
-                .send(MacEvent::Menu(event.id.as_ref().to_string()))
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+    let wake = Arc::new(MacWake::new(&app));
+    let (tx, rx) = std::sync::mpsc::channel::<Published>();
+    let notifier = MacNotifier::new(tx, wake);
     // The poll worker: the Linux loop's twin, publishing state instead of
     // pushing it into a ksni handle. Detached like every dispatch worker:
     // Quit drops the process, and the flag stops the loop first anyway.
-    let worker_tx = tx.clone();
-    drop(tx);
     let worker_undo = last_quick_add.clone();
     let worker_shutdown = shutdown.clone();
     let worker_slot = client_slot.clone();
     std::thread::spawn(move || {
         async_io::block_on(poll_worker(
-            worker_tx,
+            notifier,
             worker_undo,
             worker_shutdown,
             worker_slot,
@@ -244,41 +399,27 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     // The last publish applied, plus the last item state pushed: the icon,
-    // tooltip, and title only move on a real change, while the timeout
+    // tooltip, and title only move on a real change, while `UI_TICK_MS`
     // re-reads the sticky action error so a failed click surfaces within
-    // a beat even when no snapshot changed (ksni re-renders on demand;
-    // here the UI thread must push).
+    // a beat even when neither AppKit input nor a snapshot changed (ksni
+    // re-renders on demand; here the UI thread must push).
     let mut last = Published {
         menu: MenuModel::default(),
         summary: TooltipState::default(),
         unwell: None,
     };
     let mut last_pushed: Option<(NeutralStatus, String, String)> = None;
+    let tick_secs = f64::from(UI_TICK_MS) / 1000.0;
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(MacEvent::Menu(id)) => {
-                if let Some(action) = decode_action(&id) {
-                    dispatch(action, &ctx);
-                } else if let Some(entry_id) = parse_keep_id(&id) {
-                    println!("timetrack-tray: delete of {entry_id} cancelled");
-                } else {
-                    eprintln!("timetrack-tray: ignoring unknown menu id");
-                }
-            }
-            Ok(MacEvent::Update(published)) => {
-                match build_native_menu(&build_window_menu(
-                    &published.menu,
-                    &crate::lock(&last_quick_add),
-                )) {
-                    Ok(menu) => tray.set_menu(Some(Box::new(menu))),
-                    Err(e) => eprintln!("timetrack-tray: could not rebuild the menu: {e}"),
-                }
-                last = published;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        let mut disconnected = false;
+        autoreleasepool(|_| {
+            drain_menu_events(&ctx);
+            disconnected = drain_updates(&rx, &tray, &last_quick_add, &mut last);
+            push_status(&tray, &last, &action_error, &mut last_pushed);
+        });
+        if disconnected {
+            break;
         }
-        push_status(&tray, &last, &action_error, &mut last_pushed);
         if shutdown.load(Ordering::Relaxed) {
             // Quit stops the tray only: clear the shared slot without
             // calling the service, exactly like the Linux return path.
@@ -286,6 +427,34 @@ pub fn run() -> anyhow::Result<()> {
             println!("timetrack-tray: quit requested; exiting");
             break;
         }
+        autoreleasepool(|_| {
+            // SAFETY: `NSDefaultRunLoopMode` is an immutable AppKit/Foundation
+            // constant string valid for the lifetime of the process.
+            let mode = unsafe { NSDefaultRunLoopMode };
+            let deadline = NSDate::dateWithTimeIntervalSinceNow(tick_secs);
+            if let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&deadline),
+                mode,
+                true,
+            ) {
+                if !is_wake_event(&event) {
+                    app.sendEvent(&event);
+                }
+                let past = NSDate::distantPast();
+                while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&past),
+                    mode,
+                    true,
+                ) {
+                    if !is_wake_event(&event) {
+                        app.sendEvent(&event);
+                    }
+                }
+                app.updateWindows();
+            }
+        });
     }
     Ok(())
 }
@@ -375,7 +544,7 @@ fn build_native_menu(items: &[WinMenuItem]) -> anyhow::Result<tray_icon::menu::M
 /// connection is dropped so the next tick reconnects from scratch.
 #[cfg(target_os = "macos")]
 async fn poll_worker(
-    tx: std::sync::mpsc::Sender<MacEvent>,
+    notifier: MacNotifier,
     last_quick_add: Arc<Mutex<HashMap<String, String>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     client_slot: crate::ipc::SharedClient,
@@ -424,7 +593,7 @@ async fn poll_worker(
                             summary: last_summary.clone(),
                             unwell: last_unwell.clone(),
                         };
-                        if tx.send(MacEvent::Update(published)).is_err() {
+                        if !notifier.send(published) {
                             break;
                         }
                     }
@@ -489,7 +658,7 @@ async fn poll_worker(
                         summary,
                         unwell: last_unwell.clone(),
                     };
-                    if tx.send(MacEvent::Update(published)).is_err() {
+                    if !notifier.send(published) {
                         break;
                     }
                 }
@@ -505,7 +674,7 @@ async fn poll_worker(
                         summary: last_summary.clone(),
                         unwell: last_unwell.clone(),
                     };
-                    if tx.send(MacEvent::Update(published)).is_err() {
+                    if !notifier.send(published) {
                         break;
                     }
                 }
@@ -521,7 +690,7 @@ async fn poll_worker(
                         summary: last_summary.clone(),
                         unwell: last_unwell.clone(),
                     };
-                    if tx.send(MacEvent::Update(published)).is_err() {
+                    if !notifier.send(published) {
                         break;
                     }
                 }
@@ -780,8 +949,8 @@ mod tests {
 
     #[test]
     fn gui_presence_follows_the_filesystem() {
-        // The Open row's target exists only once a macOS GUI build ships
-        // beside the tray; until then the runner logs its absence.
+        // The Open row's target exists only when a macOS GUI binary
+        // sits beside the tray; otherwise the runner logs its absence.
         assert!(!gui_program_present(""));
         assert!(!gui_program_present("/definitely/not/here/timetrack-gui"));
         let dir =
@@ -792,5 +961,41 @@ mod tests {
         assert!(gui_program_present(&exe.to_string_lossy()));
         assert!(!gui_program_present(&dir.to_string_lossy()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ui_tick_matches_windows() {
+        assert_eq!(UI_TICK_MS, crate::backend_windows::UI_TICK_MS);
+        const {
+            assert!(UI_TICK_MS > 0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wake_event_matches_only_our_sentinel() {
+        use objc2::rc::autoreleasepool;
+        use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+        use objc2_foundation::NSPoint;
+
+        autoreleasepool(|_| {
+            let wake = build_wake_event().expect("synthetic wake event");
+            assert!(is_wake_event(&wake));
+
+            let other =
+                NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+                    NSEventType::ApplicationDefined,
+                    NSPoint::ZERO,
+                    NSEventModifierFlags::empty(),
+                    0.0,
+                    0,
+                    None,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("other ApplicationDefined event");
+            assert!(!is_wake_event(&other));
+        });
     }
 }

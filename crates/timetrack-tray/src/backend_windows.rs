@@ -39,6 +39,11 @@ pub const SINGLE_INSTANCE_MUTEX: &str = "Local\\org.sequ.timetrack.tray";
 /// noticing that the service has gone away.
 pub const POLL_SECS: u64 = 60;
 
+/// Maximum wait before the UI event loop re-checks sticky action errors
+/// even when neither OS input nor a worker publish arrived, in
+/// milliseconds.
+pub const UI_TICK_MS: u32 = 500;
+
 /// The tray icon's edge, in pixels. The bytes are generated (see
 /// [`icon_rgba`]), not shipped as an asset.
 pub const ICON_PX: u32 = 32;
@@ -299,10 +304,10 @@ fn project_submenu(project: &ProjectItem, can_undo: bool) -> WinMenuItem {
     }
 }
 
-/// Whether the Open row's target exists. No Windows GUI build exists yet
-/// (#155), so the sibling binary is usually absent: the runner logs that
-/// once at startup, and the click itself stays graceful through the
-/// neutral dispatch's spawn-failure log.
+/// Whether the Open row's target exists. A standalone tray install may
+/// not ship the sibling GUI binary, so the runner logs its presence once
+/// at startup and clicks degrade gracefully through neutral dispatch's
+/// spawn-failure log.
 pub fn gui_exe_present(program: &str) -> bool {
     !program.is_empty() && std::path::Path::new(program).is_file()
 }
@@ -356,37 +361,164 @@ struct Published {
     unwell: Option<Unwell>,
 }
 
-/// The UI thread's inbox: worker publishes, or a clicked menu id.
+/// Auto-reset Win32 event waking the UI thread's `MsgWaitForMultipleObjectsEx`
+/// when the poll worker publishes an update or exits.
 #[cfg(windows)]
-enum WinEvent {
-    Update(Published),
-    Menu(String),
+struct WakeEvent {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: A Win32 event handle may be signaled via `SetEvent` from any thread
+// while the UI thread waits in `MsgWaitForMultipleObjectsEx`; `Arc<WakeEvent>`
+// ensures `CloseHandle` runs once on final drop.
+#[cfg(windows)]
+unsafe impl Send for WakeEvent {}
+// SAFETY: See `Send` impl above.
+#[cfg(windows)]
+unsafe impl Sync for WakeEvent {}
+
+#[cfg(windows)]
+impl WakeEvent {
+    fn new() -> anyhow::Result<Self> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if handle.is_null() {
+            anyhow::bail!("could not create the UI wake event");
+        }
+        Ok(Self { handle })
+    }
+
+    fn raw_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle
+    }
+
+    fn signal(&self) {
+        use windows_sys::Win32::System::Threading::SetEvent;
+        let _ = unsafe { SetEvent(self.handle) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WakeEvent {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+/// Worker-to-UI channel plus its Win32 wake handle so published updates
+/// interrupt `MsgWaitForMultipleObjectsEx` immediately.
+#[cfg(windows)]
+struct WinNotifier {
+    tx: Option<std::sync::mpsc::Sender<Published>>,
+    wake: Arc<WakeEvent>,
+}
+
+#[cfg(windows)]
+impl WinNotifier {
+    fn new(tx: std::sync::mpsc::Sender<Published>, wake: Arc<WakeEvent>) -> Self {
+        Self { tx: Some(tx), wake }
+    }
+
+    fn send(&self, published: Published) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        if tx.send(published).is_err() {
+            return false;
+        }
+        self.wake.signal();
+        true
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WinNotifier {
+    fn drop(&mut self) {
+        // Drop the sender before signaling so the UI thread observes
+        // `Disconnected` immediately when woken.
+        self.tx.take();
+        self.wake.signal();
+    }
+}
+
+/// Drain every pending menu click produced by `muda` on the UI thread.
+#[cfg(windows)]
+fn drain_menu_events(ctx: &crate::actions::DispatchContext) {
+    use crate::actions::dispatch;
+    use tray_icon::menu::MenuEvent;
+    while let Ok(event) = MenuEvent::receiver().try_recv() {
+        let id = event.id.as_ref();
+        if let Some(action) = decode_action(id) {
+            dispatch(action, ctx);
+        } else if let Some(entry_id) = parse_keep_id(id) {
+            println!("timetrack-tray: delete of {entry_id} cancelled");
+        } else {
+            eprintln!("timetrack-tray: ignoring unknown menu id");
+        }
+    }
+}
+
+/// Apply the latest worker snapshot if one arrived, and report whether the
+/// worker channel disconnected.
+#[cfg(windows)]
+fn drain_updates(
+    rx: &std::sync::mpsc::Receiver<Published>,
+    tray: &tray_icon::TrayIcon,
+    last_quick_add: &Arc<Mutex<HashMap<String, String>>>,
+    last: &mut Published,
+) -> bool {
+    let mut latest = None;
+    let mut disconnected = false;
+    loop {
+        match rx.try_recv() {
+            Ok(published) => latest = Some(published),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    if let Some(published) = latest {
+        match build_native_menu(&build_window_menu(
+            &published.menu,
+            &crate::lock(last_quick_add),
+        )) {
+            Ok(menu) => tray.set_menu(Some(Box::new(menu))),
+            Err(e) => eprintln!("timetrack-tray: could not rebuild the menu: {e}"),
+        }
+        *last = published;
+    }
+    disconnected
 }
 
 /// Run the Windows tray: claim single instance, show the icon, and pump
-/// menu clicks plus worker publishes until Quit. Blocks the calling
-/// (UI) thread; the service polling lives on a worker thread, like the
-/// Linux poll loop, and clicks dispatch the neutral [`TrayAction`]s.
+/// Win32 messages, menu clicks, and worker publishes until Quit. Blocks the
+/// calling (UI) thread; the service polling lives on a worker thread, like
+/// the Linux poll loop, and clicks dispatch the neutral [`TrayAction`]s.
 #[cfg(windows)]
 pub fn run() -> anyhow::Result<()> {
-    use crate::actions::{DispatchContext, dispatch};
+    use crate::actions::DispatchContext;
     use crate::ipc::set_shared_client;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Duration;
-    use tray_icon::menu::MenuEvent;
     use tray_icon::{Icon, TrayIconBuilder};
+    use windows_sys::Win32::Foundation::WAIT_FAILED;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
+        PeekMessageW, QS_ALLINPUT, TranslateMessage, WM_QUIT,
+    };
 
     let Some(_instance) = SingleInstance::try_claim()? else {
         println!("timetrack-tray: already running; exiting");
         return Ok(());
     };
 
-    // No Windows GUI build exists yet, so say once, at startup, whether
-    // the Open row has anything to spawn; the click itself degrades to the
-    // neutral dispatch's spawn-failure log either way.
+    // Say once at startup whether the Open row's target is present beside
+    // the tray; clicks degrade gracefully to neutral dispatch's
+    // spawn-failure log when the GUI binary is absent.
     let argv = crate::platform::open_gui_command();
     let program = argv.first().cloned().unwrap_or_default();
     if gui_exe_present(&program) {
@@ -421,32 +553,18 @@ pub fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("could not register tray icon: {e}"))?;
     println!("timetrack-tray: registered {}", crate::TRAY_NAME);
 
-    let (tx, rx) = std::sync::mpsc::channel::<WinEvent>();
-    // Menu clicks arrive on muda's global channel; forward them into the
-    // one inbox so the UI loop has a single blocking wait.
-    let menu_tx = tx.clone();
-    std::thread::spawn(move || {
-        let receiver = MenuEvent::receiver();
-        while let Ok(event) = receiver.recv() {
-            if menu_tx
-                .send(WinEvent::Menu(event.id.as_ref().to_string()))
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+    let wake = Arc::new(WakeEvent::new()?);
+    let (tx, rx) = std::sync::mpsc::channel::<Published>();
+    let notifier = WinNotifier::new(tx, wake.clone());
     // The poll worker: the Linux loop's twin, publishing state instead of
     // pushing it into a ksni handle. Detached like every dispatch worker:
     // Quit drops the process, and the flag stops the loop first anyway.
-    let worker_tx = tx.clone();
-    drop(tx);
     let worker_undo = last_quick_add.clone();
     let worker_shutdown = shutdown.clone();
     let worker_slot = client_slot.clone();
     std::thread::spawn(move || {
         async_io::block_on(poll_worker(
-            worker_tx,
+            notifier,
             worker_undo,
             worker_shutdown,
             worker_slot,
@@ -454,10 +572,10 @@ pub fn run() -> anyhow::Result<()> {
     });
 
     // The last publish applied, plus the last icon state pushed: the icon
-    // and tooltip only move on a real change, while the timeout re-reads
+    // and tooltip only move on a real change, while `UI_TICK_MS` re-reads
     // the sticky action error so a failed click surfaces within a beat
-    // even when no snapshot changed (ksni re-renders on demand; here the
-    // UI thread must push).
+    // even when no Win32 message or snapshot change arrived (ksni
+    // re-renders on demand; here the UI thread must push).
     let mut last = Published {
         menu: MenuModel::default(),
         summary: TooltipState::default(),
@@ -465,35 +583,50 @@ pub fn run() -> anyhow::Result<()> {
     };
     let mut last_pushed: Option<(NeutralStatus, String)> = None;
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(WinEvent::Menu(id)) => {
-                if let Some(action) = decode_action(&id) {
-                    dispatch(action, &ctx);
-                } else if let Some(entry_id) = parse_keep_id(&id) {
-                    println!("timetrack-tray: delete of {entry_id} cancelled");
-                } else {
-                    eprintln!("timetrack-tray: ignoring unknown menu id");
-                }
+        let mut quit = false;
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+            if msg.message == WM_QUIT {
+                quit = true;
+                break;
             }
-            Ok(WinEvent::Update(published)) => {
-                match build_native_menu(&build_window_menu(
-                    &published.menu,
-                    &crate::lock(&last_quick_add),
-                )) {
-                    Ok(menu) => tray.set_menu(Some(Box::new(menu))),
-                    Err(e) => eprintln!("timetrack-tray: could not rebuild the menu: {e}"),
-                }
-                last = published;
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        drain_menu_events(&ctx);
+        let disconnected = drain_updates(&rx, &tray, &last_quick_add, &mut last);
         push_status(&tray, &last, &action_error, &mut last_pushed);
+        if quit {
+            shutdown.store(true, Ordering::Relaxed);
+            set_shared_client(&client_slot, None);
+            println!("timetrack-tray: WM_QUIT received; exiting");
+            break;
+        }
+        if disconnected {
+            break;
+        }
         if shutdown.load(Ordering::Relaxed) {
             // Quit stops the tray only: clear the shared slot without
             // calling the service, exactly like the Linux return path.
             set_shared_client(&client_slot, None);
             println!("timetrack-tray: quit requested; exiting");
+            break;
+        }
+        let handles = [wake.raw_handle()];
+        let waited = unsafe {
+            MsgWaitForMultipleObjectsEx(
+                1,
+                handles.as_ptr(),
+                UI_TICK_MS,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            )
+        };
+        if waited == WAIT_FAILED {
+            let err = std::io::Error::last_os_error();
+            eprintln!("timetrack-tray: UI message wait failed ({err}); exiting");
             break;
         }
     }
@@ -581,7 +714,7 @@ fn build_native_menu(items: &[WinMenuItem]) -> anyhow::Result<tray_icon::menu::M
 /// connection is dropped so the next tick reconnects from scratch.
 #[cfg(windows)]
 async fn poll_worker(
-    tx: std::sync::mpsc::Sender<WinEvent>,
+    notifier: WinNotifier,
     last_quick_add: Arc<Mutex<HashMap<String, String>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     client_slot: crate::ipc::SharedClient,
@@ -630,7 +763,7 @@ async fn poll_worker(
                             summary: last_summary.clone(),
                             unwell: last_unwell.clone(),
                         };
-                        if tx.send(WinEvent::Update(published)).is_err() {
+                        if !notifier.send(published) {
                             break;
                         }
                     }
@@ -695,7 +828,7 @@ async fn poll_worker(
                         summary,
                         unwell: last_unwell.clone(),
                     };
-                    if tx.send(WinEvent::Update(published)).is_err() {
+                    if !notifier.send(published) {
                         break;
                     }
                 }
@@ -711,7 +844,7 @@ async fn poll_worker(
                         summary: last_summary.clone(),
                         unwell: last_unwell.clone(),
                     };
-                    if tx.send(WinEvent::Update(published)).is_err() {
+                    if !notifier.send(published) {
                         break;
                     }
                 }
@@ -727,7 +860,7 @@ async fn poll_worker(
                         summary: last_summary.clone(),
                         unwell: last_unwell.clone(),
                     };
-                    if tx.send(WinEvent::Update(published)).is_err() {
+                    if !notifier.send(published) {
                         break;
                     }
                 }
@@ -1133,8 +1266,8 @@ mod tests {
 
     #[test]
     fn gui_presence_follows_the_filesystem() {
-        // The Open row's target exists only once a Windows GUI build ships
-        // beside the tray; until then the runner logs its absence.
+        // The Open row's target exists only when a Windows GUI binary
+        // sits beside the tray; otherwise the runner logs its absence.
         assert!(!gui_exe_present(""));
         assert!(!gui_exe_present("/definitely/not/here/timetrack-gui.exe"));
         let dir = std::env::temp_dir().join(format!("timetrack-tray-test-{}", std::process::id()));
@@ -1144,5 +1277,36 @@ mod tests {
         assert!(gui_exe_present(&exe.to_string_lossy()));
         assert!(!gui_exe_present(&dir.to_string_lossy()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ui_tick_is_responsive() {
+        const {
+            assert!(UI_TICK_MS > 0 && UI_TICK_MS <= 1_000);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wake_event_unblocks_msg_wait_from_worker_thread() {
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+        use windows_sys::Win32::UI::WindowsAndMessaging::MsgWaitForMultipleObjectsEx;
+
+        let wake = Arc::new(WakeEvent::new().unwrap());
+        let worker_wake = wake.clone();
+        std::thread::spawn(move || {
+            worker_wake.signal();
+        })
+        .join()
+        .unwrap();
+
+        let handles = [wake.raw_handle()];
+        let first = unsafe { MsgWaitForMultipleObjectsEx(1, handles.as_ptr(), 5_000, 0, 0) };
+        assert_eq!(first, WAIT_OBJECT_0);
+
+        // Auto-reset clears the signal once consumed by the wait above.
+        let second = unsafe { MsgWaitForMultipleObjectsEx(1, handles.as_ptr(), 0, 0, 0) };
+        assert_ne!(second, WAIT_OBJECT_0);
+        assert_ne!(second, WAIT_FAILED);
     }
 }
