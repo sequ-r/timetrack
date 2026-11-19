@@ -25,18 +25,42 @@ zbus = { workspace = true }
 ksni = { workspace = true }
 
 # Windows-only notification-area backend (#155): a native icon plus menu
-# via tray-icon, and a named mutex via windows-sys. Both are tokio-free,
-# like everything else in this workspace.
+# via tray-icon, and a named mutex plus Win32 message loop via windows-sys.
+# Both are tokio-free, like everything else in this workspace.
 [target.'cfg(target_os = "windows")'.dependencies]
 tray-icon = { version = "0.21", default-features = false }
-windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # macOS-only menu-bar backend (#156): the same tray-icon family as Windows
-# (NSStatusItem plus title via objc2, menu via muda), and libc for the
-# flock single-instance claim. Both are tokio-free, like everything else
-# in this workspace.
+# (NSStatusItem plus title via objc2, menu via muda), the NSApplication
+# event loop via objc2 / objc2-app-kit / objc2-foundation, and libc for
+# the flock single-instance claim. All are tokio-free, like everything
+# else in this workspace.
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { version = "0.21", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSResponder",
+    "NSRunningApplication",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSDate",
+    "NSGeometry",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSString",
+] }
 libc = { version = "0.2" }
 
 [dev-dependencies]
