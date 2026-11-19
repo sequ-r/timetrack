@@ -21,3 +21,4 @@ pub mod project;
 pub mod recolour;
 pub mod source;
 pub mod split;
+pub mod sync;

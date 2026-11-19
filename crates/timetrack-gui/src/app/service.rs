@@ -75,6 +75,17 @@ pub(super) enum Msg {
     /// The registered external sources changed (#153). Sent only on
     /// change, beside the snapshot cadence, like the suggestions.
     Sources(Vec<timetrack_proto::SourceView>),
+    /// Current folder-sync status (#176), updated on change and sync ops.
+    SyncStatus(timetrack_proto::SyncStatusView),
+    /// Unresolved folder-sync conflicts (#176), updated on change.
+    SyncConflicts(Vec<timetrack_proto::SyncConflictView>),
+    /// Active or newly rotated pairing code to display in the code dialog.
+    SyncCode {
+        code: String,
+        rotated: bool,
+    },
+    /// Folder chosen by the OS folder picker for the open sync dialog.
+    SyncFolderPicked(String),
 }
 
 /// What an export save needs: the typed scope plus the paths and labels
@@ -272,6 +283,25 @@ pub(super) enum Action {
     /// Delete a source, its pending suggestions, and its stored secret.
     /// Decided suggestions and confirmed entries stay (#153).
     RemoveSource(String),
+    /// Open the OS folder chooser for the sync setup dialog (#176).
+    PickSyncFolder,
+    /// Enable folder sync or join an existing sync folder (#176).
+    SyncEnable {
+        folder: String,
+        pairing_code: Option<timetrack_proto::SecretString>,
+    },
+    /// Run a pull-merge-publish folder sync round now (#176).
+    SyncNow,
+    /// Pull-merge active peers ahead of publishing after falling behind (#176).
+    SyncRepair,
+    /// Stop folder sync and optionally delete this device's sync file (#176).
+    SyncUnpair { delete_file: bool },
+    /// Fetch the active pairing code to display to the user (#176).
+    SyncShowCode,
+    /// Rotate the 256-bit folder-sync key and show the new pairing code (#176).
+    SyncRotateKey,
+    /// Re-save a losing conflict record as a fresh local edit (#176).
+    SyncRestoreConflict(String),
 }
 
 /// What happened to a snapshot offered to the view.
@@ -444,6 +474,10 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
             // The sources last sent to the view (#153): same cadence,
             // same change gate.
             let mut last_sources: Vec<timetrack_proto::SourceView> = Vec::new();
+            // Folder-sync status and unresolved conflicts (#176): same
+            // cadence and change gate, plus immediate push on sync actions.
+            let mut last_sync_status: Option<timetrack_proto::SyncStatusView> = None;
+            let mut last_sync_conflicts: Vec<timetrack_proto::SyncConflictView> = Vec::new();
             loop {
                 // Wait for a command, but never longer than until the
                 // next refresh is due: a click reaches the service at
@@ -644,6 +678,92 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                         Ok(Action::RemoveSource(id)) => {
                             report(&tx, client.remove_source(&id).await.map(|_| ()));
                         }
+                        Ok(Action::PickSyncFolder) => {
+                            let tx = tx.clone();
+                            std::thread::spawn(move || {
+                                async_io::block_on(async move {
+                                    match super::export::save::portal_pick_folder().await {
+                                        super::export::save::PortalOutcome::Granted(path) => {
+                                            let _ = tx.send(Msg::SyncFolderPicked(path));
+                                        }
+                                        super::export::save::PortalOutcome::Cancelled => {}
+                                        super::export::save::PortalOutcome::Unavailable => {
+                                            let _ = tx.send(Msg::Status(
+                                                "folder picker unavailable — type the folder path"
+                                                    .to_string(),
+                                            ));
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                        Ok(Action::SyncEnable {
+                            folder,
+                            pairing_code,
+                        }) => {
+                            match client
+                                .sync_enable(&folder, pairing_code.as_ref().map(|s| s.expose()))
+                                .await
+                            {
+                                Ok(res) => {
+                                    if let Some(code) = res.pairing_code {
+                                        let _ = tx.send(Msg::SyncCode {
+                                            code,
+                                            rotated: false,
+                                        });
+                                    }
+                                    last_sync_status = Some(res.status.clone());
+                                    let _ = tx.send(Msg::SyncStatus(res.status));
+                                    let _ = tx.send(Msg::ActionOk);
+                                    if !res.warnings.is_empty() {
+                                        let cleaned: Vec<String> = res
+                                            .warnings
+                                            .iter()
+                                            .map(|w| timetrack_core::sanitize_display(w))
+                                            .collect();
+                                        let _ = tx.send(Msg::Status(format!(
+                                            "sync enabled ({})",
+                                            cleaned.join("; ")
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
+                                }
+                            }
+                        }
+                        Ok(Action::SyncNow) => {
+                            apply_sync_round(&client, &tx, &mut last_sync_status, false).await;
+                        }
+                        Ok(Action::SyncRepair) => {
+                            apply_sync_round(&client, &tx, &mut last_sync_status, true).await;
+                        }
+                        Ok(Action::SyncUnpair { delete_file }) => {
+                            report(&tx, client.sync_unpair(delete_file).await);
+                        }
+                        Ok(Action::SyncShowCode) => match client.sync_show_code().await {
+                            Ok(code) => {
+                                let _ = tx.send(Msg::SyncCode {
+                                    code,
+                                    rotated: false,
+                                });
+                                report(&tx, Ok(()));
+                            }
+                            Err(e) => report(&tx, Err(e)),
+                        },
+                        Ok(Action::SyncRotateKey) => match client.sync_rotate_key().await {
+                            Ok(code) => {
+                                let _ = tx.send(Msg::SyncCode {
+                                    code,
+                                    rotated: true,
+                                });
+                                report(&tx, Ok(()));
+                            }
+                            Err(e) => report(&tx, Err(e)),
+                        },
+                        Ok(Action::SyncRestoreConflict(id)) => {
+                            report(&tx, client.sync_restore_conflict(&id).await);
+                        }
                         Ok(Action::StartService) => {
                             // Spawn the sibling binary, then prove it by
                             // snapshot: the next refresh tick would find
@@ -702,6 +822,19 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
                             last_sources = fresh.clone();
                             let _ = tx.send(Msg::Sources(fresh));
                         }
+                        // Folder sync status and unresolved conflicts (#176).
+                        if let Ok(fresh) = client.sync_status().await
+                            && last_sync_status.as_ref() != Some(&fresh)
+                        {
+                            last_sync_status = Some(fresh.clone());
+                            let _ = tx.send(Msg::SyncStatus(fresh));
+                        }
+                        if let Ok(fresh) = client.sync_conflicts(false).await
+                            && fresh != last_sync_conflicts
+                        {
+                            last_sync_conflicts = fresh.clone();
+                            let _ = tx.send(Msg::SyncConflicts(fresh));
+                        }
                         match offer_snapshot(&snapshot_tx, s) {
                             Offered::Queued | Offered::Dropped => {}
                             // The window is gone: nothing left to do.
@@ -719,6 +852,57 @@ pub(super) fn spawn_service_thread() -> (Receiver<Snapshot>, Receiver<Msg>, Send
         });
     });
     (snapshot_rx, rx, action_tx)
+}
+
+/// Format one completed sync or repair round for the footer status line (#176).
+pub(super) fn sync_round_summary(verb: &str, res: &timetrack_proto::SyncNowView) -> String {
+    let mut base = format!(
+        "{verb}: {} peer{}, {} change{}",
+        res.peers_read,
+        if res.peers_read == 1 { "" } else { "s" },
+        res.applied_changes,
+        if res.applied_changes == 1 { "" } else { "s" },
+    );
+    if res.new_conflicts > 0 {
+        base.push_str(&format!(
+            ", {} conflict{}",
+            res.new_conflicts,
+            if res.new_conflicts == 1 { "" } else { "s" },
+        ));
+    }
+    if !res.warnings.is_empty() {
+        let cleaned: Vec<String> = res
+            .warnings
+            .iter()
+            .map(|w| timetrack_core::sanitize_display(w))
+            .collect();
+        base.push_str(&format!(" ({})", cleaned.join("; ")));
+    }
+    base
+}
+
+async fn apply_sync_round(
+    client: &timetrack_proto::Client,
+    tx: &Sender<Msg>,
+    last_sync_status: &mut Option<timetrack_proto::SyncStatusView>,
+    repair: bool,
+) {
+    let (verb, outcome) = if repair {
+        ("sync repaired", client.sync_repair().await)
+    } else {
+        ("synced", client.sync_now().await)
+    };
+    match outcome {
+        Ok(res) => {
+            *last_sync_status = Some(res.status.clone());
+            let _ = tx.send(Msg::SyncStatus(res.status.clone()));
+            let _ = tx.send(Msg::ActionOk);
+            let _ = tx.send(Msg::Status(sync_round_summary(verb, &res)));
+        }
+        Err(e) => {
+            let _ = tx.send(Msg::Error(StatusMsg::from(&e)));
+        }
+    }
 }
 
 /// Apply a source save's credential half (#153): the secret travels
@@ -824,6 +1008,58 @@ mod tests {
         let debug = format!("{action:?}");
         assert!(!debug.contains("s3cr3t-153"), "{debug}");
         assert!(debug.contains("alice"), "{debug}");
+    }
+
+    #[test]
+    fn a_sync_enable_action_never_debug_prints_its_pairing_code() {
+        let action = Action::SyncEnable {
+            folder: "/tmp/shared".into(),
+            pairing_code: Some(timetrack_proto::SecretString::new("SECRET-CODE-999")),
+        };
+        let debug = format!("{action:?}");
+        assert!(!debug.contains("SECRET-CODE-999"), "{debug}");
+        assert!(debug.contains("/tmp/shared"), "{debug}");
+    }
+
+    #[test]
+    fn sync_round_summary_formats_changes_conflicts_and_warnings() {
+        let status = timetrack_proto::SyncStatusView {
+            enabled: true,
+            device_id: "0123456789abcdef".into(),
+            folder: Some("/tmp/sync".into()),
+            has_key: true,
+            merged_through: 1_000,
+            compacted_through: 0,
+            last_sync_at: Some(1_000),
+            last_error: None,
+            needs_repair: false,
+            unresolved_conflicts: 0,
+            peers: Vec::new(),
+        };
+        let clean = timetrack_proto::SyncNowView {
+            status: status.clone(),
+            peers_read: 1,
+            applied_changes: 0,
+            new_conflicts: 0,
+            compacted_tombstones: 0,
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            sync_round_summary("synced", &clean),
+            "synced: 1 peer, 0 changes"
+        );
+        let busy = timetrack_proto::SyncNowView {
+            status,
+            peers_read: 2,
+            applied_changes: 1,
+            new_conflicts: 1,
+            compacted_tombstones: 0,
+            warnings: vec!["peer stale".into()],
+        };
+        assert_eq!(
+            sync_round_summary("sync repaired", &busy),
+            "sync repaired: 2 peers, 1 change, 1 conflict (peer stale)"
+        );
     }
 
     #[test]
