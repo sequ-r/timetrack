@@ -58,6 +58,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Background periodic folder sync (#173, ADR 0020): best-effort pull-merge-
+    // publish every 60s when sync is enabled; never blocks the socket or mutations.
+    let sync_service = Arc::clone(&service);
+    std::thread::Builder::new()
+        .name("timetrack-sync".into())
+        .spawn(move || {
+            sync_service.sync_now_best_effort();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                sync_service.sync_now_best_effort();
+            }
+        })?;
+
     // Park forever. Ctrl-C kills the process outright, which is fine:
     // every mutation is persisted before it is acknowledged, so there
     // is no state to flush on the way out.

@@ -180,6 +180,27 @@ fn dispatch(service: &EntryService, request: Request) -> Result<Response, Servic
         Request::SetNote { id, note } => {
             Response::Entry(Box::new(service.set_note(&id, note.as_deref())?))
         }
+        Request::SyncEnable {
+            folder,
+            pairing_code,
+        } => Response::SyncEnable(Box::new(
+            service.sync_enable(&folder, pairing_code.as_deref())?,
+        )),
+        Request::SyncStatus => Response::SyncStatus(Box::new(service.sync_status()?)),
+        Request::SyncNow => Response::SyncNow(Box::new(service.sync_now()?)),
+        Request::SyncUnpair { delete_file } => {
+            service.sync_unpair(delete_file)?;
+            Response::Unit
+        }
+        Request::SyncShowCode => Response::SyncCode(service.sync_show_code()?),
+        Request::SyncRotateKey => Response::SyncCode(service.sync_rotate_key()?),
+        Request::SyncConflicts { include_restored } => {
+            Response::SyncConflicts(service.sync_conflicts(include_restored)?)
+        }
+        Request::SyncRestoreConflict { id } => {
+            service.sync_restore_conflict(&id)?;
+            Response::Unit
+        }
     })
 }
 

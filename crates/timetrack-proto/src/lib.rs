@@ -207,6 +207,69 @@ pub struct CaldavCollectionView {
     pub components: Vec<String>,
 }
 
+/// One known peer device in the sync folder (#173, #175).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncPeerView {
+    pub device_id: String,
+    pub last_published_at: i64,
+    pub last_merged_through: i64,
+    pub last_seen_at: i64,
+    pub quarantined: bool,
+    pub stale: bool,
+    pub last_warning: Option<String>,
+}
+
+/// Current folder-sync state and tracked peers (#173).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatusView {
+    pub enabled: bool,
+    pub device_id: String,
+    pub folder: Option<String>,
+    pub has_key: bool,
+    pub merged_through: i64,
+    pub compacted_through: i64,
+    pub last_sync_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub needs_repair: bool,
+    pub unresolved_conflicts: usize,
+    pub peers: Vec<SyncPeerView>,
+}
+
+/// Outcome of enabling folder sync (#173).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncEnableResult {
+    pub status: SyncStatusView,
+    /// Present only when a new sync key was generated; omitted when joining.
+    pub pairing_code: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Outcome of one pull-merge-publish sync round (#173, #175).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncNowView {
+    pub status: SyncStatusView,
+    pub peers_read: usize,
+    pub applied_changes: usize,
+    pub new_conflicts: usize,
+    pub compacted_tombstones: usize,
+    pub warnings: Vec<String>,
+}
+
+/// One losing record preserved in the local conflict journal (#173).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncConflictView {
+    pub id: String,
+    pub kind: String,
+    pub record_id: String,
+    pub recorded_at: i64,
+    pub loser_updated_at: i64,
+    pub loser_device_id: String,
+    pub winner_updated_at: i64,
+    pub winner_device_id: String,
+    pub summary: String,
+    pub restored_at: Option<i64>,
+}
+
 /// Totals for one period, mirroring `timetrack_core::aggregate::Totals`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TotalsView {
@@ -834,6 +897,51 @@ impl Client {
         .entry()
     }
 
+    pub async fn sync_enable(
+        &self,
+        folder: &str,
+        pairing_code: Option<&str>,
+    ) -> Result<SyncEnableResult, ClientError> {
+        self.call(SocketRequest::SyncEnable {
+            folder: folder.into(),
+            pairing_code: pairing_code.map(str::to_string),
+        })?
+        .sync_enable()
+    }
+
+    pub async fn sync_status(&self) -> Result<SyncStatusView, ClientError> {
+        self.call(SocketRequest::SyncStatus)?.sync_status()
+    }
+
+    pub async fn sync_now(&self) -> Result<SyncNowView, ClientError> {
+        self.call(SocketRequest::SyncNow)?.sync_now()
+    }
+
+    pub async fn sync_unpair(&self, delete_file: bool) -> Result<(), ClientError> {
+        self.call(SocketRequest::SyncUnpair { delete_file })?.unit()
+    }
+
+    pub async fn sync_show_code(&self) -> Result<String, ClientError> {
+        self.call(SocketRequest::SyncShowCode)?.sync_code()
+    }
+
+    pub async fn sync_rotate_key(&self) -> Result<String, ClientError> {
+        self.call(SocketRequest::SyncRotateKey)?.sync_code()
+    }
+
+    pub async fn sync_conflicts(
+        &self,
+        include_restored: bool,
+    ) -> Result<Vec<SyncConflictView>, ClientError> {
+        self.call(SocketRequest::SyncConflicts { include_restored })?
+            .sync_conflicts()
+    }
+
+    pub async fn sync_restore_conflict(&self, id: &str) -> Result<(), ClientError> {
+        self.call(SocketRequest::SyncRestoreConflict { id: id.into() })?
+            .unit()
+    }
+
     /// Poll until the service answers, or give up.
     ///
     /// The first method call is what proves the service, so that is
@@ -1167,6 +1275,123 @@ mod tests {
         .unwrap();
         assert!(!back.has_credential);
         assert_eq!(back.username, None);
+    }
+
+    // --- sync wire types (#173) ---
+
+    #[test]
+    fn sync_wire_types_round_trip() {
+        let status = SyncStatusView {
+            enabled: true,
+            device_id: "0123456789abcdef0123456789abcdef".into(),
+            folder: Some("/tmp/sync".into()),
+            has_key: true,
+            merged_through: 1_700_000_000_000,
+            compacted_through: 0,
+            last_sync_at: Some(1_700_000_001_000),
+            last_error: None,
+            needs_repair: false,
+            unresolved_conflicts: 1,
+            peers: vec![SyncPeerView {
+                device_id: "fedcba9876543210fedcba9876543210".into(),
+                last_published_at: 1_700_000_000_000,
+                last_merged_through: 1_699_999_000_000,
+                last_seen_at: 1_700_000_001_000,
+                quarantined: false,
+                stale: false,
+                last_warning: None,
+            }],
+        };
+        let enable = SyncEnableResult {
+            status: status.clone(),
+            pairing_code: Some("ABCD-EFGH".into()),
+            warnings: vec!["peer warn".into()],
+        };
+        assert_eq!(
+            serde_json::from_str::<SyncEnableResult>(&serde_json::to_string(&enable).unwrap())
+                .unwrap(),
+            enable
+        );
+        let now = SyncNowView {
+            status: status.clone(),
+            peers_read: 1,
+            applied_changes: 2,
+            new_conflicts: 1,
+            compacted_tombstones: 0,
+            warnings: vec![],
+        };
+        assert_eq!(
+            serde_json::from_str::<SyncNowView>(&serde_json::to_string(&now).unwrap()).unwrap(),
+            now
+        );
+        let conflict = SyncConflictView {
+            id: "c1".into(),
+            kind: "entry".into(),
+            record_id: "e1".into(),
+            recorded_at: 1_700_000_000_100,
+            loser_updated_at: 1_700_000_000_000,
+            loser_device_id: status.device_id.clone(),
+            winner_updated_at: 1_700_000_000_050,
+            winner_device_id: status.peers[0].device_id.clone(),
+            summary: "Work · 1h".into(),
+            restored_at: None,
+        };
+        assert_eq!(
+            serde_json::from_str::<SyncConflictView>(&serde_json::to_string(&conflict).unwrap())
+                .unwrap(),
+            conflict
+        );
+
+        for req in [
+            SocketRequest::SyncEnable {
+                folder: "/tmp/sync".into(),
+                pairing_code: Some("ABCD-EFGH".into()),
+            },
+            SocketRequest::SyncStatus,
+            SocketRequest::SyncNow,
+            SocketRequest::SyncUnpair { delete_file: true },
+            SocketRequest::SyncShowCode,
+            SocketRequest::SyncRotateKey,
+            SocketRequest::SyncConflicts {
+                include_restored: false,
+            },
+            SocketRequest::SyncRestoreConflict { id: "c1".into() },
+        ] {
+            let back: SocketRequest =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+
+        assert_eq!(
+            socket::Response::SyncStatus(Box::new(status.clone()))
+                .sync_status()
+                .unwrap(),
+            status
+        );
+        assert_eq!(
+            socket::Response::SyncEnable(Box::new(enable.clone()))
+                .sync_enable()
+                .unwrap(),
+            enable
+        );
+        assert_eq!(
+            socket::Response::SyncNow(Box::new(now.clone()))
+                .sync_now()
+                .unwrap(),
+            now
+        );
+        assert_eq!(
+            socket::Response::SyncCode("ABCD".into())
+                .sync_code()
+                .unwrap(),
+            "ABCD"
+        );
+        assert_eq!(
+            socket::Response::SyncConflicts(vec![conflict.clone()])
+                .sync_conflicts()
+                .unwrap(),
+            [conflict]
+        );
     }
 
     // --- the call timeout ---

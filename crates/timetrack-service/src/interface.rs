@@ -102,6 +102,14 @@ struct Inner {
     /// The last good zone is kept in that case: startup already proved a
     /// usable zone exists, and failing every call would lose tracking.
     tz_refresh_error: Option<String>,
+    /// Clock source (#173/#175): system wall clock in production, injectable in tests.
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl Inner {
+    fn now_ms(&self) -> i64 {
+        (self.clock)()
+    }
 }
 
 /// Re-resolve the zone from the environment (#102), adopting it when it
@@ -135,6 +143,9 @@ fn refresh_tz(inner: &mut Inner) {
 /// Serialise access to the store.
 pub struct EntryService {
     inner: Mutex<Inner>,
+    /// Serialises folder/keyring sync rounds off `self.inner` so sync I/O
+    /// never blocks normal tracking mutations or snapshots (ADR 0020, #173).
+    sync_lock: Mutex<()>,
     /// `Changed` subscribers on the socket transport (§16). The D-Bus
     /// signal is emitted by the interface wrappers in `main.rs`; socket
     /// subscribers are notified here, in the mutation funnel, so a
@@ -149,7 +160,13 @@ impl EntryService {
         // here with an actionable message, instead of silently running in
         // UTC and bucketing every typed local time into the wrong day.
         let tz = core::Tz::try_from_env().map_err(anyhow::Error::new)?;
-        Self::new_inner(store, tz, true, Arc::new(OsCredentialStore::new()))
+        Self::new_inner(
+            store,
+            tz,
+            true,
+            Arc::new(OsCredentialStore::new()),
+            Arc::new(now_ms),
+        )
     }
 
     /// Build with an explicit, pinned zone. The production path is
@@ -159,7 +176,13 @@ impl EntryService {
     /// test's zone can never be replaced under it.
     #[cfg(test)]
     pub fn new_with_tz(store: SqliteStore, tz: core::Tz) -> anyhow::Result<Self> {
-        Self::new_inner(store, tz, false, Arc::new(OsCredentialStore::new()))
+        Self::new_inner(
+            store,
+            tz,
+            false,
+            Arc::new(OsCredentialStore::new()),
+            Arc::new(now_ms),
+        )
     }
 
     /// Build with an injected credential backend (#149): the fake, so
@@ -169,7 +192,17 @@ impl EntryService {
         store: SqliteStore,
         credentials: Arc<dyn CredentialStore>,
     ) -> anyhow::Result<Self> {
-        Self::new_inner(store, core::Tz::utc(), false, credentials)
+        Self::new_inner(store, core::Tz::utc(), false, credentials, Arc::new(now_ms))
+    }
+
+    /// Build with injected credential backend and clock (#173, #175).
+    #[cfg(test)]
+    pub fn new_with_credentials_and_clock(
+        store: SqliteStore,
+        credentials: Arc<dyn CredentialStore>,
+        clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(store, core::Tz::utc(), false, credentials, clock)
     }
 
     fn new_inner(
@@ -177,6 +210,7 @@ impl EntryService {
         tz: core::Tz,
         tz_live: bool,
         credentials: Arc<dyn CredentialStore>,
+        clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     ) -> anyhow::Result<Self> {
         let mut data = store.load()?;
         // A brand-new store has no projects, and with no project there is
@@ -203,7 +237,9 @@ impl EntryService {
                 tz,
                 tz_live,
                 tz_refresh_error: None,
+                clock,
             }),
+            sync_lock: Mutex::new(()),
             changed: Mutex::new(Vec::new()),
         };
         // Persist the seed immediately, so a read-only store surfaces at
@@ -228,6 +264,10 @@ impl EntryService {
         rx
     }
 
+    fn lock_sync(&self) -> MutexGuard<'_, ()> {
+        self.sync_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn notify_changed(&self) {
         self.changed
             .lock()
@@ -239,16 +279,15 @@ impl EntryService {
     /// startup, so both go through the same path.
     fn persist(&self) -> anyhow::Result<()> {
         let g = lock(&self.inner);
-        g.store
-            .save_all(&g.data, now_ms())
-            .map_err(anyhow::Error::from)
+        let now = g.now_ms();
+        g.store.save_all(&g.data, now).map_err(anyhow::Error::from)
     }
 
     /// A consistent view of everything a client needs for one frame.
     pub fn snapshot(&self) -> Snapshot {
         let mut g = lock(&self.inner);
         refresh_tz(&mut g);
-        let now = now_ms();
+        let now = g.now_ms();
         let today = g.tz.day_of(now);
         // One pass for all four aggregates: clients poll snapshots
         // continuously, so four full rescans per poll made every client's
@@ -294,7 +333,7 @@ impl EntryService {
     ) -> Result<T, ServiceError> {
         let mut g = lock(&self.inner);
         refresh_tz(&mut g);
-        let now = now_ms();
+        let now = g.now_ms();
         // Destructure so `data` and `ids` are borrowed separately; borrowing
         // two fields of the same struct mutably in one call is rejected.
         let Inner {
@@ -311,12 +350,16 @@ impl EntryService {
         let mut next_ids = ids.clone();
         match f(&mut next_data, &mut next_ids, now) {
             Ok(value) => {
+                // Keep synced `updated_at`/`deleted_at` strictly ahead of
+                // `sync_merged_through` so sequential edits after a peer pull
+                // always advance even under slight clock skew (#173).
+                let persist_ts = monotonic_persist_ts(store, now)?;
                 // Persist before acknowledging -- and before the new
                 // state becomes visible to snapshots. The persisted form
                 // is one SQLite transaction holding this mutation's diff
                 // (§17), so a tap stays proportional to the change.
                 let record = core::Journal::between(data, &next_data);
-                if let Err(e) = store.apply(&record, now) {
+                if let Err(e) = store.apply(&record, persist_ts) {
                     return Err(ServiceError::Storage(e.to_string()));
                 }
                 *data = next_data;
@@ -511,7 +554,8 @@ impl EntryService {
     /// anchored at now: old clients keep current-period behaviour unchanged
     /// against a new service.
     pub fn export_csv(&self, scope: &str) -> Result<String, ServiceError> {
-        self.export_csv_at(scope, now_ms())
+        let now = lock(&self.inner).now_ms();
+        self.export_csv_at(scope, now)
     }
 
     /// CSV export between two local days, inclusive (#133). The days
@@ -563,9 +607,10 @@ impl EntryService {
             .map_err(|e| ServiceError::Storage(e.to_string()))?
             .iter()
             .any(|s| s.kind == kind && s.locator == locator);
+        let persist_ts = monotonic_persist_ts(&g.store, g.now_ms())?;
         let src = g
             .store
-            .add_source(kind, locator, project_id.as_deref(), label, now_ms())
+            .add_source(kind, locator, project_id.as_deref(), label, persist_ts)
             .map_err(|e| ServiceError::Storage(e.to_string()))?;
         drop(g);
         if !already {
@@ -610,6 +655,7 @@ impl EntryService {
         } else {
             label
         };
+        let persist_ts = monotonic_persist_ts(&g.store, g.now_ms())?;
         let src = g
             .store
             .update_source(
@@ -618,7 +664,7 @@ impl EntryService {
                 locator,
                 project_id.as_deref(),
                 label,
-                now_ms(),
+                persist_ts,
             )
             .map_err(|e| ServiceError::Storage(e.to_string()))?
             .ok_or_else(|| ServiceError::Rule(RuleError::UnknownSource(id.to_string())))?;
@@ -640,7 +686,7 @@ impl EntryService {
     /// Fetch one source (or all), parse, and store new suggestions.
     /// Fetching never creates entries and never writes back.
     pub fn refresh_source(&self, id: Option<&str>) -> Result<protocol::RefreshView, ServiceError> {
-        let (tz, targets, credentials) = {
+        let (tz, targets, credentials, now) = {
             let mut g = lock(&self.inner);
             refresh_tz(&mut g);
             let targets: Vec<_> = match id {
@@ -650,13 +696,12 @@ impl EntryService {
                     .sources()
                     .map_err(|e| ServiceError::Storage(e.to_string()))?,
             };
-            (g.tz.clone(), targets, g.credentials.clone())
+            (g.tz.clone(), targets, g.credentials.clone(), g.now_ms())
         };
         let mut total = protocol::RefreshView::default();
         // Suggestions are actionable near-term: expand recurrences a
         // month back (just-missed meetings still get logged) and a
         // quarter ahead, nothing further in either direction.
-        let now = now_ms();
         let (from_ms, until_ms) = (now - 31 * 86_400_000, now + 93 * 86_400_000);
         for src in &targets {
             if src.kind == "caldav" {
@@ -676,9 +721,10 @@ impl EntryService {
                 total.fetched += parsed.items.len();
                 total.skipped += parsed.skipped;
                 let g = lock(&self.inner);
+                let ts = g.now_ms();
                 total.inserted += g
                     .store
-                    .upsert_suggestions(&src.id, &parsed.items, now_ms())
+                    .upsert_suggestions(&src.id, &parsed.items, ts)
                     .map_err(|e| ServiceError::Storage(e.to_string()))?;
             }
         }
@@ -754,12 +800,13 @@ impl EntryService {
         }
         let mut tally = protocol::RefreshView::default();
         let g = lock(&self.inner);
+        let ts = g.now_ms();
         for (resource, parsed) in &parsed_all {
             tally.fetched += parsed.items.len();
             tally.skipped += parsed.skipped;
             let counts = g
                 .store
-                .reconcile_caldav_resource(&src.id, &resource.href, &parsed.items, now_ms())
+                .reconcile_caldav_resource(&src.id, &resource.href, &parsed.items, ts)
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
             tally.inserted += counts.inserted;
             tally.updated += counts.updated;
@@ -770,7 +817,7 @@ impl EntryService {
                     &resource.href,
                     resource.etag.as_deref(),
                     Some(&resource.content_hash),
-                    now_ms(),
+                    ts,
                 )
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
         }
@@ -781,7 +828,7 @@ impl EntryService {
                     &validator.href,
                     validator.etag.as_deref(),
                     validator.content_hash.as_deref(),
-                    now_ms(),
+                    ts,
                 )
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
         }
@@ -796,7 +843,7 @@ impl EntryService {
                 &src.id,
                 outcome.sync_token.as_deref(),
                 outcome.ctag.as_deref(),
-                now_ms(),
+                ts,
             )
             .map_err(|e| ServiceError::Storage(e.to_string()))?;
         Ok(tally)
@@ -865,7 +912,7 @@ impl EntryService {
             let g = lock(&self.inner);
             let claimed = g
                 .store
-                .decide_suggestion(id, "confirmed", None, now_ms())
+                .decide_suggestion(id, "confirmed", None, g.now_ms())
                 .map_err(|e| ServiceError::Storage(e.to_string()))?;
             if !claimed {
                 return Err(ServiceError::Other(format!(
@@ -896,7 +943,7 @@ impl EntryService {
         let g = lock(&self.inner);
         let decided = g
             .store
-            .decide_suggestion(id, "dismissed", None, now_ms())
+            .decide_suggestion(id, "dismissed", None, g.now_ms())
             .map_err(|e| ServiceError::Storage(e.to_string()))?;
         if decided {
             Ok(())
@@ -1033,10 +1080,13 @@ impl EntryService {
                 source.id
             );
         }
-        let removed = lock(&self.inner)
-            .store
-            .remove_source(&source.id, now_ms())
-            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        let removed = {
+            let g = lock(&self.inner);
+            let persist_ts = monotonic_persist_ts(&g.store, g.now_ms())?;
+            g.store
+                .remove_source(&source.id, persist_ts)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+        };
         if removed {
             self.notify_changed();
             Ok(())
@@ -1104,6 +1154,642 @@ impl EntryService {
     pub fn set_note(&self, id: &str, note: Option<&str>) -> Result<EntryView, ServiceError> {
         let e = self.mutate(|s, _ids, _| core::set_text(s, id, None, Some(note)))?;
         Ok(protocol::entry_to_view(&e))
+    }
+
+    // --- folder sync (#173, ADR 0020) ---
+
+    fn sync_status_with_has_key(
+        &self,
+        has_key: bool,
+    ) -> Result<protocol::SyncStatusView, ServiceError> {
+        let g = lock(&self.inner);
+        let cfg = g
+            .store
+            .sync_config()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        let now = g.now_ms();
+        let unresolved_conflicts = g
+            .store
+            .sync_conflicts(false)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .len();
+        let peers = g
+            .store
+            .sync_peers()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?
+            .into_iter()
+            .map(|p| peer_to_view(p, now))
+            .collect();
+        Ok(protocol::SyncStatusView {
+            enabled: cfg.folder.is_some(),
+            device_id: g.store.device_id().to_string(),
+            folder: cfg.folder,
+            has_key,
+            merged_through: cfg.merged_through,
+            compacted_through: cfg.compacted_through,
+            last_sync_at: cfg.last_sync_at,
+            last_error: cfg.last_error,
+            needs_repair: cfg.needs_repair,
+            unresolved_conflicts,
+            peers,
+        })
+    }
+
+    pub fn sync_status(&self) -> Result<protocol::SyncStatusView, ServiceError> {
+        let credentials = lock(&self.inner).credentials.clone();
+        let has_key = matches!(credentials.get(crate::sync::key::SYNC_KEY_REF), Ok(Some(_)));
+        self.sync_status_with_has_key(has_key)
+    }
+
+    pub fn sync_enable(
+        &self,
+        folder: &str,
+        pairing_code: Option<&str>,
+    ) -> Result<protocol::SyncEnableResult, ServiceError> {
+        let trimmed = folder.trim();
+        if trimmed.is_empty() {
+            return Err(ServiceError::Other(
+                "sync folder path must not be empty".into(),
+            ));
+        }
+        let _sync_guard = self.lock_sync();
+        let (credentials, device_id) = {
+            let g = lock(&self.inner);
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            if cfg.folder.is_some() {
+                return Err(ServiceError::Other(
+                    "sync is already enabled; run `timetrack sync unpair` first".into(),
+                ));
+            }
+            (g.credentials.clone(), g.store.device_id().to_string())
+        };
+
+        let ensured = crate::sync::folder::ensure_sync_folder(std::path::Path::new(trimmed))
+            .map_err(|e| ServiceError::Other(e.to_string()))?;
+        let folder_str = ensured
+            .canonicalize()
+            .unwrap_or(ensured)
+            .to_string_lossy()
+            .into_owned();
+
+        let (key, created_code) = match pairing_code {
+            Some(code) => {
+                let parsed = crate::sync::key::SyncKey::from_pairing_code(code)
+                    .map_err(|e| ServiceError::Other(e.to_string()))?;
+                crate::sync::key::store_sync_key(&*credentials, &parsed)
+                    .map_err(|e| ServiceError::Other(e.to_string()))?;
+                (parsed, None)
+            }
+            None => {
+                let key = crate::sync::key::generate_and_store_sync_key(&*credentials)
+                    .map_err(|e| ServiceError::Other(e.to_string()))?;
+                let code = key.to_pairing_code().to_string();
+                (key, Some(code))
+            }
+        };
+
+        let read = match crate::sync::folder::read_peer_envelopes(
+            std::path::Path::new(&folder_str),
+            &device_id,
+            &key,
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = crate::sync::key::delete_sync_key(&*credentials);
+                return Err(ServiceError::Other(e.to_string()));
+            }
+        };
+
+        if pairing_code.is_some()
+            && read.total_peer_files > 0
+            && read.envelopes.is_empty()
+            && read.decrypt_failed_count == read.total_peer_files
+        {
+            let _ = crate::sync::key::delete_sync_key(&*credentials);
+            return Err(ServiceError::Other(
+                "could not decrypt any peer envelope in sync folder: check the pairing code and try again"
+                    .into(),
+            ));
+        }
+
+        let (mut outcome, envelope, purged_creds, seed_dropped) = {
+            let mut g = lock(&self.inner);
+            g.store
+                .set_sync_folder(&folder_str)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let rows = g
+                .store
+                .load_sync_rows()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let prev_peers = g
+                .store
+                .sync_peers()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let now = g.now_ms();
+
+            let mut rows_for_merge = rows.clone();
+            let mut dropped_seed: Option<String> = None;
+            if pairing_code.is_some()
+                && read.envelopes.iter().any(|e| !e.projects.is_empty())
+                && is_untouched_seed(&rows_for_merge)
+            {
+                dropped_seed = Some(rows_for_merge.projects[0].project.id.clone());
+                rows_for_merge.projects.clear();
+            }
+
+            let mut outcome = crate::sync::merge::merge_snapshots(
+                &device_id,
+                &rows_for_merge,
+                &cfg,
+                &prev_peers,
+                &read.envelopes,
+                &read.warnings,
+                now,
+            );
+            if let Some(ref seed_id) = dropped_seed
+                && !outcome
+                    .write
+                    .upsert_projects
+                    .iter()
+                    .any(|p| &p.project.id == seed_id)
+                && !outcome.write.delete_projects.contains(seed_id)
+            {
+                outcome.write.delete_projects.push(seed_id.clone());
+            }
+
+            let purged_creds = g
+                .store
+                .apply_sync_merge(&outcome.write)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let fresh_data = g
+                .store
+                .load()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            g.data = fresh_data;
+            let post_rows = g
+                .store
+                .load_sync_rows()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let post_cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let env = crate::sync::merge::build_envelope(&device_id, &post_rows, &post_cfg, now);
+            (outcome, env, purged_creds, dropped_seed.is_some())
+        };
+
+        for cred_ref in purged_creds {
+            let _ = credentials.delete(&cred_ref);
+        }
+
+        if let Err(err) = crate::sync::folder::publish_envelope(
+            std::path::Path::new(&folder_str),
+            &envelope,
+            &key,
+        ) {
+            let _ = lock(&self.inner).store.clear_sync_config();
+            let _ = crate::sync::key::delete_sync_key(&*credentials);
+            return Err(ServiceError::Other(err.to_string()));
+        }
+
+        if outcome.applied_changes > 0 || outcome.new_conflicts > 0 || seed_dropped {
+            self.notify_changed();
+        }
+        let status = self.sync_status_with_has_key(true)?;
+        Ok(protocol::SyncEnableResult {
+            status,
+            pairing_code: created_code,
+            warnings: std::mem::take(&mut outcome.warnings),
+        })
+    }
+
+    pub fn sync_now(&self) -> Result<protocol::SyncNowView, ServiceError> {
+        let _sync_guard = self.lock_sync();
+        let (folder_str, credentials, device_id) = {
+            let g = lock(&self.inner);
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let Some(folder) = cfg.folder else {
+                return Err(ServiceError::Other(
+                    "sync is not enabled; run `timetrack sync enable <folder>` first".into(),
+                ));
+            };
+            (
+                folder,
+                g.credentials.clone(),
+                g.store.device_id().to_string(),
+            )
+        };
+
+        let key = match crate::sync::key::load_sync_key(&*credentials) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                let msg =
+                    "sync key is missing from the OS credential store; unpair and re-pair this device"
+                        .to_string();
+                let _ = lock(&self.inner)
+                    .store
+                    .record_sync_status(None, Some(Some(&msg)), None);
+                return Err(ServiceError::Other(msg));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = lock(&self.inner)
+                    .store
+                    .record_sync_status(None, Some(Some(&msg)), None);
+                return Err(ServiceError::Other(msg));
+            }
+        };
+
+        let read = match crate::sync::folder::read_peer_envelopes(
+            std::path::Path::new(&folder_str),
+            &device_id,
+            &key,
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = lock(&self.inner)
+                    .store
+                    .record_sync_status(None, Some(Some(&msg)), None);
+                return Err(ServiceError::Other(msg));
+            }
+        };
+
+        let (outcome, envelope, purged_creds) = {
+            let mut g = lock(&self.inner);
+            let rows = g
+                .store
+                .load_sync_rows()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let prev_peers = g
+                .store
+                .sync_peers()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let now = g.now_ms();
+            let outcome = crate::sync::merge::merge_snapshots(
+                &device_id,
+                &rows,
+                &cfg,
+                &prev_peers,
+                &read.envelopes,
+                &read.warnings,
+                now,
+            );
+            let purged_creds = g
+                .store
+                .apply_sync_merge(&outcome.write)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let fresh_data = g
+                .store
+                .load()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            g.data = fresh_data;
+            let post_rows = g
+                .store
+                .load_sync_rows()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let post_cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let env = crate::sync::merge::build_envelope(&device_id, &post_rows, &post_cfg, now);
+            (outcome, env, purged_creds)
+        };
+
+        for cred_ref in purged_creds {
+            let _ = credentials.delete(&cred_ref);
+        }
+
+        if let Err(err) = crate::sync::folder::publish_envelope(
+            std::path::Path::new(&folder_str),
+            &envelope,
+            &key,
+        ) {
+            let msg = err.to_string();
+            let _ = lock(&self.inner)
+                .store
+                .record_sync_status(None, Some(Some(&msg)), None);
+            if outcome.applied_changes > 0 || outcome.new_conflicts > 0 {
+                self.notify_changed();
+            }
+            return Err(ServiceError::Other(msg));
+        }
+
+        if outcome.applied_changes > 0 || outcome.new_conflicts > 0 {
+            self.notify_changed();
+        }
+        let status = self.sync_status_with_has_key(true)?;
+        Ok(protocol::SyncNowView {
+            status,
+            peers_read: outcome.peers_read,
+            applied_changes: outcome.applied_changes,
+            new_conflicts: outcome.new_conflicts,
+            compacted_tombstones: outcome.compacted_tombstones,
+            warnings: outcome.warnings,
+        })
+    }
+
+    /// Run a best-effort sync round when sync is enabled; never panics or propagates.
+    pub fn sync_now_best_effort(&self) {
+        let enabled = lock(&self.inner)
+            .store
+            .sync_config()
+            .map(|c| c.folder.is_some())
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        if let Err(err) = self.sync_now() {
+            eprintln!("timetrack-service: background sync failed: {err}");
+        }
+    }
+
+    pub fn sync_unpair(&self, delete_file: bool) -> Result<(), ServiceError> {
+        let _sync_guard = self.lock_sync();
+        let (folder_opt, credentials, device_id) = {
+            let g = lock(&self.inner);
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            (
+                cfg.folder,
+                g.credentials.clone(),
+                g.store.device_id().to_string(),
+            )
+        };
+        if delete_file
+            && let Some(ref folder) = folder_opt
+            && let Err(err) =
+                crate::sync::folder::delete_device_file(std::path::Path::new(folder), &device_id)
+        {
+            return Err(ServiceError::Other(err.to_string()));
+        }
+        lock(&self.inner)
+            .store
+            .clear_sync_config()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        let _ = crate::sync::key::delete_sync_key(&*credentials);
+        self.notify_changed();
+        Ok(())
+    }
+
+    pub fn sync_show_code(&self) -> Result<String, ServiceError> {
+        let credentials = {
+            let g = lock(&self.inner);
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            if cfg.folder.is_none() {
+                return Err(ServiceError::Other(
+                    "sync is not enabled; run `timetrack sync enable <folder>` first".into(),
+                ));
+            }
+            g.credentials.clone()
+        };
+        let key = crate::sync::key::load_sync_key(&*credentials)
+            .map_err(|e| ServiceError::Other(e.to_string()))?
+            .ok_or_else(|| {
+                ServiceError::Other(
+                    "sync key is missing from the OS credential store; unpair and re-pair this device"
+                        .into(),
+                )
+            })?;
+        Ok(key.to_pairing_code().to_string())
+    }
+
+    pub fn sync_rotate_key(&self) -> Result<String, ServiceError> {
+        let _sync_guard = self.lock_sync();
+        let (folder_str, credentials, device_id) = {
+            let g = lock(&self.inner);
+            let cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let Some(folder) = cfg.folder else {
+                return Err(ServiceError::Other(
+                    "sync is not enabled; run `timetrack sync enable <folder>` first".into(),
+                ));
+            };
+            (
+                folder,
+                g.credentials.clone(),
+                g.store.device_id().to_string(),
+            )
+        };
+        let new_key = crate::sync::key::rotate_sync_key(&*credentials)
+            .map_err(|e| ServiceError::Other(e.to_string()))?;
+        let code = new_key.to_pairing_code().to_string();
+        let (envelope, peer_ids) = {
+            let g = lock(&self.inner);
+            let rows = g
+                .store
+                .load_sync_rows()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let peer_ids: Vec<String> = g
+                .store
+                .sync_peers()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?
+                .into_iter()
+                .map(|p| p.device_id)
+                .collect();
+            let now = g.now_ms();
+            let clear_write = timetrack_store::SyncMergeWrite {
+                delete_peers: peer_ids.clone(),
+                last_sync_at: Some(now),
+                last_error: Some(None),
+                ..Default::default()
+            };
+            g.store
+                .apply_sync_merge(&clear_write)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let fresh_cfg = g
+                .store
+                .sync_config()
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            let env = crate::sync::merge::build_envelope(&device_id, &rows, &fresh_cfg, now);
+            (env, peer_ids)
+        };
+        let _ = peer_ids;
+        crate::sync::folder::publish_envelope(
+            std::path::Path::new(&folder_str),
+            &envelope,
+            &new_key,
+        )
+        .map_err(|e| ServiceError::Other(e.to_string()))?;
+        self.notify_changed();
+        Ok(code)
+    }
+
+    pub fn sync_conflicts(
+        &self,
+        include_restored: bool,
+    ) -> Result<Vec<protocol::SyncConflictView>, ServiceError> {
+        let g = lock(&self.inner);
+        let rows = g
+            .store
+            .sync_conflicts(include_restored)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|c| protocol::SyncConflictView {
+                summary: crate::sync::merge::summarize_conflict_payload(&c.loser_payload),
+                id: c.id,
+                kind: c.kind,
+                record_id: c.record_id,
+                recorded_at: c.recorded_at,
+                loser_updated_at: c.loser_updated_at,
+                loser_device_id: c.loser_device_id,
+                winner_updated_at: c.winner_updated_at,
+                winner_device_id: c.winner_device_id,
+                restored_at: c.restored_at,
+            })
+            .collect())
+    }
+
+    pub fn sync_restore_conflict(&self, id: &str) -> Result<(), ServiceError> {
+        let mut g = lock(&self.inner);
+        let unresolved = g
+            .store
+            .sync_conflicts(false)
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        let conflict = resolve_conflict_id_prefix(&g.store, &unresolved, id)?;
+        let payload = crate::sync::merge::ConflictPayload::from_json(&conflict.loser_payload)
+            .map_err(|e| ServiceError::Other(format!("corrupt conflict payload: {e}")))?;
+
+        match &payload {
+            crate::sync::merge::ConflictPayload::Project { .. } => {}
+            crate::sync::merge::ConflictPayload::Entry { project_id, .. } => {
+                if !g.data.projects.iter().any(|p| p.id == *project_id) {
+                    return Err(ServiceError::Other(format!(
+                        "cannot restore entry conflict: project '{project_id}' no longer exists (restore the project first)"
+                    )));
+                }
+            }
+            crate::sync::merge::ConflictPayload::Source {
+                id: src_id,
+                source_kind: kind,
+                locator,
+                ..
+            } => {
+                let collision = g
+                    .store
+                    .sources()
+                    .map_err(|e| ServiceError::Storage(e.to_string()))?
+                    .into_iter()
+                    .any(|s| s.id != *src_id && s.kind == *kind && s.locator == *locator);
+                if collision {
+                    return Err(ServiceError::Other(format!(
+                        "cannot restore source conflict: another {kind} source already uses '{locator}'"
+                    )));
+                }
+            }
+        }
+
+        let cfg = g
+            .store
+            .sync_config()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        let now = g.now_ms();
+        let restore_ts = now
+            .max(conflict.winner_updated_at + 1)
+            .max(cfg.merged_through + 1);
+        g.store
+            .restore_sync_conflict(&conflict.id, restore_ts, &payload.to_restored_record())
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        g.data = g
+            .store
+            .load()
+            .map_err(|e| ServiceError::Storage(e.to_string()))?;
+        drop(g);
+        self.notify_changed();
+        Ok(())
+    }
+}
+
+fn monotonic_persist_ts(store: &SqliteStore, now: i64) -> Result<i64, ServiceError> {
+    let cfg = store
+        .sync_config()
+        .map_err(|e| ServiceError::Storage(e.to_string()))?;
+    Ok(if cfg.merged_through >= now {
+        cfg.merged_through + 1
+    } else {
+        now
+    })
+}
+
+fn is_untouched_seed(rows: &timetrack_store::SyncRows) -> bool {
+    rows.projects.len() == 1
+        && rows.projects[0].project.name == "General"
+        && !rows.projects[0].project.archived
+        && rows.projects[0].project.colour.is_none()
+        && rows.entries.is_empty()
+        && rows.sources.is_empty()
+        && rows.tombstones.is_empty()
+}
+
+fn peer_to_view(p: timetrack_store::SyncPeerRow, now: i64) -> protocol::SyncPeerView {
+    let stale = p.quarantined
+        || now.saturating_sub(p.last_published_at) > crate::sync::merge::STALE_PEER_WARNING_MS;
+    protocol::SyncPeerView {
+        device_id: p.device_id,
+        last_published_at: p.last_published_at,
+        last_merged_through: p.last_merged_through,
+        last_seen_at: p.last_seen_at,
+        quarantined: p.quarantined,
+        stale,
+        last_warning: p.last_warning,
+    }
+}
+
+fn resolve_conflict_id_prefix(
+    store: &SqliteStore,
+    unresolved: &[timetrack_store::SyncConflictRow],
+    want: &str,
+) -> Result<timetrack_store::SyncConflictRow, ServiceError> {
+    let want = want.trim();
+    if want.is_empty() {
+        return Err(ServiceError::Other("conflict id must not be empty".into()));
+    }
+    if let Some(exact) = unresolved.iter().find(|c| c.id == want) {
+        return Ok(exact.clone());
+    }
+    let matches: Vec<_> = unresolved
+        .iter()
+        .filter(|c| c.id.starts_with(want))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        n if n > 1 => Err(ServiceError::Other(format!(
+            "conflict id prefix '{want}' is ambiguous ({n} matches)"
+        ))),
+        _ => {
+            let all = store
+                .sync_conflicts(true)
+                .map_err(|e| ServiceError::Storage(e.to_string()))?;
+            if all.iter().any(|c| c.id == want || c.id.starts_with(want)) {
+                Err(ServiceError::Other(format!(
+                    "conflict '{want}' has already been restored"
+                )))
+            } else {
+                Err(ServiceError::Other(format!("unknown conflict '{want}'")))
+            }
+        }
     }
 }
 

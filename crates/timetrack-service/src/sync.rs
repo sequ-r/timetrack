@@ -12,13 +12,11 @@
 //! XChaCha20-Poly1305 and a 256-bit sync key stored in the OS
 //! credential store (#149).
 
-// Wired by the publish/pull/merge flow (#173); tested directly until then.
-#[allow(dead_code)]
 pub mod crypto;
-#[allow(dead_code)]
 pub mod envelope;
-#[allow(dead_code)]
+pub mod folder;
 pub mod key;
+pub mod merge;
 
 #[cfg(test)]
 mod tests {
@@ -432,6 +430,744 @@ mod tests {
         );
         assert!(!csv.contains(&*code));
         assert!(!csv.contains(SYNC_KEY_REF));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- merge engine + end-to-end two-store sync (#173) ---
+
+    fn temp_root(_tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let dir = std::env::temp_dir().join(format!(
+            "tt-s-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    struct TestNode {
+        svc: std::sync::Arc<crate::interface::EntryService>,
+        client: timetrack_proto::socket::SocketClient,
+        clock: std::sync::Arc<std::sync::atomic::AtomicI64>,
+        creds: std::sync::Arc<FakeCredentialStore>,
+    }
+
+    fn spawn_test_node(dir: &std::path::Path, name: &str, start_ms: i64) -> TestNode {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicI64, Ordering},
+        };
+        let node_dir = dir.join(name);
+        std::fs::create_dir_all(&node_dir).unwrap();
+        let store = SqliteStore::open_at(&node_dir.join("store.json")).unwrap();
+        let creds = Arc::new(FakeCredentialStore::new());
+        let clock = Arc::new(AtomicI64::new(start_ms));
+        let c = Arc::clone(&clock);
+        let svc = Arc::new(
+            crate::interface::EntryService::new_with_credentials_and_clock(
+                store,
+                creds.clone(),
+                Arc::new(move || c.load(Ordering::Relaxed)),
+            )
+            .unwrap(),
+        );
+        let sock = node_dir.join("s.sock");
+        crate::socket::serve_at(Arc::clone(&svc), sock.clone()).unwrap();
+        let client = timetrack_proto::socket::SocketClient::new(sock);
+        TestNode {
+            svc,
+            client,
+            clock,
+            creds,
+        }
+    }
+
+    #[test]
+    fn merge_lww_tiebreak_tombstone_resurrection_and_source_collision() {
+        use super::merge::merge_snapshots;
+        use timetrack_store::{ExternalSource, ExternalSourceRow, SyncConfig, SyncRows, Tombstone};
+
+        let local = SyncRows {
+            projects: vec![],
+            entries: vec![],
+            sources: vec![ExternalSourceRow {
+                source: ExternalSource {
+                    id: "src-a".into(),
+                    kind: "caldav".into(),
+                    locator: "https://cal.test/shared/".into(),
+                    project_id: None,
+                    label: "Local Label".into(),
+                    cred_ref: Some("caldav/src-a".into()),
+                    cred_username: Some("alice".into()),
+                },
+                created_at: 100,
+                updated_at: 500,
+                device_id: DEV_A.into(),
+            }],
+            tombstones: vec![Tombstone {
+                id: "entry-res".into(),
+                kind: "entry".into(),
+                deleted_at: 200,
+                device_id: DEV_A.into(),
+            }],
+        };
+
+        let mut env = sample_envelope();
+        env.device_id = DEV_B.into();
+        env.published_at = 600;
+        env.merged_through = 100;
+        // Same timestamp as DEV_A source, higher device_id DEV_B ("fed..." > "012...")
+        env.sources.push(SyncedSource {
+            id: "src-b".into(),
+            kind: "caldav".into(),
+            locator: "https://cal.test/shared/".into(),
+            project_id: None,
+            label: "Peer Label".into(),
+            created_at: 100,
+            updated_at: 500,
+            device_id: DEV_B.into(),
+        });
+        // Resurrect `entry-res` strictly newer than tombstone @200
+        env.entries.push(SyncedEntry {
+            id: "entry-res".into(),
+            project_id: env.projects[0].id.clone(),
+            description: "Resurrected".into(),
+            started_at: 1000,
+            ended_at: 2000,
+            source: EntrySource::Manual,
+            note: None,
+            external_source_id: None,
+            external_uid: None,
+            external_started_at: None,
+            created_at: 100,
+            updated_at: 250,
+            device_id: DEV_B.into(),
+        });
+
+        let out = merge_snapshots(
+            DEV_A,
+            &local,
+            &SyncConfig::default(),
+            &[],
+            &[env],
+            &[],
+            1_000,
+        );
+        // Tombstone deleted on resurrection
+        assert!(
+            out.write
+                .delete_tombstones
+                .contains(&("entry-res".into(), "entry".into()))
+        );
+        assert!(
+            out.write
+                .upsert_entries
+                .iter()
+                .any(|e| e.entry.id == "entry-res")
+        );
+        // Duplicate `(kind, locator)` picks higher `(500, DEV_B)` and tombstones `src-a`
+        assert!(out.write.delete_sources.contains(&"src-a".into()));
+        assert!(
+            out.write
+                .upsert_sources
+                .iter()
+                .any(|s| s.source.id == "src-b")
+        );
+        assert!(
+            out.write
+                .upsert_tombstones
+                .iter()
+                .any(|t| t.id == "src-a" && t.kind == "source")
+        );
+        assert_eq!(out.write.new_conflicts.len(), 1);
+        assert_eq!(out.write.new_conflicts[0].record_id, "src-a");
+        assert_eq!(out.write.merged_through, Some(600));
+    }
+
+    #[test]
+    fn two_stores_converge_over_shared_folder_and_sockets() {
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("converge");
+        let sync_dir = dir.join("shared");
+        let a = spawn_test_node(&dir, "node-a", 1_700_000_000_000);
+        let b = spawn_test_node(&dir, "node-b", 1_700_000_001_000);
+
+        // Device A sets up a project, an entry, and an authenticated CalDAV source.
+        let proj = a
+            .client
+            .call(Request::AddProject {
+                name: "Client".into(),
+            })
+            .unwrap()
+            .project()
+            .unwrap();
+        let entry_a = a
+            .client
+            .call(Request::Add {
+                project_id: proj.id.clone(),
+                description: "Design".into(),
+                started_at: 1_699_999_000_000,
+                ended_at: 1_699_999_600_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        let src = a
+            .client
+            .call(Request::AddSource {
+                kind: "caldav".into(),
+                locator: "https://alice@cal.secret.test/work/".into(),
+                project_id: Some(proj.id.clone()),
+                label: "Work Cal".into(),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+        a.client
+            .call(Request::SetSourceCredential {
+                id: src.id.clone(),
+                username: "alice".into(),
+                secret: timetrack_proto::SecretString::new("super-secret-caldav-pw"),
+            })
+            .unwrap()
+            .source()
+            .unwrap();
+
+        // Enable sync on A.
+        let enable_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        assert!(enable_a.status.enabled);
+        let code = enable_a.pairing_code.unwrap();
+        let shown = a
+            .client
+            .call(Request::SyncShowCode)
+            .unwrap()
+            .sync_code()
+            .unwrap();
+        assert_eq!(code, shown);
+
+        // Verify raw ciphertext on disk leaks nothing.
+        let raw_a = std::fs::read(sync_dir.join(&enable_a.status.device_id)).unwrap();
+        assert!(!raw_a.windows(12).any(|w| w == b"super-secret"));
+        assert!(!raw_a.windows(10).any(|w| w == b"cal.secret"));
+
+        // Wrong pairing code on B rolls back cleanly without enabling or storing key.
+        let bad_code = SyncKey::generate().unwrap().to_pairing_code().to_string();
+        assert!(
+            b.client
+                .call(Request::SyncEnable {
+                    folder: sync_dir.to_string_lossy().into_owned(),
+                    pairing_code: Some(bad_code),
+                })
+                .is_err()
+        );
+        let status_b_err = b
+            .client
+            .call(Request::SyncStatus)
+            .unwrap()
+            .sync_status()
+            .unwrap();
+        assert!(!status_b_err.enabled);
+        assert!(!status_b_err.has_key);
+
+        // Real pairing code joins cleanly, drops B's untouched "General" seed, and keeps secrets local.
+        let enable_b = b
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: Some(code),
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        assert!(enable_b.status.enabled);
+        let snap_b = b
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        // A's seed "General" + "Client" = 2 projects (B did NOT add a duplicate "General").
+        assert_eq!(snap_b.projects.len(), 2);
+        assert_eq!(snap_b.entries.len(), 1);
+        assert_eq!(snap_b.entries[0].id, entry_a.id);
+        let sources_b = b
+            .client
+            .call(Request::ListSources)
+            .unwrap()
+            .sources()
+            .unwrap();
+        assert_eq!(sources_b.len(), 1);
+        assert!(!sources_b[0].has_credential);
+        assert_eq!(sources_b[0].username, None);
+
+        // B adds an entry; A pulls and converges.
+        b.clock.fetch_add(5_000, Ordering::Relaxed);
+        let entry_b = b
+            .client
+            .call(Request::Add {
+                project_id: proj.id.clone(),
+                description: "Review".into(),
+                started_at: 1_699_999_700_000,
+                ended_at: 1_699_999_900_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        a.clock.fetch_add(6_000, Ordering::Relaxed);
+        let now_a = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(now_a.applied_changes >= 1);
+
+        let snap_a = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let snap_b2 = b
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snap_a.entries.len(), 2);
+        assert_eq!(snap_b2.entries.len(), 2);
+        assert!(snap_a.entries.iter().any(|e| e.id == entry_b.id));
+
+        // Unpair B with --delete-file deletes its envelope and keeps local data intact.
+        b.client
+            .call(Request::SyncUnpair { delete_file: true })
+            .unwrap()
+            .unit()
+            .unwrap();
+        assert!(!sync_dir.join(&enable_b.status.device_id).exists());
+        let status_b_unpaired = b
+            .client
+            .call(Request::SyncStatus)
+            .unwrap()
+            .sync_status()
+            .unwrap();
+        assert!(!status_b_unpaired.enabled);
+        assert!(!status_b_unpaired.has_key);
+        let snap_b_after = b
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(snap_b_after.entries.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_edits_both_orders_journal_and_restore_rewins() {
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("conflicts");
+        let sync_dir = dir.join("shared");
+        let a = spawn_test_node(&dir, "node-a", 1_700_000_000_000);
+        let b = spawn_test_node(&dir, "node-b", 1_700_000_001_000);
+
+        let proj_id = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .projects[0]
+            .id
+            .clone();
+        let entry = a
+            .client
+            .call(Request::Add {
+                project_id: proj_id,
+                description: "Initial".into(),
+                started_at: 1_699_999_000_000,
+                ended_at: 1_699_999_600_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        let en_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        b.client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: en_a.pairing_code,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // Both go offline: B edits at +10s (loser), A edits at +20s (winner).
+        b.clock.store(1_700_000_010_000, Ordering::Relaxed);
+        b.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "Loser edit on B".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        a.clock.store(1_700_000_020_000, Ordering::Relaxed);
+        a.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "Winner edit on A".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        // Order 1: A publishes first, B pulls and records B's losing edit locally.
+        a.clock.store(1_700_000_030_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        b.clock.store(1_700_000_031_000, Ordering::Relaxed);
+        let sync_b = b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(sync_b.new_conflicts, 1);
+        let snap_b = b
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(
+            snap_b
+                .entries
+                .iter()
+                .find(|e| e.id == entry.id)
+                .unwrap()
+                .description,
+            "Winner edit on A"
+        );
+
+        let conflicts_b = b
+            .client
+            .call(Request::SyncConflicts {
+                include_restored: false,
+            })
+            .unwrap()
+            .sync_conflicts()
+            .unwrap();
+        assert_eq!(conflicts_b.len(), 1);
+        assert!(conflicts_b[0].summary.contains("Loser edit on B"));
+
+        // Restore by prefix on B; re-sync propagates restored version cleanly with zero new conflicts.
+        let prefix: String = conflicts_b[0].id.chars().take(8).collect();
+        b.clock.store(1_700_000_040_000, Ordering::Relaxed);
+        b.client
+            .call(Request::SyncRestoreConflict { id: prefix })
+            .unwrap()
+            .unit()
+            .unwrap();
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        a.clock.store(1_700_000_045_000, Ordering::Relaxed);
+        let sync_a2 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(sync_a2.new_conflicts, 0);
+        assert_eq!(
+            a.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .iter()
+                .find(|e| e.id == entry.id)
+                .unwrap()
+                .description,
+            "Loser edit on B"
+        );
+
+        // Order 2: both publish while offline (using sync_enable folder snapshots or simulated peer publish),
+        // winner pulls first -> winner still preserves loser in conflict journal.
+        // Simulate B publishing its envelope offline before pulling A by having B sync against an isolated folder
+        // then copying its file into `sync_dir`.
+        b.clock.store(1_700_000_060_000, Ordering::Relaxed);
+        b.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "Concurrent B".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        let b_id = b
+            .client
+            .call(Request::SyncStatus)
+            .unwrap()
+            .sync_status()
+            .unwrap()
+            .device_id;
+        // Temporarily stash A's file, publish B, restore A's file -> mirrors both publishing offline before merging.
+        let a_file = sync_dir.join(&en_a.status.device_id);
+        let a_backup = dir.join("a_env.bak");
+        std::fs::rename(&a_file, &a_backup).unwrap();
+        b.clock.store(1_700_000_061_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        std::fs::rename(&a_backup, &a_file).unwrap();
+
+        a.clock.store(1_700_000_070_000, Ordering::Relaxed);
+        a.client
+            .call(Request::SetText {
+                id: entry.id.clone(),
+                description: "Concurrent A".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        let sync_a3 = a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert_eq!(
+            sync_a3.new_conflicts, 1,
+            "winner must capture B's published loser"
+        );
+        assert!(sync_dir.join(&b_id).exists());
+        let conf_a = a
+            .client
+            .call(Request::SyncConflicts {
+                include_restored: false,
+            })
+            .unwrap()
+            .sync_conflicts()
+            .unwrap();
+        assert!(conf_a[0].summary.contains("Concurrent B"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_vs_resurrection_folder_wipe_broken_folder_and_key_rotation() {
+        use std::sync::atomic::Ordering;
+        use timetrack_proto::socket::Request;
+
+        let dir = temp_root("edge-cases");
+        let sync_dir = dir.join("shared");
+        let a = spawn_test_node(&dir, "node-a", 1_700_000_000_000);
+        let b = spawn_test_node(&dir, "node-b", 1_700_000_001_000);
+
+        let proj_id = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .projects[0]
+            .id
+            .clone();
+        let e1 = a
+            .client
+            .call(Request::Add {
+                project_id: proj_id.clone(),
+                description: "Stay dead".into(),
+                started_at: 1_699_999_000_000,
+                ended_at: 1_699_999_300_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        let e2 = a
+            .client
+            .call(Request::Add {
+                project_id: proj_id.clone(),
+                description: "Will resurrect".into(),
+                started_at: 1_699_999_400_000,
+                ended_at: 1_699_999_700_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+
+        let en_a = a
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: None,
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        let en_b = b
+            .client
+            .call(Request::SyncEnable {
+                folder: sync_dir.to_string_lossy().into_owned(),
+                pairing_code: en_a.pairing_code.clone(),
+            })
+            .unwrap()
+            .sync_enable()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // A deletes both entries at +10s.
+        a.clock.store(1_700_000_010_000, Ordering::Relaxed);
+        a.client
+            .call(Request::DeleteEntry { id: e1.id.clone() })
+            .unwrap()
+            .unit()
+            .unwrap();
+        a.client
+            .call(Request::DeleteEntry { id: e2.id.clone() })
+            .unwrap()
+            .unit()
+            .unwrap();
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        // B resurrects e2 at +20s (strictly newer than delete @+10s).
+        b.clock.store(1_700_000_020_000, Ordering::Relaxed);
+        b.client
+            .call(Request::SetText {
+                id: e2.id.clone(),
+                description: "Resurrected on B".into(),
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        let b_sync = b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(b_sync.status.enabled);
+
+        a.clock.store(1_700_000_025_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+
+        let snap_a = a
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let snap_b = b
+            .client
+            .call(Request::Snapshot)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(!snap_a.entries.iter().any(|e| e.id == e1.id));
+        assert!(!snap_b.entries.iter().any(|e| e.id == e1.id));
+        assert_eq!(
+            snap_a
+                .entries
+                .iter()
+                .find(|e| e.id == e2.id)
+                .unwrap()
+                .description,
+            "Resurrected on B"
+        );
+        assert_eq!(
+            snap_b
+                .entries
+                .iter()
+                .find(|e| e.id == e2.id)
+                .unwrap()
+                .description,
+            "Resurrected on B"
+        );
+
+        // Deleting all files in the sync folder loses zero local data; re-sync reseeds.
+        for item in std::fs::read_dir(&sync_dir).unwrap() {
+            let p = item.unwrap().path();
+            let _ = std::fs::remove_file(&p);
+        }
+        assert!(
+            !sync_dir.join(&en_a.status.device_id).exists()
+                && !sync_dir.join(&en_b.status.device_id).exists()
+        );
+        a.clock.store(1_700_000_030_000, Ordering::Relaxed);
+        a.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(sync_dir.join(&en_a.status.device_id).exists());
+        assert_eq!(
+            a.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+
+        // Key rotation emits new code, clears stale peers, and old key cannot decrypt new file.
+        b.clock.store(1_700_000_031_000, Ordering::Relaxed);
+        b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        a.clock.store(1_700_000_035_000, Ordering::Relaxed);
+        let new_code = a
+            .client
+            .call(Request::SyncRotateKey)
+            .unwrap()
+            .sync_code()
+            .unwrap();
+        assert_ne!(Some(new_code.clone()), en_a.pairing_code);
+        let st_a = a
+            .client
+            .call(Request::SyncStatus)
+            .unwrap()
+            .sync_status()
+            .unwrap();
+        assert!(st_a.peers.is_empty());
+        // Old key on B produces a warning and keeps B's existing data untouched.
+        let b_after_rot = b.client.call(Request::SyncNow).unwrap().sync_now().unwrap();
+        assert!(!b_after_rot.warnings.is_empty());
+        assert!(b_after_rot.status.last_error.is_some());
+
+        // Broken sync folder (replaced with a file): normal offline tracking continues untouched.
+        let _ = std::fs::remove_dir_all(&sync_dir);
+        std::fs::write(&sync_dir, "not a directory").unwrap();
+        let sync_err = a.client.call(Request::SyncNow);
+        assert!(sync_err.is_err());
+        let st_broken = a
+            .client
+            .call(Request::SyncStatus)
+            .unwrap()
+            .sync_status()
+            .unwrap();
+        assert!(st_broken.last_error.is_some());
+        let added_offline = a
+            .client
+            .call(Request::QuickAdd {
+                project_id: proj_id,
+                duration_ms: 15 * 60_000,
+            })
+            .unwrap()
+            .entry()
+            .unwrap();
+        assert_eq!(
+            a.client
+                .call(Request::Snapshot)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|e| e.id == added_offline.id)
+                .count(),
+            1
+        );
+
+        // Check FakeCredentialStore isn't flagged as dead helper even if creds isn't read here
+        let _ = (a.svc, b.svc, a.creds, b.creds);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

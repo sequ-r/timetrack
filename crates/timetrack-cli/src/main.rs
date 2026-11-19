@@ -44,6 +44,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::time::Duration;
 use timetrack_proto::{Client, ClientError, EntryView, ProjectView, Snapshot, no_service_hint};
 
@@ -425,6 +426,62 @@ enum Command {
         /// Source id or unambiguous id prefix (from `sources`).
         id: String,
     },
+
+    // --- folder sync (ADR 0020, #173) ---
+    /// Encrypted per-device folder sync.
+    Sync {
+        #[command(subcommand)]
+        action: SyncCommand,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq)]
+enum SyncCommand {
+    /// Enable folder sync, generating a new key or joining an existing folder (--join).
+    Enable {
+        /// Shared folder path (Syncthing, Nextcloud, USB stick, NFS, etc.).
+        folder: PathBuf,
+        /// Pair with an existing sync folder using a pairing code from another device
+        /// (prompted on a terminal or read from stdin when piped; never passed in argv).
+        #[arg(long)]
+        join: bool,
+    },
+    /// Show sync configuration, watermarks, known peers, and unresolved conflicts.
+    Status {
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pull peer envelopes, merge changes, and publish this device's snapshot now.
+    Now {
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable sync and remove the sync key from this device, keeping all local data.
+    Unpair {
+        /// Also delete this device's envelope file from the sync folder.
+        #[arg(long)]
+        delete_file: bool,
+    },
+    /// Print the pairing code for this device's sync key.
+    ShowCode,
+    /// Generate a fresh sync key and re-publish (re-pair surviving devices afterwards).
+    RotateKey,
+    /// List losing edits/deletes preserved in the local conflict journal.
+    Conflicts {
+        /// Include already-restored conflicts.
+        #[arg(long)]
+        all: bool,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a losing record from the conflict journal with a fresh timestamp.
+    Restore {
+        /// Conflict id or unambiguous id prefix (from `sync conflicts`).
+        id: String,
+    },
 }
 
 /// The client is driven by `async_io` — this workspace has no tokio
@@ -636,6 +693,37 @@ fn read_piped_secret(reader: &mut dyn std::io::BufRead) -> Result<String> {
         ));
     }
     Ok(secret)
+}
+
+fn read_pairing_code() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("pairing code: ")
+            .map_err(|e| anyhow::anyhow!("could not read the pairing code: {e}"))
+            .and_then(|c| {
+                let trimmed = c.trim().to_string();
+                if trimmed.is_empty() {
+                    Err(anyhow::anyhow!("the pairing code is empty"))
+                } else {
+                    Ok(trimmed)
+                }
+            })
+    } else {
+        read_piped_pairing_code(&mut std::io::stdin().lock())
+    }
+}
+
+fn read_piped_pairing_code(reader: &mut dyn std::io::BufRead) -> Result<String> {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|e| anyhow::anyhow!("could not read the pairing code from stdin: {e}"))?;
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no pairing code on stdin; pipe one or run on a terminal for the prompt"
+        ));
+    }
+    Ok(code)
 }
 
 async fn dispatch(client: Client, command: Command) -> Result<()> {
@@ -1327,8 +1415,188 @@ async fn dispatch(client: Client, command: Command) -> Result<()> {
                 None => emit_raw(&csv),
             }
         }
+
+        Command::Sync { action } => match action {
+            SyncCommand::Enable { folder, join } => {
+                let folder_abs = if folder.is_relative() {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&folder))
+                        .unwrap_or(folder)
+                } else {
+                    folder
+                };
+                let folder_str = folder_abs.to_string_lossy().into_owned();
+                let pairing_code = if join {
+                    Some(read_pairing_code()?)
+                } else {
+                    None
+                };
+                let res = client
+                    .sync_enable(&folder_str, pairing_code.as_deref())
+                    .await?;
+                emit(&format!(
+                    "sync enabled (folder: {})",
+                    disp(res.status.folder.as_deref().unwrap_or(&folder_str))
+                ));
+                emit(&format!("device id: {}", res.status.device_id));
+                if let Some(code) = res.pairing_code {
+                    emit(&format!(
+                        "pairing code (keep secret; enter on another device with --join):\n{code}"
+                    ));
+                }
+                for warn in res.warnings {
+                    emit(&format!("warning: {}", disp(&warn)));
+                }
+            }
+            SyncCommand::Status { json } => {
+                let status = client.sync_status().await?;
+                if json {
+                    emit(&serde_json::to_string(&status)?);
+                } else {
+                    for line in format_sync_status(&status) {
+                        emit(&line);
+                    }
+                }
+            }
+            SyncCommand::Now { json } => {
+                let res = client.sync_now().await?;
+                if json {
+                    emit(&serde_json::to_string(&res)?);
+                } else {
+                    emit(&format!(
+                        "synced: {} peer(s), {} change(s), {} new conflict(s), {} compacted tombstone(s)",
+                        res.peers_read,
+                        res.applied_changes,
+                        res.new_conflicts,
+                        res.compacted_tombstones
+                    ));
+                    for warn in res.warnings {
+                        emit(&format!("warning: {}", disp(&warn)));
+                    }
+                }
+            }
+            SyncCommand::Unpair { delete_file } => {
+                client.sync_unpair(delete_file).await?;
+                if delete_file {
+                    emit("sync unpaired and device file deleted (local data kept intact)");
+                } else {
+                    emit("sync unpaired (local data kept intact)");
+                }
+            }
+            SyncCommand::ShowCode => {
+                let code = client.sync_show_code().await?;
+                emit(&code);
+            }
+            SyncCommand::RotateKey => {
+                let code = client.sync_rotate_key().await?;
+                emit("sync key rotated; re-pair surviving devices with:");
+                emit(&code);
+            }
+            SyncCommand::Conflicts { all, json } => {
+                let rows = client.sync_conflicts(all).await?;
+                if json {
+                    emit(&serde_json::to_string(&rows)?);
+                } else if rows.is_empty() {
+                    emit("no sync conflicts");
+                } else {
+                    for line in format_sync_conflicts(&rows) {
+                        emit(&line);
+                    }
+                }
+            }
+            SyncCommand::Restore { id } => {
+                client.sync_restore_conflict(&id).await?;
+                emit(&format!(
+                    "restored conflict {}; run `timetrack sync now` to propagate",
+                    disp(&id)
+                ));
+            }
+        },
     }
     Ok(())
+}
+
+fn format_sync_status(s: &timetrack_proto::SyncStatusView) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "enabled:   {}",
+        if s.enabled { "yes" } else { "no" }
+    ));
+    lines.push(format!("device id: {}", s.device_id));
+    if let Some(ref folder) = s.folder {
+        lines.push(format!("folder:    {}", disp(folder)));
+    }
+    if s.enabled || s.has_key {
+        lines.push(format!(
+            "sync key:  {}",
+            if s.has_key { "stored" } else { "missing" }
+        ));
+    }
+    lines.push(format!("watermark: merged_through={}", s.merged_through));
+    if s.compacted_through > 0 {
+        lines.push(format!("compacted: {}", s.compacted_through));
+    }
+    if let Some(ts) = s.last_sync_at {
+        lines.push(format!("last sync: {ts}"));
+    }
+    if s.needs_repair {
+        lines.push("warning:   needs repair (`timetrack sync repair`)".to_string());
+    }
+    if let Some(ref err) = s.last_error {
+        lines.push(format!("error:     {}", disp(err)));
+    }
+    lines.push(format!("conflicts: {} unresolved", s.unresolved_conflicts));
+    if s.peers.is_empty() {
+        lines.push("peers:     none".to_string());
+    } else {
+        lines.push(format!("peers:     {}", s.peers.len()));
+        for p in &s.peers {
+            let short_dev: String = p.device_id.chars().take(8).collect();
+            let mut flags = Vec::new();
+            if p.quarantined {
+                flags.push("quarantined");
+            } else if p.stale {
+                flags.push("stale");
+            }
+            let suffix = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", flags.join(", "))
+            };
+            lines.push(format!(
+                "  {short_dev}  published={} merged={}{suffix}",
+                p.last_published_at, p.last_merged_through
+            ));
+            if let Some(ref warn) = p.last_warning {
+                lines.push(format!("    warning: {}", disp(warn)));
+            }
+        }
+    }
+    lines
+}
+
+fn format_sync_conflicts(rows: &[timetrack_proto::SyncConflictView]) -> Vec<String> {
+    rows.iter()
+        .map(|c| {
+            let short_id: String = c.id.chars().take(8).collect();
+            let state = if c.restored_at.is_some() {
+                " [restored]"
+            } else {
+                ""
+            };
+            let short_loser: String = c.loser_device_id.chars().take(8).collect();
+            let short_winner: String = c.winner_device_id.chars().take(8).collect();
+            format!(
+                "{short_id}{state}  {:<7}  {}  (lost @{}/{} to @{}/{})",
+                c.kind,
+                disp(&c.summary),
+                c.loser_updated_at,
+                short_loser,
+                c.winner_updated_at,
+                short_winner
+            )
+        })
+        .collect()
 }
 
 fn print_status(s: &Snapshot) {
@@ -2760,5 +3028,66 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         let err = emit_to(&mut FailPipe(std::io::ErrorKind::PermissionDenied), "hi").unwrap_err();
         assert_ne!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn sync_subcommands_parse_and_read_piped_code() {
+        let enable = Cli::try_parse_from(["timetrack", "sync", "enable", "/tmp/sync"]).unwrap();
+        assert!(matches!(
+            enable.command,
+            Some(Command::Sync {
+                action: SyncCommand::Enable { join: false, .. }
+            })
+        ));
+        // Joining never takes the pairing code on argv (only --join flag).
+        assert!(
+            Cli::try_parse_from(["timetrack", "sync", "enable", "/tmp/sync", "--join", "CODE"])
+                .is_err()
+        );
+        let join =
+            Cli::try_parse_from(["timetrack", "sync", "enable", "/tmp/sync", "--join"]).unwrap();
+        assert!(matches!(
+            join.command,
+            Some(Command::Sync {
+                action: SyncCommand::Enable { join: true, .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["timetrack", "sync", "status", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "now"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "unpair", "--delete-file"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "show-code"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "rotate-key"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "conflicts", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["timetrack", "sync", "restore", "c1"]).is_ok());
+
+        use std::io::BufReader;
+        let mut piped = BufReader::new("  ABCD-EFGH  \r\nignored\n".as_bytes());
+        assert_eq!(read_piped_pairing_code(&mut piped).unwrap(), "ABCD-EFGH");
+        assert!(read_piped_pairing_code(&mut BufReader::new("   \n".as_bytes())).is_err());
+
+        let status = timetrack_proto::SyncStatusView {
+            enabled: true,
+            device_id: "0123456789abcdef0123456789abcdef".into(),
+            folder: Some("/tmp/sync".into()),
+            has_key: true,
+            merged_through: 100,
+            compacted_through: 0,
+            last_sync_at: Some(200),
+            last_error: None,
+            needs_repair: false,
+            unresolved_conflicts: 1,
+            peers: vec![timetrack_proto::SyncPeerView {
+                device_id: "fedcba9876543210fedcba9876543210".into(),
+                last_published_at: 90,
+                last_merged_through: 80,
+                last_seen_at: 200,
+                quarantined: false,
+                stale: true,
+                last_warning: None,
+            }],
+        };
+        let lines = format_sync_status(&status).join("\n");
+        assert!(lines.contains("enabled:   yes"));
+        assert!(lines.contains("fedcba98  published=90 merged=80 [stale]"));
     }
 }
